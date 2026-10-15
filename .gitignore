@@ -1,0 +1,25 @@
+# Build output
+build/
+.gradle/
+.kotlin/
+.cxx/
+app/.cxx/
+*.apk
+*.aab
+
+# Machine-specific settings (SDK location, signing) never belong in the repository
+local.properties
+*.jks
+*.keystore
+signing.properties
+
+# x264 / x265 built by scripts/build-codecs.sh
+app/src/main/cpp/third_party/include/
+app/src/main/cpp/third_party/lib/
+.codec-build/
+
+# Editors and OS
+.idea/
+*.iml
+.DS_Store
+.vscode/

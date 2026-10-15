@@ -1,0 +1,15 @@
+name: Feature request
+description: An idea to make Graden better
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why does it matter to you?
+      description: The kind of video you edit and how this would help.

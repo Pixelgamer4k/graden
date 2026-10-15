@@ -1,0 +1,39 @@
+name: Bug report
+description: Something broke, looked wrong or felt slow
+labels: ["bug", "beta"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for testing the beta! A clear report helps a lot. Please don't include personal information.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what you saw instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a project with …
+        2. Tap …
+        3. …
+  - type: input
+    id: phone
+    attributes:
+      label: Phone model and Android version
+      placeholder: e.g. Pixel 8, Android 15
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      placeholder: 0.1.0-beta
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshots or a screen recording
+      description: Drag files in here if you have them.
