@@ -80,17 +80,48 @@ class ProxyBuilder(
     private var currentJob: Job? = null
     private val progress = ProgressHolder()
 
-    private fun fileFor(a: MediaAsset, kind: Kind): File {
+    /** The proxy file of [a]; [hdr] proxies (kept HDR, 10-bit HEVC) end in "h". */
+    private fun fileFor(a: MediaAsset, kind: Kind, hdr: Boolean = false): File {
         val base = "${a.uri.hashCode().toUInt()}_${a.durationUs}"
+        val h = if (hdr) "h" else ""
         return File(
             dir,
             when (kind) {
-                Kind.SCRUB -> "${base}_r${REVISION}_s$SCRUB_SHORT_SIDE.mp4"
-                Kind.PLAY -> "${base}_e${PLAY_REVISION}_p${DeviceProfiler.proxyShortSide(a.tier)}.mp4"
+                Kind.SCRUB -> "${base}_r${REVISION}_s$SCRUB_SHORT_SIDE$h.mp4"
+                Kind.PLAY -> "${base}_e${PLAY_REVISION}_p${DeviceProfiler.proxyShortSide(a.tier)}$h.mp4"
                 Kind.SEEKABLE -> "${base}_seek.mp4"
             },
         )
     }
+
+    /**
+     * Proxies of [a] are kept in HDR: it is HDR and this phone has a hardware HEVC Main 10 encoder (only standard
+     * codec queries). Elsewhere HDR clips get SDR proxies, tone-mapped, as before.
+     */
+    private fun keepsHdr(a: MediaAsset): Boolean = a.hdr && hevc10
+
+    private val hevc10: Boolean by lazy {
+        runCatching {
+            android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS).codecInfos.any { info ->
+                info.isEncoder && (android.os.Build.VERSION.SDK_INT < 29 || info.isHardwareAccelerated) &&
+                    info.supportedTypes.any { it.equals(MimeTypes.VIDEO_H265, true) } &&
+                    info.getCapabilitiesForType(MimeTypes.VIDEO_H265).profileLevels.any { it.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10 }
+            }
+        }.getOrDefault(false)
+    }
+
+    /** The file says it is HDR (PQ or HLG). */
+    private fun isHdrFile(f: File): Boolean = runCatching {
+        val ex = android.media.MediaExtractor()
+        try {
+            ex.setDataSource(f.path)
+            val fmt = (0 until ex.trackCount).map { ex.getTrackFormat(it) }.first { it.getString(android.media.MediaFormat.KEY_MIME)?.startsWith("video/") == true }
+            val t = if (fmt.containsKey(android.media.MediaFormat.KEY_COLOR_TRANSFER)) fmt.getInteger(android.media.MediaFormat.KEY_COLOR_TRANSFER) else 0
+            t == android.media.MediaFormat.COLOR_TRANSFER_ST2084 || t == android.media.MediaFormat.COLOR_TRANSFER_HLG
+        } finally {
+            ex.release()
+        }
+    }.getOrDefault(false)
 
     init {
         // Proxies made with earlier settings carry another revision (or none) in their name; they are no
@@ -107,11 +138,14 @@ class ProxyBuilder(
     private fun legacyPlay(a: MediaAsset): File =
         File(dir, "${a.uri.hashCode().toUInt()}_${a.durationUs}_r${REVISION}_p${DeviceProfiler.proxyShortSide(a.tier)}.mp4")
 
-    /** Queues whatever [a] still needs; proxies that already exist are reported straight away. */
-    fun enqueue(a: MediaAsset) {
+    /**
+     * Queues whatever [a] still needs; proxies that already exist are reported straight away. [clipByClip] (an import)
+     * keeps the file's two proxies together at the end of the queue, so each clip is finished before the next starts.
+     */
+    fun enqueue(a: MediaAsset, clipByClip: Boolean = false) {
         if (a.isAudio || a.isImage) return
-        enqueue(a, Kind.SCRUB)
-        if (DeviceProfiler.needsPlayProxy(a)) enqueue(a, Kind.PLAY)
+        enqueue(a, Kind.SCRUB, clipByClip)
+        if (DeviceProfiler.needsPlayProxy(a)) enqueue(a, Kind.PLAY, clipByClip)
         // A seekable copy made earlier is picked up again.
         fileFor(a, Kind.SEEKABLE).takeIf { it.exists() }?.let { onReady(a.id, Kind.SEEKABLE, it.path) }
     }
@@ -132,18 +166,25 @@ class ProxyBuilder(
         pump()
     }
 
-    private fun enqueue(a: MediaAsset, kind: Kind) {
+    private fun enqueue(a: MediaAsset, kind: Kind, clipByClip: Boolean) {
+        val hdr = keepsHdr(a)
+        val h = fileFor(a, kind, hdr = true)
         val f = fileFor(a, kind)
+        if (hdr && h.exists()) {
+            onReady(a.id, kind, h.path)
+            return
+        }
         if (f.exists()) {
             onReady(a.id, kind, f.path)
-            return
+            // An SDR proxy of an HDR clip serves until its HDR one is made.
+            if (!hdr) return
         }
         // Until its edit proxy is made, an older play proxy keeps playback light.
         if (kind == Kind.PLAY) legacyPlay(a).takeIf { it.exists() }?.let { onReady(a.id, kind, it.path) }
         fun same(j: Job?) = j != null && j.asset.id == a.id && j.kind == kind
         if (same(currentJob) || queue.any { same(it) }) return
         // Scrub proxies first: they are quick and make the timeline smooth for every clip.
-        if (kind == Kind.SCRUB) queue.add(queue.indexOfFirst { it.kind == Kind.PLAY }.let { if (it < 0) queue.size else it }, Job(a, kind))
+        if (kind == Kind.SCRUB && !clipByClip) queue.add(queue.indexOfFirst { it.kind == Kind.PLAY }.let { if (it < 0) queue.size else it }, Job(a, kind))
         else queue.addLast(Job(a, kind))
         pump()
     }
@@ -171,9 +212,21 @@ class ProxyBuilder(
 
     private val pumpLater = Runnable { pump() }
 
+    /** Whether the hardware H.264 encoder (the one a proxy gets) can hold a constant bitrate. */
+    private val cbrH264: Boolean by lazy {
+        runCatching {
+            android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS).codecInfos
+                .filter { it.isEncoder && it.supportedTypes.any { t -> t.equals(MimeTypes.VIDEO_H264, true) } && (android.os.Build.VERSION.SDK_INT < 29 || it.isHardwareAccelerated) }
+                .firstOrNull()?.getCapabilitiesForType(MimeTypes.VIDEO_H264)?.encoderCapabilities
+                ?.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+        }.getOrNull() ?: false
+    }
+
     private fun start(job: Job) {
         val a = job.asset
-        val out = fileFor(a, job.kind)
+        // HDR clips keep their HDR in the proxy where the phone can encode it; after two failed tries, SDR.
+        val hdr = job.kind != Kind.SEEKABLE && keepsHdr(a) && job.attempt < 2
+        var out = fileFor(a, job.kind, hdr)
         val tmp = File(out.path + ".tmp")
         tmp.delete()
         currentTmp = tmp
@@ -183,8 +236,15 @@ class ProxyBuilder(
         onCodecPressure()
         val listener = object : Transformer.Listener {
             override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                // Named by what was really written: some encoders quietly fall back to SDR.
+                if (hdr && !isHdrFile(tmp)) {
+                    android.util.Log.w("ProxyBuilder", "${a.name}: HDR proxy came out SDR")
+                    out = fileFor(a, job.kind)
+                }
                 if (tmp.renameTo(out) && out.length() > 0) {
                     onReady(a.id, job.kind, out.path)
+                    // The SDR stand-in is no longer needed.
+                    if (out.name.endsWith("h.mp4")) fileFor(a, job.kind).delete()
                     if (job.kind == Kind.PLAY) legacyPlay(a).delete()
                     next()
                 } else {
@@ -239,8 +299,10 @@ class ProxyBuilder(
         if (scrub) settings.setBitrate((outW * outH * fps * 0.35f).toInt().coerceIn(200_000, 600_000)).setiFrameIntervalSeconds(0f)
         // Constant bitrate: left to itself the phone's encoder ignores a low target and spends about 1 Mbps anyway.
         // The short keyframe interval costs some size; the bitrate is raised a little to keep the picture as clean.
+        // Where the phone's H.264 encoder has no constant-bitrate mode (MediaTek's, for one), variable: asked for a mode
+        // it does not have, it refuses the job outright.
         else settings.setBitrate((outW * outH * fps * 0.062f).toInt().coerceIn(400_000, 1_400_000)).setiFrameIntervalSeconds(PLAY_KEYFRAME_S)
-            .setBitrateMode(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            .setBitrateMode(if (cbrH264) MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
         val effects = ArrayList<androidx.media3.common.Effect>()
         if (a.fps > fps + 1f) effects += FrameDropEffect.createDefaultFrameDropEffect(fps)
         effects += Presentation.createForHeight(outH)
@@ -251,7 +313,7 @@ class ProxyBuilder(
             .setEffects(Effects(emptyList(), effects))
             .build()
         val composition = Composition.Builder(EditedMediaItemSequence.Builder(item).build())
-            .setHdrMode(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL)
+            .setHdrMode(if (hdr) Composition.HDR_MODE_KEEP_HDR else Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL)
             .build()
         val encoders = DefaultEncoderFactory.Builder(context)
             .setRequestedVideoEncoderSettings(settings.build())
@@ -263,7 +325,7 @@ class ProxyBuilder(
             com.google.common.collect.ImmutableList.copyOf(all.sortedBy { info -> if (info.name.startsWith("c2.android") || info.name.startsWith("OMX.google")) 0 else 1 })
         }
         val builder = Transformer.Builder(context)
-            .setVideoMimeType(MimeTypes.VIDEO_H264)
+            .setVideoMimeType(if (hdr) MimeTypes.VIDEO_H265 else MimeTypes.VIDEO_H264)
             .setEncoderFactory(encoders.build())
             .addListener(listener)
         if (st.decoderFallback) builder.setAssetLoaderFactory(
@@ -294,6 +356,16 @@ class ProxyBuilder(
         pausedUntil = android.os.SystemClock.uptimeMillis() + backoff
         queue.addFirst(nextTry)
         pump()
+    }
+
+    /** Drops every job for these files, stopping the one running now if it is theirs. */
+    fun cancel(ids: Set<Int>) {
+        queue.removeAll { it.asset.id in ids }
+        val j = currentJob ?: return
+        if (j.asset.id !in ids) return
+        current?.cancel()
+        currentTmp?.delete()
+        next()
     }
 
     private fun next() {

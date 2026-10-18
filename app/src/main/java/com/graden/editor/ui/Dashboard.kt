@@ -92,29 +92,13 @@ private val Rates = listOf(23.976f, 24f, 25f, 29.97f, 30f, 50f, 59.94f, 60f)
 /** Colour spaces, grouped as in a colour-managed desktop project. The note under each says when it is the right one. */
 private class Space(val name: String, val note: String)
 
+/** What a project can be delivered as: every one of them can be written and correctly tagged in a video file. */
 private val SpaceGroups: List<Pair<String, List<Space>>> = listOf(
-    "SDR" to listOf(
-        Space("Rec.709 Gamma 2.4", "Standard HD video, for TVs and most screens"),
-        Space("Rec.709-A", "Rec.709 that looks the same on Apple devices as elsewhere"),
-        Space("sRGB", "Computer and web screens"),
-        Space("Rec.709 Gamma 2.2", "Rec.709 for brighter rooms and phone screens"),
-        Space("Rec.2020 Gamma 2.4", "Wide-gamut SDR"),
-    ),
-    "HDR" to listOf(
-        Space("Rec.2100 HLG", "HDR that also plays acceptably on SDR screens; broadcast and phones"),
-        Space("Rec.2100 ST2084 (PQ)", "HDR10: YouTube, Netflix and most HDR streaming"),
-        Space("P3-D65 ST2084", "HDR mastered for cinema-grade P3 displays"),
-    ),
-    "Wide gamut" to listOf(
-        Space("P3-D65", "Phones, tablets and Apple displays"),
-        Space("P3-DCI", "Digital cinema projection"),
-        Space("DaVinci Wide Gamut", "Very wide working space for grading mixed cameras"),
-        Space("ACEScct", "Academy grading space, with a log curve for colourists"),
-        Space("ACEScc", "Academy grading space, pure log"),
-    ),
+    "SDR" to com.graden.editor.ColorSpaces.outputs.filter { !it.hdr }.map { Space(it.name, it.note) },
+    "HDR" to com.graden.editor.ColorSpaces.outputs.filter { it.hdr }.map { Space(it.name, it.note) },
 )
 private val AllSpaces = SpaceGroups.flatMap { it.second }
-private val WorkingSpaces = listOf("Rec.709 Gamma 2.4", "Rec.2020 Gamma 2.4", "P3-D65", "DaVinci Wide Gamut", "ACEScct")
+private val WorkingSpaces = com.graden.editor.ColorSpaces.working.map { it.name }
 private val MasterNits = listOf(400, 600, 1000, 2000, 4000)
 
 /**
@@ -244,8 +228,9 @@ fun ProjectSheet(open: Boolean, initial: ProjectMeta?, onClose: () -> Unit, onDo
         var preset by remember(open) { mutableStateOf(startPreset) }
         var side by remember(open) { mutableStateOf(start?.shortSide ?: 1080) }
         var fps by remember(open) { mutableStateOf(start?.fps?.takeIf { it in Rates } ?: 30f) }
-        var color by remember(open) { mutableStateOf(start?.colorSpace ?: AllSpaces.first().name) }
-        var working by remember(open) { mutableStateOf(start?.workingSpace ?: WorkingSpaces.first()) }
+        // Older projects may carry names that are no longer offered; they map onto the nearest real space.
+        var color by remember(open) { mutableStateOf(start?.colorSpace?.let { com.graden.editor.ColorSpaces.output(it).name } ?: AllSpaces.first().name) }
+        var working by remember(open) { mutableStateOf(start?.workingSpace?.let { com.graden.editor.ColorSpaces.working(it).name } ?: WorkingSpaces.first()) }
         var nits by remember(open) { mutableStateOf(start?.masterNits ?: 1000) }
         var customW by remember(open) { mutableStateOf((start?.width ?: 1920).toString()) }
         var customH by remember(open) { mutableStateOf((start?.height ?: 1080).toString()) }
@@ -368,6 +353,10 @@ fun ProjectSheet(open: Boolean, initial: ProjectMeta?, onClose: () -> Unit, onDo
 
                 Heading("Timeline colour space")
                 Chips(WorkingSpaces, WorkingSpaces.indexOf(working)) { working = WorkingSpaces[it] }
+                Note(
+                    com.graden.editor.ColorSpaces.working(working).note +
+                        if (ProjectMeta.isHdr(color) && !com.graden.editor.ColorSpaces.working(working).log) ". For HDR output, DaVinci Wide Gamut or ACEScct keeps the highlights." else "",
+                )
                 Note("Where grading happens. A wider space keeps more colour from each camera; export converts to the output space.")
 
                 Heading("Bit depth")

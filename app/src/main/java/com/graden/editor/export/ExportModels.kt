@@ -59,9 +59,19 @@ data class EncoderInfo(
     val soft: Boolean = false,
     /** For a hardware encoder: it takes 10-bit P010 frames, so it can make Main 10. */
     val p010: Boolean = false,
+    /** Can write HDR10 (HEVC Main 10 HDR10, with mastering metadata). HLG needs only 10-bit. */
+    val hdr10: Boolean = false,
+    /**
+     * Built for HDR editing (Android's "hdr-editing" feature, or a ".hdr" encoder): writes the HDR10 metadata into the
+     * stream itself. Some phones' plain encoder (Snapdragon 8 Gen 2's) leaves it out, so HDR exports prefer these.
+     */
+    val hdrEditing: Boolean = false,
+    /** Main 10 that the encoder does not list but makes when asked (MediaTek's Dimensity 9300); the file is checked. */
+    val unlistedMain10: Boolean = false,
 ) {
     /** Offers 10-bit output. */
     val tenBit: Boolean get() = profiles.any { it.tenBit }
+
     /** "Hardware · Qualcomm" or "Software · Android", for the encoder list. */
     val label: String
         get() {
@@ -110,7 +120,12 @@ data class EncoderInfo(
                     val e = c.encoderCapabilities
                     // 10-bit frames reach a hardware encoder as P010 buffers, where it accepts them.
                     val p010 = android.os.Build.VERSION.SDK_INT >= 33 && c.colorFormats.any { it == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUVP010 }
-                    val profiles = c.profileLevels.map { it.profile }.distinct().mapNotNull { profileChoice(codec, it, p010) }.sortedBy { it.label }
+                    var profiles = c.profileLevels.map { it.profile }.distinct().mapNotNull { profileChoice(codec, it, p010) }.sortedBy { it.label }
+                    // An HEVC encoder that takes P010 but lists only Main: some (MediaTek) make true Main 10 all the same.
+                    // Offered, and the output's profile is checked when the export starts.
+                    val unlisted = p010 && codec == VideoCodec.H265 && profiles.none { it.tenBit } && info.name.let { it.startsWith("c2.mtk") || it.startsWith("OMX.MTK") }
+                    if (unlisted) profiles = (profiles + ProfileChoice("Main 10", MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10, true)).sortedBy { it.label }
+                    val hdrEdit = (android.os.Build.VERSION.SDK_INT >= 33 && runCatching { c.isFeatureSupported("hdr-editing") }.getOrDefault(false)) || info.name.endsWith(".hdr")
                     out += EncoderInfo(
                         name = info.name,
                         codec = codec,
@@ -128,6 +143,9 @@ data class EncoderInfo(
                         qualityRange = runCatching { e.qualityRange.let { it.lower..it.upper } }.getOrNull(),
                         caps = v,
                         p010 = p010 && profiles.any { it.tenBit },
+                        hdr10 = p010 && codec == VideoCodec.H265 && c.profileLevels.any { it.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10 },
+                        hdrEditing = hdrEdit,
+                        unlistedMain10 = unlisted,
                     )
                 }
             }
@@ -189,13 +207,18 @@ data class ExportSettings(
     val bitDepth: Int = 8,
     /** For x264 / x265: speed against compression, "ultrafast" to "veryslow". */
     val speedPreset: String = "medium",
+    /** The colour space written out (a name from [com.graden.editor.ColorSpaces.outputs]). */
+    val output: String = "Rec.709 Gamma 2.4",
+    /** What the footage itself was recorded at, scaled to this export ([SourceRate.floor]); not saved with presets. */
+    val sourceFloor: Int = 0,
 ) {
     /** The bitrate the encoder is given, in bits per second. */
     fun videoBitrate(fps: Float, enc: EncoderInfo?): Int {
         val want = when (quality) {
-            QualityMode.AUTO_BEST -> autoBest(codec, width, height, fps)
+            // Never less than the original was recorded at: nothing the camera kept is thrown away.
+            QualityMode.AUTO_BEST -> maxOf(autoBest(codec, width, height, fps), sourceFloor)
             QualityMode.RESTRICT -> bitrate
-            QualityMode.CONSTANT -> autoBest(codec, width, height, fps)
+            QualityMode.CONSTANT -> maxOf(autoBest(codec, width, height, fps), sourceFloor)
         }
         return enc?.let { minOf(want, it.maxBitrate) } ?: want
     }
@@ -204,7 +227,7 @@ data class ExportSettings(
         .put("container", container.name).put("codec", codec.name).put("encoder", encoder)
         .put("w", width).put("h", height).put("quality", quality.name).put("bitrate", bitrate).put("cq", cq)
         .put("rate", rateMode.name).put("profile", profile).put("kf", keyframeEvery)
-        .put("audio", audio).put("abr", audioBitrate).put("norm", normalizeLoudness).put("depth", bitDepth).put("speed", speedPreset)
+        .put("audio", audio).put("abr", audioBitrate).put("norm", normalizeLoudness).put("depth", bitDepth).put("speed", speedPreset).put("out", output)
 
     companion object {
         /**
@@ -228,7 +251,7 @@ data class ExportSettings(
             profile = o.optInt("profile", 0), keyframeEvery = o.optInt("kf", 0),
             audio = o.optBoolean("audio", true), audioBitrate = o.optInt("abr", 320_000),
             normalizeLoudness = o.optBoolean("norm", false),
-            bitDepth = o.optInt("depth", 8), speedPreset = o.optString("speed", "medium"),
+            bitDepth = o.optInt("depth", 8), speedPreset = o.optString("speed", "medium"), output = o.optString("out", "Rec.709 Gamma 2.4"),
         )
     }
 }

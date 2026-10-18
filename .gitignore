@@ -23,3 +23,6 @@ app/src/main/cpp/third_party/lib/
 *.iml
 .DS_Store
 .vscode/
+
+# OpenCV (Apache-2.0), fetched by scripts/fetch-opencv.sh
+app/src/main/cpp/third_party/opencv/

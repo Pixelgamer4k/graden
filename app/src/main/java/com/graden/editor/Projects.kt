@@ -27,6 +27,9 @@ data class ProjectMeta(
     val workingSpace: String = "Rec.709 Gamma 2.4",
     /** Peak brightness the picture is mastered for, in nits; only used when the output is HDR. */
     val masterNits: Int = 1000,
+    /** How light beyond the output's range is brought into it, and colours outside its gamut (see ColorSpaces). */
+    val toneMap: String = "DaVinci",
+    val gamutMap: String = "Saturation Compression",
     /** A size typed in by hand; when set it overrides the preset shape and [shortSide]. */
     val customW: Int = 0,
     val customH: Int = 0,
@@ -50,7 +53,7 @@ data class ProjectMeta(
 
     fun toJson(): JSONObject = JSONObject().put("name", name).put("created", created).put("preset", preset)
         .put("aspectW", aspectW).put("aspectH", aspectH).put("shortSide", shortSide).put("fps", fps.toDouble()).put("colorSpace", colorSpace)
-        .put("workingSpace", workingSpace).put("masterNits", masterNits)
+        .put("workingSpace", workingSpace).put("masterNits", masterNits).put("toneMap", toneMap).put("gamutMap", gamutMap)
         .put("customW", customW).put("customH", customH).put("scaling", scaling).put("bitDepth", bitDepth)
         .put("sampleRate", sampleRate).put("loudness", loudness?.toDouble() ?: JSONObject.NULL).put("startTcSec", startTcSec)
 
@@ -63,6 +66,7 @@ data class ProjectMeta(
                 o.optInt("aspectW", 16), o.optInt("aspectH", 9), o.optInt("shortSide", 1080),
                 o.optDouble("fps", 30.0).toFloat(), legacySpace(o.optString("colorSpace", "Rec.709 Gamma 2.4")),
                 legacySpace(o.optString("workingSpace", o.optString("colorSpace", "Rec.709 Gamma 2.4"))), o.optInt("masterNits", 1000),
+                o.optString("toneMap", "DaVinci"), o.optString("gamutMap", "Saturation Compression"),
                 o.optInt("customW", 0), o.optInt("customH", 0), o.optString("scaling", "Fit").let { if (it == "Stretch") "Fit" else it }, o.optInt("bitDepth", 8),
                 o.optInt("sampleRate", 48_000), if (o.isNull("loudness")) null else o.optDouble("loudness", -14.0).toFloat(), o.optInt("startTcSec", 0),
             )
@@ -131,7 +135,10 @@ class Projects(private val context: Context) {
     fun list(): List<ProjectSummary> {
         migrate()
         return (root.listFiles() ?: emptyArray()).filter { it.isDirectory }.mapNotNull { dir ->
-            val loaded = ProjectStore(dir).load() ?: return@mapNotNull null
+            val store = ProjectStore(dir)
+            store.summary(dir.name)?.let { return@mapNotNull it }
+            val loaded = store.load() ?: return@mapNotNull null
+            store.writeSummary(loaded.meta, loaded.tracks, loaded.assets)
             val base = loaded.tracks.firstOrNull { it.id == 0 }
             ProjectSummary(
                 dir.name, loaded.meta, File(dir, "project.json").lastModified(),

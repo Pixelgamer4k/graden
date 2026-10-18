@@ -36,6 +36,9 @@ class ProjectStore(private val dir: File) {
                     .put("durationUs", a.durationUs).put("width", a.width).put("height", a.height)
                     .put("fps", a.fps.toDouble()).put("hasAudio", a.hasAudio).put("hdr", a.hdr).put("mime", a.mime).put("tier", a.tier)
                     .apply { if (a.isReversed) put("revOf", a.reverseOf).put("revIn", a.revInUs).put("revOut", a.revOutUs) }
+                    .apply { if (a.fullRange) put("fr", true) }
+                    .apply { if (a.hlg) put("hlg", true) }
+                    .apply { if (a.isRaw) put("raw", a.raw).put("rawCal", a.rawCal).put("rawHalf", a.rawHalf).put("rawShade", a.rawShading) }
             )
         })
         root.put("tracks", JSONArray().apply {
@@ -53,6 +56,7 @@ class ProjectStore(private val dir: File) {
             file.delete()
             tmp.renameTo(file)
         }
+        writeSummary(meta, tracks, assets.associateBy { it.id })
     }
 
     private fun clipsJson(list: List<Clip>) = JSONArray().apply {
@@ -65,6 +69,8 @@ class ProjectStore(private val dir: File) {
                     .put("cr", c.tf.cropR.toDouble()).put("cb", c.tf.cropB.toDouble()).put("fh", c.tf.flipH).put("fv", c.tf.flipV))
                 .put("sp", c.speed.toDouble())
                 .putOpt("gr", if (c.grade.isIdentity) null else c.grade.toJson())
+                .putOpt("cs", c.cs)
+                .putOpt("stab", c.stab?.toJson())
                 .putOpt("snd", if (c.snd.isDefault) null else JSONObject().put("v", c.snd.volume.toDouble()).put("m", c.snd.muted)
                     .put("n", c.snd.normalize).put("fi", c.snd.fadeInUs).put("fo", c.snd.fadeOutUs).put("p", c.snd.pan.toDouble())
                     .put("b", c.snd.bass.toDouble()).put("mi", c.snd.mid.toDouble()).put("t", c.snd.treble.toDouble()).put("pi", c.snd.pitch.toDouble()))
@@ -87,10 +93,37 @@ class ProjectStore(private val dir: File) {
                 } ?: Snd(),
                 o.optDouble("sp", 1.0).toFloat().coerceIn(0.1f, 10f),
                 Grade.fromJson(o.optJSONObject("gr")),
+                o.optString("cs").ifEmpty { null },
+                Stab.fromJson(o.optJSONObject("stab")),
             )
         }
 
     private val history = File(dir, "history.json")
+    private val summaryFile = File(dir, "summary.json")
+
+    /** What the project list shows, in a file of its own so the list never reads whole projects. */
+    fun writeSummary(meta: ProjectMeta, tracks: List<Track>, assets: Map<Int, MediaAsset>) {
+        runCatching {
+            val cover = tracks.firstOrNull { it.id == 0 }?.clips?.firstNotNullOfOrNull { assets[it.assetId]?.takeIf { a -> !a.isAudio } }
+            val o = JSONObject().put("meta", meta.toJson()).put("durationUs", tracks.maxOfOrNull { it.endUs } ?: 0L).put("clips", tracks.sumOf { it.clips.size })
+                .putOpt("cover", cover?.let { JSONObject().put("id", it.id).put("uri", it.uri).put("name", it.name).put("w", it.width).put("h", it.height).put("mime", it.mime) })
+            val tmp = File(summaryFile.path + ".tmp")
+            tmp.writeText(o.toString())
+            if (!tmp.renameTo(summaryFile)) { summaryFile.delete(); tmp.renameTo(summaryFile) }
+        }
+    }
+
+    /** The project as the list shows it, from its summary when that is up to date; null when it must be read in full. */
+    fun summary(id: String): ProjectSummary? = runCatching {
+        if (!summaryFile.exists() || summaryFile.lastModified() + 2000 < file.lastModified()) return null
+        val o = JSONObject(summaryFile.readText())
+        val c = o.optJSONObject("cover")
+        ProjectSummary(
+            id, ProjectMeta.fromJson(o.optJSONObject("meta"), ProjectMeta.defaultName(file.lastModified()), file.lastModified()), file.lastModified(),
+            o.optLong("durationUs"), o.optInt("clips"),
+            c?.let { MediaAsset(it.optInt("id"), it.getString("uri"), it.optString("name"), 0L, it.optInt("w"), it.optInt("h"), 30f, false, false, it.optString("mime")) },
+        )
+    }.getOrNull()
 
     private fun tracksJson(tracks: List<Track>) = JSONArray().apply {
         for (t in tracks) put(JSONObject().put("id", t.id).put("video", t.video).put("name", t.name).put("clips", clipsJson(t.clips)))
@@ -142,6 +175,7 @@ class ProjectStore(private val dir: File) {
                     o.getInt("width"), o.getInt("height"), o.getDouble("fps").toFloat(),
                     o.getBoolean("hasAudio"), o.getBoolean("hdr"), o.getString("mime"), o.optInt("tier", 0),
                     o.optInt("revOf", -1), o.optLong("revIn", 0L), o.optLong("revOut", 0L),
+                    o.optString("raw").ifEmpty { null }, o.optString("rawCal").ifEmpty { null }, o.optBoolean("rawHalf"), o.optBoolean("rawShade", true), o.optBoolean("fr"), o.optBoolean("hlg"),
                 )
             }
             fun clips(ca: JSONArray) = readClips(ca).filter { it.assetId in assets }

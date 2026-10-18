@@ -22,6 +22,9 @@ import java.nio.ByteBuffer
 
 /** The one export running (or last finished), watched by the export screen and the notification. */
 object ExportJob {
+    /** Testing only (GradenLab): 10-bit goes the old way, read back as P010, to compare against the surface route. */
+    @Volatile var forceP010 = false
+
     enum class Phase { IDLE, AUDIO, VIDEO, SAVING, DONE, FAILED, CANCELLED }
 
     var phase by mutableStateOf(Phase.IDLE)
@@ -121,10 +124,14 @@ class ExportEngine(
             ui { ExportJob.phase = ExportJob.Phase.VIDEO }
             val total = ((project.totalUs * fps) / 1_000_000.0).toLong().coerceAtLeast(1L).toInt()
             ui { ExportJob.framesTotal = total }
-            val tenBit = s.bitDepth == 10 && enc.tenBit
-            // Three ways to the encoder: the GPU draws straight into a hardware encoder (8-bit); or the frame is read
-            // back and given to x264 / x265; or (10-bit hardware) read back, converted to P010 and queued.
-            val route = if (enc.soft) Route.SOFT else if (tenBit) Route.P010 else Route.SURFACE
+            val out = com.graden.editor.ColorSpaces.output(s.output)
+            // HDR needs 10 bits; it is only offered where the encoder can do it.
+            val tenBit = (s.bitDepth == 10 || out.hdr) && enc.tenBit
+            if (out.hdr && !tenBit) error("This encoder cannot write HDR; choose an SDR output")
+            // The ways to the encoder: the GPU draws straight into a hardware encoder's surface (8-bit, or 10-bit
+            // RGBA1010102 where the GPU can: every chip tested); else 10-bit is read back as P010 and queued; or the
+            // frame is read back and given to x264 / x265.
+            var route = if (enc.soft) Route.SOFT else if (tenBit) (if (ExportJob.forceP010) Route.P010 else Route.SURFACE10) else Route.SURFACE
             val comp = Compositor(context, project, s.width, s.height, tenBit)
             val muxer = MediaMuxer(video.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             var videoTrack = -1
@@ -136,6 +143,12 @@ class ExportEngine(
             val audioInfo = MediaCodec.BufferInfo()
 
             fun startMuxer(videoFormat: MediaFormat) {
+                // 10-bit asked of a hardware HEVC encoder: the stream must really be Main 10 (an encoder may quietly
+                // make 8-bit Main instead, which would turn HDR into banded SDR).
+                if (tenBit && !enc.soft && s.codec == VideoCodec.H265) {
+                    val idc = hevcProfileIdc(videoFormat)
+                    if (idc == 1) error("This phone's ${enc.label} encoder made 8-bit video when asked for 10-bit, so HDR cannot be written here; choose SDR")
+                }
                 videoTrack = muxer.addTrack(videoFormat)
                 if (audioFormat != null) audioTrack = muxer.addTrack(audioFormat)
                 muxer.start()
@@ -182,7 +195,7 @@ class ExportEngine(
             }
 
             val (fpsNum, fpsDen) = fraction(fps)
-            val frameBuf = if (route != Route.SURFACE) ByteBuffer.allocateDirect(s.width * s.height * 4).order(java.nio.ByteOrder.nativeOrder()) else null
+            val frameBuf = if (route == Route.SOFT) ByteBuffer.allocateDirect(s.width * s.height * 4).order(java.nio.ByteOrder.nativeOrder()) else null
             val outBuf = if (route == Route.SOFT) ByteBuffer.allocateDirect(s.width * s.height * 2 + 1_000_000) else null
             val meta = LongArray(2)
             val softInfo = MediaCodec.BufferInfo()
@@ -205,16 +218,35 @@ class ExportEngine(
                     Route.SURFACE -> {
                         val c = MediaCodec.createByCodecName(enc.name)
                         codec = c
-                        val format = encoderFormat(fps, false)
+                        val format = encoderFormat(fps, false, out)
                         configure(c, format)
                         input = c.createInputSurface()
                         c.start()
                         comp.start(input)
                     }
+                    Route.SURFACE10 -> {
+                        val c = MediaCodec.createByCodecName(enc.name)
+                        codec = c
+                        configure(c, encoderFormat(fps, true, out, surface = true))
+                        input = c.createInputSurface()
+                        c.start()
+                        if (!comp.start(input, tenBitSurface = true)) {
+                            // This GPU cannot draw 10 bits into the encoder: the frame is read back as P010 instead.
+                            android.util.Log.i("ExportProbe", "no 10-bit encoder surface; P010 read-back")
+                            runCatching { c.stop() }; c.release(); input?.release(); input = null
+                            route = Route.P010
+                            val c2 = MediaCodec.createByCodecName(enc.name)
+                            codec = c2
+                            configure(c2, encoderFormat(fps, true, out))
+                            c2.start()
+                            comp.start(null)
+                            if (!comp.tenBit) error("This phone's GPU cannot render in 10-bit; choose 8-bit")
+                        }
+                    }
                     Route.P010 -> {
                         val c = MediaCodec.createByCodecName(enc.name)
                         codec = c
-                        configure(c, encoderFormat(fps, true))
+                        configure(c, encoderFormat(fps, true, out))
                         c.start()
                         comp.start(null)
                         if (!comp.tenBit) error("This phone's GPU cannot render in 10-bit; choose 8-bit")
@@ -237,18 +269,18 @@ class ExportEngine(
 
                 val t0 = SystemClock.elapsedRealtime()
                 var lastUi = 0L
+                var packNs = 0L
                 for (n in 0 until total) {
                     if (ExportJob.cancel) throw Cancelled()
                     val us = frameUs(n.toLong())
                     comp.render(us, us * 1000L)
                     when (route) {
-                        Route.SURFACE -> drain(false)
+                        Route.SURFACE, Route.SURFACE10 -> drain(false)
                         Route.SOFT -> {
                             val fmt = comp.readFrame(frameBuf!!)
                             writeSoft(soft!!.encode(frameBuf, fmt, outBuf!!, meta))
                         }
                         Route.P010 -> {
-                            val fmt = comp.readFrame(frameBuf!!)
                             val c = codec!!
                             var idx: Int
                             while (true) {
@@ -261,8 +293,10 @@ class ExportEngine(
                             val stride = inFmt.getIntegerOr(MediaFormat.KEY_STRIDE, s.width * 2).coerceAtLeast(s.width * 2)
                             val slice = inFmt.getIntegerOr(MediaFormat.KEY_SLICE_HEIGHT, s.height).coerceAtLeast(s.height)
                             val ib = c.getInputBuffer(idx)!!
-                            ib.clear()
-                            SoftEncoder.nativeToP010(frameBuf, fmt, s.width, s.height, ib, stride, slice)
+                            val tp = System.nanoTime()
+                            comp.packP010(ib, out == com.graden.editor.ColorSpaces.REC2020 || out.hdr, stride, slice)
+                            packNs += System.nanoTime() - tp
+                            if (n % 60 == 59) { android.util.Log.d("ExportProbe", "P010 read back and packed: %.1f ms a frame".format(packNs / 6e7)); packNs = 0L }
                             c.queueInputBuffer(idx, 0, stride * slice * 3 / 2, us, 0)
                             drain(false)
                         }
@@ -284,7 +318,7 @@ class ExportEngine(
                 }
                 // The end of the stream: whatever the encoder still holds comes out.
                 when (route) {
-                    Route.SURFACE -> { codec!!.signalEndOfInputStream(); drain(true) }
+                    Route.SURFACE, Route.SURFACE10 -> { codec!!.signalEndOfInputStream(); drain(true) }
                     Route.P010 -> {
                         val c = codec!!
                         var idx: Int
@@ -341,8 +375,55 @@ class ExportEngine(
 
     private class Cancelled : Exception()
 
+    /** general_profile_idc of the HEVC stream whose headers are in [f] (1 Main, 2 Main 10), or -1 when not found. */
+    private fun hevcProfileIdc(f: MediaFormat): Int {
+        val csd = f.getByteBuffer("csd-0") ?: return -1
+        val b = ByteArray(csd.remaining()).also { csd.duplicate().get(it) }
+        var i = 0
+        while (i + 6 < b.size) {
+            // Start code, then the NAL header: type 33 is the SPS; after its first byte comes the profile.
+            if (b[i].toInt() == 0 && b[i + 1].toInt() == 0 && b[i + 2].toInt() == 1) {
+                val type = (b[i + 3].toInt() shr 1) and 0x3F
+                if (type == 33) return b[i + 6].toInt() and 0x1F
+                i += 3
+            } else i++
+        }
+        return -1
+    }
+
     /** The encoder's settings, exactly as chosen: nothing is lowered behind the user's back. */
-    private enum class Route { SURFACE, SOFT, P010 }
+    private enum class Route { SURFACE, SURFACE10, SOFT, P010 }
+
+    /** Tags [f] with what the picture is: primaries, transfer and range, as players read them. */
+    private fun colourTags(f: MediaFormat, out: com.graden.editor.ColorSpaces.Space) {
+        val wide = out == com.graden.editor.ColorSpaces.REC2020 || out.hdr
+        f.setInteger(MediaFormat.KEY_COLOR_STANDARD, if (wide) MediaFormat.COLOR_STANDARD_BT2020 else MediaFormat.COLOR_STANDARD_BT709)
+        f.setInteger(
+            MediaFormat.KEY_COLOR_TRANSFER, when (out) {
+                com.graden.editor.ColorSpaces.PQ -> MediaFormat.COLOR_TRANSFER_ST2084
+                com.graden.editor.ColorSpaces.HLG -> MediaFormat.COLOR_TRANSFER_HLG
+                else -> MediaFormat.COLOR_TRANSFER_SDR_VIDEO
+            },
+        )
+        f.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+    }
+
+    /**
+     * HDR10 static metadata (CTA-861.3 / SMPTE ST 2086): Rec.2020 mastering display, peak [nits], and the content
+     * light levels, as the 25 bytes MediaFormat takes.
+     */
+    private fun hdrStaticInfo(nits: Float): ByteBuffer {
+        val b = ByteBuffer.allocate(25).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        b.put(0)
+        fun xy(x: Double, y: Double) { b.putShort((x / 0.00002).toInt().toShort()); b.putShort((y / 0.00002).toInt().toShort()) }
+        xy(0.708, 0.292); xy(0.170, 0.797); xy(0.131, 0.046); xy(0.3127, 0.3290)
+        b.putShort(nits.toInt().toShort())
+        b.putShort(50)
+        b.putShort(nits.toInt().toShort())
+        b.putShort(minOf(400, nits.toInt()).toShort())
+        b.flip()
+        return b
+    }
 
     /** Configures [c] with [format]; some encoders refuse B-frames or a profile, so the plain form is tried next. */
     private fun configure(c: MediaCodec, format: MediaFormat) {
@@ -394,14 +475,13 @@ class ExportEngine(
             val ps = nals.filter { type(it) in 32..34 }.fold(ByteArray(0)) { acc, b -> acc + b }
             f.setByteBuffer("csd-0", ByteBuffer.wrap(ps))
         }
-        f.setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
-        f.setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
-        f.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+        colourTags(f, com.graden.editor.ColorSpaces.output(s.output))
         return f
     }
 
-    private fun encoderFormat(fps: Float, p010: Boolean): MediaFormat = MediaFormat.createVideoFormat(s.codec.mime, s.width, s.height).apply {
-        setInteger(MediaFormat.KEY_COLOR_FORMAT, if (p010) MediaCodecInfo.CodecCapabilities.COLOR_FormatYUVP010 else MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+    /** [p010]: 10-bit (a 10-bit profile), from P010 buffers, or from the surface when [surface]. */
+    private fun encoderFormat(fps: Float, p010: Boolean, out: com.graden.editor.ColorSpaces.Space, surface: Boolean = false): MediaFormat = MediaFormat.createVideoFormat(s.codec.mime, s.width, s.height).apply {
+        setInteger(MediaFormat.KEY_COLOR_FORMAT, if (p010 && !surface) MediaCodecInfo.CodecCapabilities.COLOR_FormatYUVP010 else MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
         setFloat(MediaFormat.KEY_FRAME_RATE, fps)
         if (s.quality == QualityMode.CONSTANT && enc.supportsCq) {
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ)
@@ -412,14 +492,14 @@ class ExportEngine(
         }
         // Keyframes: as chosen, else one a second.
         if (s.keyframeEvery > 0) setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, s.keyframeEvery / fps) else setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-        val profile = if (s.profile != 0 && enc.profiles.any { it.value == s.profile && it.tenBit == p010 }) s.profile
+        val profile = if (out == com.graden.editor.ColorSpaces.PQ) (if (enc.hdr10 || !enc.unlistedMain10) MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10 else MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10)
+            else if (s.profile != 0 && enc.profiles.any { it.value == s.profile && it.tenBit == p010 }) s.profile
             else enc.profiles.filter { it.tenBit == p010 }.maxByOrNull { if (it.label.startsWith("High") || it.label.startsWith("Main")) 2 else 1 }?.value ?: 0
         if (profile != 0) setInteger(MediaFormat.KEY_PROFILE, profile)
         if (profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh || profile == MediaCodecInfo.CodecProfileLevel.AVCProfileMain ||
             profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain || profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10) setInteger(MediaFormat.KEY_MAX_B_FRAMES, 2)
-        setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
-        setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
-        setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+        colourTags(this, out)
+        if (out == com.graden.editor.ColorSpaces.PQ) setByteBuffer(MediaFormat.KEY_HDR_STATIC_INFO, hdrStaticInfo(project.nits))
         // Not real time: the encoder may take as long as it needs for each frame.
         setInteger(MediaFormat.KEY_PRIORITY, 1)
     }

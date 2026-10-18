@@ -12,12 +12,12 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 
-enum class ScopeType(val label: String) { WAVEFORM("Waveform"), PARADE("Parade"), VECTOR("Vectorscope"), HISTOGRAM("Histogram"), CIE("CIE") }
+enum class ScopeType(val label: String) { WAVEFORM("Waveform"), PARADE("Parade"), VECTOR("Vectorscope"), HISTOGRAM("Histogram"), CIE("CIE"), HDR("HDR") }
 
 /** Which traces a waveform or histogram draws. */
 enum class WaveMode(val label: String) { Y("Y"), RGB("RGB"), YRGB("YRGB") }
 enum class ParadeMode(val label: String) { RGB("RGB"), YRGB("YRGB"), YCBCR("YCbCr") }
-enum class ScopeScale(val label: String) { TEN_BIT("10-bit"), PERCENT("%") }
+enum class ScopeScale(val label: String) { AUTO("Auto"), TEN_BIT("10-bit"), PERCENT("%"), NITS("Nits") }
 enum class CieSpace(val label: String) { XY("CIE 1931 xy"), UV("CIE 1976 u′v′") }
 
 /**
@@ -38,7 +38,20 @@ data class ScopeSettings(
     /** Trace brightness and graticule brightness, 0..1. */
     val brightness: Float = 0.6f,
     val graticule: Float = 0.5f,
-    val scale: ScopeScale = ScopeScale.TEN_BIT,
+    /** Auto: nits for an HDR signal, 10-bit for SDR. */
+    val scale: ScopeScale = ScopeScale.AUTO,
+    /** HDR reference lines: SDR reference white (203 nits), the master's peak, this screen's peak. */
+    val refSdrWhite: Boolean = true,
+    val refPeak: Boolean = true,
+    val refScreen: Boolean = false,
+    /** HDR scope: shade the SDR, HDR and over-peak zones; count on a log scale. */
+    val hdrZones: Boolean = true,
+    val hdrLog: Boolean = true,
+    /** What the read-back signal is (set by the editor): Rec.2100 PQ when true, else Rec.709 SDR. */
+    val hdr: Boolean = false,
+    /** The master's peak and the screen's, in nits. */
+    val peakNits: Int = 1000,
+    val screenNits: Int = 540,
     /** "Highs and lows": reference lines at these 10-bit levels. */
     val refLevels: Boolean = false,
     val refHigh: Int = 940,
@@ -59,6 +72,9 @@ data class ScopeSettings(
  * changed setting redraws straight away even when paused.
  */
 class ScopeEngine(private val onImage: (Bitmap) -> Unit) {
+    /** Light-level figures of the latest picture, for the HDR scope. */
+    class Stats(val maxCll: Float, val maxFall: Float, val aboveSdr: Float, val abovePeak: Float)
+    @Volatile var onStats: ((Stats) -> Unit)? = null
     private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "scopes").apply { priority = Thread.NORM_PRIORITY - 1 } }
     private val main = Handler(Looper.getMainLooper())
     private val busy = AtomicBoolean(false)
@@ -124,6 +140,25 @@ class ScopeEngine(private val onImage: (Bitmap) -> Unit) {
 
     fun release() = worker.shutdown()
 
+    /** The picture's colour at ([x], [y]) (0..1, y down), as the scopes last saw it; null before any picture. */
+    fun sample(x: Float, y: Float): FloatArray? = synchronized(lock) {
+        if (fw == 0 || fh == 0) return null
+        val px = (x * fw).toInt().coerceIn(0, fw - 1)
+        // Read back bottom row first.
+        val py = ((1f - y) * fh).toInt().coerceIn(0, fh - 1)
+        // A 3×3 average, so one noisy pixel does not decide it.
+        val out = FloatArray(3)
+        var n = 0
+        for (dy in -1..1) for (dx in -1..1) {
+            val xx = (px + dx).coerceIn(0, fw - 1); val yy = (py + dy).coerceIn(0, fh - 1)
+            val i = (yy * fw + xx) * 4
+            for (c in 0..2) out[c] += (frame[i + c].toInt() and 255) / 255f
+            n++
+        }
+        for (c in 0..2) out[c] /= n
+        out
+    }
+
     private fun bitmap(w: Int, h: Int): Bitmap {
         val k = (w.toLong() shl 32) or h.toLong()
         val pair = pool.getOrPut(k) { Array(3) { Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888) } }
@@ -145,6 +180,73 @@ class ScopeEngine(private val onImage: (Bitmap) -> Unit) {
         ScopeType.VECTOR -> vector(s, f, w, h)
         ScopeType.HISTOGRAM -> histogram(s, f, w, h)
         ScopeType.CIE -> cie(s, f, w, h)
+        ScopeType.HDR -> hdr(s, f, w, h)
+    }
+
+    // Per code value: its luma weights and its light in nits, for the signal the scopes are given.
+    private val pqNits = FloatArray(256) { v -> pqToNits(v / 255f) }
+    private val sdrNits = FloatArray(256) { v -> (v / 255f).pow(2.4f) * 100f }
+
+    private fun pqToNits(e: Float): Float {
+        val p = e.toDouble().pow(1.0 / 78.84375)
+        return (Math.pow(max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p), 1.0 / 0.1593017578125) * 10000.0).toFloat()
+    }
+
+    /**
+     * The HDR scope: how much of the picture sits at each brightness, on the PQ scale from 0 to 10,000 nits (bars across,
+     * brightness up), with the SDR, HDR and over-peak zones; and the frame's MaxCLL, MaxFALL and share above SDR white.
+     */
+    private fun hdr(s: ScopeSettings, f: ByteArray, w: Int, h: Int): Bitmap {
+        val bins = 256
+        val hist = IntArray(bins)
+        val nits = if (s.hdr) pqNits else sdrNits
+        var maxCll = 0f
+        var sum = 0.0
+        var above = 0
+        var over = 0
+        for (i in 0 until w * h) {
+            val o = i * 4
+            val m = max(f[o].toInt() and 255, max(f[o + 1].toInt() and 255, f[o + 2].toInt() and 255))
+            val n = nits[m]
+            if (n > maxCll) maxCll = n
+            sum += n
+            if (n > 203f) above++
+            if (n > s.peakNits) over++
+            // Binned by PQ code, so the bars line up with the nits scale whatever the signal.
+            val code = if (s.hdr) m else (nitsToPq(n) * 255f).toInt().coerceIn(0, 255)
+            hist[code]++
+        }
+        val total = (w * h).coerceAtLeast(1)
+        onStats?.let { cb -> main.post { cb(Stats(maxCll, (sum / total).toFloat(), above * 100f / total, over * 100f / total)) } }
+        val ow = 256
+        val oh = 256
+        val out = pixels(ow * oh)
+        java.util.Arrays.fill(out, 0)
+        var peak = 1
+        for (v in hist) peak = max(peak, v)
+        val sdrRow = (nitsToPq(203f) * (bins - 1)).toInt()
+        val peakRow = (nitsToPq(s.peakNits.toFloat()) * (bins - 1)).toInt()
+        val level = 0.5f + s.brightness * 0.5f
+        for (code in 0 until bins) {
+            val v = hist[code]
+            val y = oh - 1 - code * (oh - 1) / (bins - 1)
+            if (s.hdrZones) {
+                // Faint bands behind the bars: HDR range gold, beyond the master's peak red.
+                val band = when { code > peakRow -> Trace(60, 14, 14); code > sdrRow -> Trace(40, 30, 8); else -> null }
+                if (band != null) for (x in 0 until ow) add(out, y * ow + x, band.r, band.g, band.b)
+            }
+            if (v == 0) continue
+            val t = if (s.hdrLog) ln(1f + v) / ln(1f + peak) else v.toFloat() / peak
+            val len = (t * (ow - 1)).toInt().coerceAtLeast(1)
+            val ink = when { code > peakRow -> red; code > sdrRow -> Trace(240, 190, 80); else -> white }
+            for (x in 0 until len) add(out, y * ow + x, (ink.r * level).toInt(), (ink.g * level).toInt(), (ink.b * level).toInt())
+        }
+        return finish(out, ow, oh)
+    }
+
+    private fun nitsToPq(n: Float): Float {
+        val y = (n / 10000f).coerceIn(0f, 1f).toDouble().pow(0.1593017578125)
+        return ((0.8359375 + 18.8515625 * y) / (1 + 18.6875 * y)).pow(78.84375).toFloat()
     }
 
     private class Trace(val r: Int, val g: Int, val b: Int)
@@ -161,6 +263,9 @@ class ScopeEngine(private val onImage: (Bitmap) -> Unit) {
      * an exposure curve, so a thin trace is visible and a dense one does not burn out.
      */
     private fun waveform(s: ScopeSettings, f: ByteArray, w: Int, h: Int, parade: Boolean): Bitmap {
+        // Luma weights of the signal: Rec.2020 for HDR, Rec.709 otherwise.
+        val kr = if (s.hdr) 0.2627f else 0.2126f
+        val kb = if (s.hdr) 0.0593f else 0.0722f
         // Channels: 0 Y, 1 R, 2 G, 3 B, 4 Cb, 5 Cr.
         val chans = ArrayList<Int>()
         if (parade) when (s.parade) {
@@ -196,15 +301,15 @@ class ScopeEngine(private val onImage: (Bitmap) -> Unit) {
                     r = (r + pr) * 0.5f; g = (g + pg) * 0.5f; b = (b + pb) * 0.5f
                 }
                 pr = r; pg = g; pb = b
-                val yl = 0.2126f * r + 0.7152f * g + 0.0722f * b
+                val yl = kr * r + (1f - kr - kb) * g + kb * b
                 for ((k, ch) in chans.withIndex()) {
                     val v = when (ch) {
                         0 -> yl
                         1 -> r
                         2 -> g
                         3 -> b
-                        4 -> (b - yl) / 1.8556f + 0.5f
-                        else -> (r - yl) / 1.5748f + 0.5f
+                        4 -> (b - yl) / (2f * (1f - kb)) + 0.5f
+                        else -> (r - yl) / (2f * (1f - kr)) + 0.5f
                     }
                     val col = (if (parade) k * secW else 0) + x * (if (parade) secW else ow) / w
                     val row = oh - 1 - (v * (oh - 1)).toInt().coerceIn(0, oh - 1)
@@ -283,17 +388,20 @@ class ScopeEngine(private val onImage: (Bitmap) -> Unit) {
         val counts = IntArray(n * n)
         val sr = IntArray(n * n); val sg = IntArray(n * n); val sb = IntArray(n * n)
         val zoom = if (s.vecZoom2x) 2f else 1f
-        // The full Cb/Cr range (±0.5) reaches the edge of the circle, at 0.45 of the image.
-        val k = n * 0.9f * zoom
+        // Chroma 0.6 reaches the circle (0.45 of the image), so every 100% bar target sits inside it.
+        val k = n * VEC_SCALE * zoom
+        // An HDR signal is Rec.2020: its own luma and colour-difference weights.
+        val kr = if (s.hdr) 0.2627f else 0.2126f
+        val kb = if (s.hdr) 0.0593f else 0.0722f
         val step = if (s.lowPass) 2 else 1
         for (y in 0 until h step step) for (x in 0 until w step step) {
             val i = (y * w + x) * 4
             val r = (f[i].toInt() and 255) / 255f
             val g = (f[i + 1].toInt() and 255) / 255f
             val b = (f[i + 2].toInt() and 255) / 255f
-            val yl = 0.2126f * r + 0.7152f * g + 0.0722f * b
-            val cb = (b - yl) / 1.8556f
-            val cr = (r - yl) / 1.5748f
+            val yl = kr * r + (1f - kr - kb) * g + kb * b
+            val cb = (b - yl) / (2f * (1f - kb))
+            val cr = (r - yl) / (2f * (1f - kr))
             val px = (n / 2 + cb * k).toInt()
             val py = (n / 2 - cr * k).toInt()
             if (px !in 0 until n || py !in 0 until n) continue
@@ -327,7 +435,7 @@ class ScopeEngine(private val onImage: (Bitmap) -> Unit) {
             val r = f[o].toInt() and 255
             val g = f[o + 1].toInt() and 255
             val b = f[o + 2].toInt() and 255
-            hist[0][((0.2126f * r + 0.7152f * g + 0.0722f * b).toInt()).coerceIn(0, 255)]++
+            hist[0][(if (s.hdr) 0.2627f * r + 0.6780f * g + 0.0593f * b else 0.2126f * r + 0.7152f * g + 0.0722f * b).toInt().coerceIn(0, 255)]++
             hist[1][r]++
             hist[2][g]++
             hist[3][b]++
@@ -369,17 +477,21 @@ class ScopeEngine(private val onImage: (Bitmap) -> Unit) {
         val n = 320
         val counts = IntArray(n * n)
         val sr = IntArray(n * n); val sg = IntArray(n * n); val sb = IntArray(n * n)
-        val lin = FloatArray(256) { v -> val c = v / 255f; if (c < 0.081f) c / 4.5f else ((c + 0.099f) / 1.099f).pow(1f / 0.45f) }
+        val lin = if (s.hdr) FloatArray(256) { v -> pqNits[v] / 10000f }
+            else FloatArray(256) { v -> val c = v / 255f; if (c < 0.081f) c / 4.5f else ((c + 0.099f) / 1.099f).pow(1f / 0.45f) }
+        // Rec.2020 or Rec.709 primaries to XYZ.
+        val m = if (s.hdr) floatArrayOf(0.6370f, 0.1446f, 0.1689f, 0.2627f, 0.6780f, 0.0593f, 0.0f, 0.0281f, 1.0610f)
+            else floatArrayOf(0.4124f, 0.3576f, 0.1805f, 0.2126f, 0.7152f, 0.0722f, 0.0193f, 0.1192f, 0.9505f)
         val uv = s.cie == CieSpace.UV
         for (i in 0 until w * h) {
             val o = i * 4
             val r8 = f[o].toInt() and 255; val g8 = f[o + 1].toInt() and 255; val b8 = f[o + 2].toInt() and 255
             val r = lin[r8]; val g = lin[g8]; val b = lin[b8]
-            val X = 0.4124f * r + 0.3576f * g + 0.1805f * b
-            val Y = 0.2126f * r + 0.7152f * g + 0.0722f * b
-            val Z = 0.0193f * r + 0.1192f * g + 0.9505f * b
+            val X = m[0] * r + m[1] * g + m[2] * b
+            val Y = m[3] * r + m[4] * g + m[5] * b
+            val Z = m[6] * r + m[7] * g + m[8] * b
             val sum = X + Y + Z
-            if (sum < 0.002f) continue
+            if (sum < (if (s.hdr) 0.00002f else 0.002f)) continue
             val (cx, cy) = if (uv) {
                 val d = X + 15 * Y + 3 * Z
                 4 * X / d to 9 * Y / d
@@ -406,6 +518,9 @@ class ScopeEngine(private val onImage: (Bitmap) -> Unit) {
         return finish(out, n, n)
     }
 }
+
+/** Pixels per unit of chroma in the vectorscope, as a share of its side: chroma 0.6 lands on the circle. */
+const val VEC_SCALE = 0.75f
 
 /** Where chromaticity coordinates land in the CIE scope's square, shared by the engine and the graticule. */
 object CieMap {

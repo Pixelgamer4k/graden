@@ -1,5 +1,11 @@
 package com.graden.editor.ui
 
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
+
+import com.graden.editor.VEC_SCALE
+
+import kotlin.math.pow
+
 import android.graphics.Paint
 import android.graphics.Typeface
 import android.view.HapticFeedbackConstants
@@ -91,6 +97,7 @@ import com.graden.editor.WaveMode
 import com.graden.editor.Wheel
 import com.graden.editor.WheelKind
 import kotlinx.coroutines.launch
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.drawscope.clipRect
@@ -169,15 +176,30 @@ fun ColorTopBar(vm: EditorViewModel) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         RoundIcon(Lucide.X, "Close") { vm.closeColor() }
+        var picking by remember { mutableStateOf(false) }
         Column(Modifier.weight(1f).padding(start = 4.dp)) {
             Text("Color", color = Palette.Accent, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-            Text(name, color = Palette.TextDim, fontSize = 11.sp, maxLines = 1)
+            // What the clip was shot in: tap to set a camera log by hand.
+            val clip = target?.clip
+            val asset = clip?.let { vm.assets[it.assetId] }
+            vm.colourProbes
+            val space = if (asset?.isImage == true) null else com.graden.editor.ColorSpaces.inputOf(clip, asset)
+            Text(
+                if (space == null) name else name + "  ·  " + (if (clip?.cs == null) "Auto: " else "") + shortSpace(space.name),
+                color = Palette.TextDim, fontSize = 11.sp, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                modifier = Modifier.clip(RoundedCornerShape(4.dp)).clickable(enabled = space != null) { picking = true },
+            )
         }
+        if (picking && target != null) InputSpaceDialog(vm, target.clip) { picking = false }
         RoundIcon(Lucide.Undo, "Undo", enabled = vm.canUndo) { vm.undo() }
         RoundIcon(Lucide.Redo, "Redo", enabled = vm.canRedo) { vm.redo() }
         // Bypass: the picture ungraded, held as long as it is on.
         RoundIcon(if (vm.colorBypass) Lucide.EyeOff else Lucide.Eye, "Bypass", tint = if (vm.colorBypass) Palette.Accent else Ink) {
             vm.colorBypass = !vm.colorBypass
+        }
+        // Before/after wipe across the picture.
+        RoundIcon(Lucide.SplitView, "Compare before and after", tint = if (vm.wipe >= 0f) Palette.Accent else Ink) {
+            vm.wipe = if (vm.wipe >= 0f) -1f else 0.5f
         }
         RoundIcon(Lucide.RotateCcw, "Reset grade", enabled = target?.clip?.grade?.isIdentity == false) { vm.gradeOnce { Grade() } }
         Spacer(Modifier.width(4.dp))
@@ -195,21 +217,113 @@ private fun RoundIcon(icon: ImageVector, label: String, enabled: Boolean = true,
     ) { Icon(icon, label, tint = if (enabled) tint else tint.copy(alpha = 0.3f), modifier = Modifier.size(19.dp)) }
 }
 
+private fun shortSpace(n: String) = n.replace(" Gamma ", " γ").replace("Rec.2100 ", "").replace(" (PQ)", "")
+
+/** Choose what the clip was shot in: read from the file (Auto), or a camera log and the like. */
+@Composable
+private fun InputSpaceDialog(vm: EditorViewModel, clip: com.graden.editor.Clip, onDismiss: () -> Unit) {
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+        Column(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(Color(0xFF16171D)).border(1.dp, Color(0xFF23252D), RoundedCornerShape(20.dp))
+                .padding(vertical = 14.dp).heightIn(max = 520.dp).verticalScroll(rememberScrollState()),
+        ) {
+            Text("Shot in", color = Ink, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 18.dp))
+            Text("The colour space of this clip's file. Auto reads it from the file.", color = Palette.TextDim, fontSize = 12.sp, modifier = Modifier.padding(start = 18.dp, end = 18.dp, top = 2.dp, bottom = 8.dp))
+            val options = listOf<com.graden.editor.ColorSpaces.Space?>(null) + com.graden.editor.ColorSpaces.inputs
+            for (o in options) {
+                val on = (o == null && clip.cs == null) || (o != null && o.name == clip.cs)
+                Row(
+                    Modifier.fillMaxWidth().clickable { vm.setClipSpace(clip.id, o?.name); onDismiss() }.padding(horizontal = 18.dp, vertical = 11.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(o?.name ?: "Auto", color = if (on) Palette.Accent else Ink, fontSize = 14.sp)
+                        Text(o?.note ?: "From the file: HDR files by their curve, others as Rec.709", color = Palette.TextDim, fontSize = 11.sp)
+                    }
+                    if (on) Icon(Lucide.Check, null, tint = Palette.Accent, modifier = Modifier.size(18.dp))
+                }
+            }
+        }
+    }
+}
+
 // ---- body ------------------------------------------------------------------------------------------
 
+/**
+ * The page under the picture: the scope (or timeline) above, the controls below, split by a handle. The handle follows
+ * the finger; let go and it springs, with a little overshoot, to the nearest of three rests (scope folded away,
+ * balanced, scope large), thrown further by a fling. A tick as it passes each rest, a click where it lands.
+ */
 @Composable
 fun ColorBody(vm: EditorViewModel, modifier: Modifier) {
     BoxWithConstraints(modifier.fillMaxWidth().background(Palette.Bg)) {
         val total = maxHeight
-        // One panel at the top shows either the timeline or a scope; its size is fixed (half the page when made big).
-        val scopeH by animateDpAsState(
-            if (vm.scopeBig) (total * 0.5f).coerceAtLeast(160.dp) else (total - 50.dp - 40.dp - ControlsH).coerceAtLeast(110.dp),
-            spring(0.85f, 400f), label = "scopeH",
-        )
+        val density = androidx.compose.ui.platform.LocalDensity.current
+        val view = LocalView.current
+        val scope = rememberCoroutineScope()
+        val minControls = 200.dp
+        val maxControls = (total - 48.dp - 44.dp).coerceAtLeast(minControls)
+        // The rests, as the share of the page the controls take.
+        val lo = (minControls / total).coerceIn(0.2f, 0.6f)
+        val hi = (maxControls / total).coerceIn(lo, 1f)
+        val rests = listOf(0.42f.coerceIn(lo, hi), 0.62f.coerceIn(lo, hi), hi)
+        val frac = remember { androidx.compose.animation.core.Animatable(vm.controlsFraction.coerceIn(lo, hi)) }
+        var dragging by remember { mutableStateOf(false) }
+        // The scope's size button takes it to the scope-large rest.
+        LaunchedEffect(vm.scopeBig) {
+            if (vm.scopeBig) frac.animateTo(rests[0], spring(0.62f, 380f))
+        }
+        val controlsH = total * frac.value.coerceIn(lo, hi)
+        val scopeH = (total - controlsH - 48.dp - 44.dp).coerceAtLeast(0.dp)
+        val grip by animateFloatAsState(if (dragging) 1f else 0f, spring(0.6f, 700f), label = "grip")
         Column(Modifier.fillMaxSize()) {
             ScopePanel(vm, scopeH)
             ColorTransport(vm)
-            Controls(vm, Modifier.height(ControlsH))
+            Box(
+                Modifier.fillMaxWidth().height(18.dp).background(Panel).pointerInput(total) {
+                    val totalPx = with(density) { total.toPx() }
+                    val velocity = androidx.compose.ui.input.pointer.util.VelocityTracker()
+                    var last = frac.value
+                    detectVerticalDragGestures(
+                        onDragStart = {
+                            dragging = true
+                            velocity.resetTracking()
+                            view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                        },
+                        onDragEnd = {
+                            dragging = false
+                            val v = -velocity.calculateVelocity().y / totalPx
+                            // Where a fling would carry it, then the rest nearest that.
+                            val aim = (frac.value + v * 0.18f).coerceIn(lo, hi)
+                            val target = rests.minByOrNull { abs(it - aim) } ?: frac.value
+                            vm.scopeBig = false
+                            vm.controlsFraction = target
+                            scope.launch {
+                                frac.animateTo(target, spring(0.58f, 360f), initialVelocity = v)
+                                view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                            }
+                        },
+                        onDragCancel = { dragging = false },
+                    ) { change, dy ->
+                        change.consume()
+                        velocity.addPosition(change.uptimeMillis, change.position)
+                        // A little resistance beyond the ends.
+                        var next = frac.value - dy / totalPx
+                        if (next < lo) next = lo - (lo - next) * 0.35f
+                        if (next > hi) next = hi + (next - hi) * 0.35f
+                        for (r in rests) if ((last - r) * (next - r) < 0f) view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                        last = next
+                        scope.launch { frac.snapTo(next) }
+                    }
+                },
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(
+                    Modifier.width((40 + 22 * grip).dp).height((4 + 1.5f * grip).dp).clip(RoundedCornerShape(3.dp))
+                        .background(androidx.compose.ui.graphics.lerp(Color(0xFF3A3C46), Palette.Accent, grip)),
+                )
+            }
+            Controls(vm, Modifier.height(controlsH - 18.dp))
         }
     }
 }
@@ -219,21 +333,37 @@ fun ColorBody(vm: EditorViewModel, modifier: Modifier) {
 @Composable
 private fun ScopePanel(vm: EditorViewModel, height: androidx.compose.ui.unit.Dp) {
     val s = vm.scopeSettings
+    var menu by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp).padding(top = 6.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Row(Modifier.weight(1f).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                // The timeline first, then the scopes: the panel shows whichever is chosen.
-                Pill("Timeline", vm.colorShowTimeline) { vm.colorShowTimeline = true }
-                for (t in ScopeType.entries) Pill(t.label, !vm.colorShowTimeline && s.type == t) {
-                    vm.colorShowTimeline = false
-                    vm.setScopes(s.copy(type = t))
+        Row(Modifier.fillMaxWidth().height(38.dp), verticalAlignment = Alignment.CenterVertically) {
+            // The panel shows the timeline or one scope; which scope is picked from a list, so the row never overflows.
+            Pill("Timeline", vm.colorShowTimeline) { vm.colorShowTimeline = true }
+            Spacer(Modifier.width(6.dp))
+            Box {
+                Row(
+                    Modifier.clip(RoundedCornerShape(50)).background(if (!vm.colorShowTimeline) Palette.Accent.copy(alpha = 0.18f) else Color(0xFF1A1B21))
+                        .border(1.dp, if (!vm.colorShowTimeline) Palette.Accent.copy(alpha = 0.6f) else Color.Transparent, RoundedCornerShape(50))
+                        .clickable { if (vm.colorShowTimeline) vm.colorShowTimeline = false else menu = true }.padding(start = 12.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(s.type.label, color = if (!vm.colorShowTimeline) Palette.Accent else Ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    Spacer(Modifier.width(2.dp))
+                    Icon(Lucide.ChevronDown, "Choose scope", tint = if (!vm.colorShowTimeline) Palette.Accent else Ink, modifier = Modifier.size(15.dp).clickable { menu = true })
+                }
+                androidx.compose.material3.DropdownMenu(menu, onDismissRequest = { menu = false }, containerColor = Color(0xFF1B1C23)) {
+                    for (t in ScopeType.entries) androidx.compose.material3.DropdownMenuItem(
+                        text = { Text(t.label + if (t == ScopeType.HDR) "  ·  nits, MaxCLL" else "", color = if (t == s.type) Palette.Accent else Ink, fontSize = 14.sp) },
+                        onClick = { menu = false; vm.colorShowTimeline = false; vm.setScopes(s.copy(type = t)) },
+                    )
                 }
             }
+            Spacer(Modifier.weight(1f))
             if (!vm.colorShowTimeline) RoundIcon(Lucide.Settings, "Scope settings", tint = if (vm.scopeOptionsOpen) Palette.Accent else Ink) { vm.scopeOptionsOpen = !vm.scopeOptionsOpen }
             RoundIcon(if (vm.scopeBig) Lucide.Minimize else Lucide.Maximize, "Scope size") { vm.scopeBig = !vm.scopeBig }
         }
         Spacer(Modifier.height(4.dp))
-        if (vm.colorShowTimeline) ColorTimeline(vm, height)
+        if (height < 40.dp) Unit
+        else if (vm.colorShowTimeline) ColorTimeline(vm, height)
         else Box(
             Modifier.fillMaxWidth().height(height).clip(RoundedCornerShape(10.dp)).background(Well)
                 .border(1.dp, Color(0xFF1C1E25), RoundedCornerShape(10.dp)),
@@ -263,35 +393,66 @@ private fun ScopeView(vm: EditorViewModel, s: ScopeSettings, modifier: Modifier)
     val density = LocalDensity.current.density
     val paints = remember(density) { ScopePaints(density) }
     val image = vm.scopeImage
+    val hdr = vm.hdrPreview
+    val nits = s.scale == ScopeScale.NITS || (s.scale == ScopeScale.AUTO && hdr)
+    val stats = vm.scopeStats
     Canvas(modifier) {
         val dp = density
         val g = 0.08f + s.graticule * 0.32f
         val grid = Color.White.copy(alpha = g)
         val labels = Color.White.copy(alpha = (g * 1.6f).coerceAtMost(0.75f))
-        when (s.type) {
-            ScopeType.WAVEFORM, ScopeType.PARADE, ScopeType.HISTOGRAM -> {
-                val area = Rect(30 * dp, 8 * dp, size.width - 8 * dp, size.height - (if (s.type == ScopeType.HISTOGRAM) 16 else 8) * dp)
-                if (s.type != ScopeType.HISTOGRAM) levelLines(area, s, grid, labels, paints, dp) else histogramGrid(area, grid, labels, paints, dp)
-                image?.let { drawImage(it, IntOffset.Zero, IntSize(it.width, it.height), IntOffset(area.left.roundToInt(), area.top.roundToInt()), IntSize(area.width.roundToInt(), area.height.roundToInt()), filterQuality = FilterQuality.Medium) }
-                if (s.type == ScopeType.PARADE) paradeLabels(area, s, grid, paints, dp)
-                if (s.refLevels && s.type != ScopeType.HISTOGRAM) refLines(area, s, paints, dp)
-            }
-            ScopeType.VECTOR -> {
-                val side = min(size.width, size.height) - 8 * dp
-                val box = Rect(Offset((size.width - side) / 2, (size.height - side) / 2), Size(side, side))
-                vectorGrid(box, s, grid, labels, paints, dp)
-                image?.let { drawImage(it, IntOffset.Zero, IntSize(it.width, it.height), IntOffset(box.left.roundToInt(), box.top.roundToInt()), IntSize(side.roundToInt(), side.roundToInt()), filterQuality = FilterQuality.Medium) }
-                vectorTargets(box, s, labels, paints, dp)
-            }
-            ScopeType.CIE -> {
-                val side = min(size.width, size.height) - 4 * dp
-                val box = Rect(Offset((size.width - side) / 2, (size.height - side) / 2), Size(side, side))
-                cieGrid(box, s, grid, labels, paints, dp, under = true)
-                image?.let { drawImage(it, IntOffset.Zero, IntSize(it.width, it.height), IntOffset(box.left.roundToInt(), box.top.roundToInt()), IntSize(side.roundToInt(), side.roundToInt()), filterQuality = FilterQuality.Medium) }
-                cieGrid(box, s, grid, labels, paints, dp, under = false)
+        // Left gutter as wide as the widest label, whatever the screen density.
+        val gutter = paints.label.measureText(if (nits) "10k" else if (s.scale == ScopeScale.PERCENT) "100" else "1023") + 8 * dp
+        val pad = 6 * dp
+        clipRect {
+            when (s.type) {
+                ScopeType.WAVEFORM, ScopeType.PARADE -> {
+                    val area = Rect(gutter, pad + 2 * dp, size.width - pad, size.height - pad)
+                    if (nits) nitsLines(area, grid, labels, paints, dp, s) else levelLines(area, s, grid, labels, paints, dp)
+                    image?.let { drawImage(it, IntOffset.Zero, IntSize(it.width, it.height), IntOffset(area.left.roundToInt(), area.top.roundToInt()), IntSize(area.width.roundToInt(), area.height.roundToInt()), filterQuality = FilterQuality.Medium) }
+                    if (s.type == ScopeType.PARADE) paradeLabels(area, s, grid, paints, dp)
+                    if (s.refLevels && !nits) refLines(area, s, paints, dp)
+                }
+                ScopeType.HISTOGRAM -> {
+                    val area = Rect(pad, pad, size.width - pad, size.height - pad - paints.label.textSize - 4 * dp)
+                    histogramGrid(area, grid, labels, paints, dp, nits && hdr)
+                    image?.let { drawImage(it, IntOffset.Zero, IntSize(it.width, it.height), IntOffset(area.left.roundToInt(), area.top.roundToInt()), IntSize(area.width.roundToInt(), area.height.roundToInt()), filterQuality = FilterQuality.Medium) }
+                }
+                ScopeType.HDR -> {
+                    val statsH = paints.label.textSize + 8 * dp
+                    val area = Rect(paints.label.measureText("10k") + 8 * dp, pad + statsH, size.width - pad, size.height - pad)
+                    nitsLines(area, grid, labels, paints, dp, s)
+                    image?.let { drawImage(it, IntOffset.Zero, IntSize(it.width, it.height), IntOffset(area.left.roundToInt(), area.top.roundToInt()), IntSize(area.width.roundToInt(), area.height.roundToInt()), filterQuality = FilterQuality.Medium) }
+                    val st = stats
+                    val line = if (st == null) "Measuring…" else "MaxCLL %.0f   MaxFALL %.0f nits   %.1f%% above SDR white   %.1f%% over peak".format(st.maxCll, st.maxFall, st.aboveSdr, st.abovePeak)
+                    text(fit(line, paints.label, size.width - 2 * pad), pad, pad + paints.label.textSize, paints.label, Color.White.copy(alpha = 0.8f))
+                }
+                ScopeType.VECTOR -> {
+                    val side = min(size.width, size.height) - 2 * pad
+                    val box = Rect(Offset((size.width - side) / 2, (size.height - side) / 2), Size(side, side))
+                    vectorGrid(box, s, grid, labels, paints, dp)
+                    image?.let { drawImage(it, IntOffset.Zero, IntSize(it.width, it.height), IntOffset(box.left.roundToInt(), box.top.roundToInt()), IntSize(side.roundToInt(), side.roundToInt()), filterQuality = FilterQuality.Medium) }
+                    vectorTargets(box, s, labels, paints, dp, hdr)
+                    if (hdr) text("Rec.2020", box.left + 2 * dp, box.top + paints.label.textSize, paints.label, labels)
+                }
+                ScopeType.CIE -> {
+                    val side = min(size.width, size.height) - 2 * pad
+                    val box = Rect(Offset((size.width - side) / 2, (size.height - side) / 2), Size(side, side))
+                    cieGrid(box, s, grid, labels, paints, dp, under = true)
+                    image?.let { drawImage(it, IntOffset.Zero, IntSize(it.width, it.height), IntOffset(box.left.roundToInt(), box.top.roundToInt()), IntSize(side.roundToInt(), side.roundToInt()), filterQuality = FilterQuality.Medium) }
+                    cieGrid(box, s, grid, labels, paints, dp, under = false)
+                }
             }
         }
     }
+}
+
+/** [t] shortened with an ellipsis to fit [w] pixels. */
+private fun fit(t: String, p: Paint, w: Float): String {
+    if (p.measureText(t) <= w) return t
+    var n = t.length
+    while (n > 1 && p.measureText(t.substring(0, n) + "…") > w) n--
+    return t.substring(0, n) + "…"
 }
 
 private fun DrawScope.text(t: String, x: Float, y: Float, p: Paint, c: Color, alignRight: Boolean = false) = drawIntoCanvas {
@@ -300,9 +461,44 @@ private fun DrawScope.text(t: String, x: Float, y: Float, p: Paint, c: Color, al
     it.nativeCanvas.drawText(t, x, y, p)
 }
 
+/** PQ signal level of [nits] (SMPTE ST 2084), 0..1. */
+private fun pq(nits: Float): Float {
+    val y = (nits / 10000f).coerceIn(0f, 1f).toDouble().pow(0.1593017578125)
+    return ((0.8359375 + 18.8515625 * y) / (1 + 18.6875 * y)).pow(78.84375).toFloat()
+}
+
+/**
+ * HDR waveform and parade scale, in nits on the PQ curve: the trace is the PQ signal, so each line sits where that
+ * brightness is coded. SDR reference white (203 nits) and the master's peak are marked.
+ */
+private fun DrawScope.nitsLines(area: Rect, grid: Color, labels: Color, p: ScopePaints, dp: Float, s: ScopeSettings) {
+    val levels = listOf(0, 1, 10, 50, 100, 203, 400, 1000, 2000, 4000, 10000)
+    var lastY = Float.MAX_VALUE
+    val gap = p.label.textSize + 2 * dp
+    for (n in levels) {
+        val y = area.bottom - pq(n.toFloat()) * area.height
+        val strong = n == 0 || n == 10000
+        drawLine(grid, Offset(area.left, y), Offset(area.right, y), if (strong) 1.2f * dp else 0.7f * dp)
+        // Labels only where there is room for them, always the top and bottom.
+        if (lastY - y >= gap || n == 0) {
+            text(if (n >= 1000) "${n / 1000}k" else "$n", area.left - 4 * dp, y + p.label.textSize * 0.35f, p.label, labels, alignRight = true)
+            lastY = y
+        }
+    }
+    fun mark(n: Float, name: String, c: Color) {
+        val y = area.bottom - pq(n) * area.height
+        drawLine(c, Offset(area.left, y), Offset(area.right, y), 1.1f * dp, pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(6 * dp, 4 * dp)))
+        text(name, area.right - 3 * dp, y - 3 * dp, p.label, c, alignRight = true)
+    }
+    if (s.refSdrWhite) mark(203f, "SDR white", Color.White.copy(alpha = 0.55f))
+    if (s.refPeak) mark(s.peakNits.toFloat(), "Peak ${s.peakNits}", Color(0xFFF2C14E))
+    if (s.refScreen && s.screenNits != s.peakNits) mark(s.screenNits.toFloat(), "Screen ${s.screenNits}", Color(0xFF7FC8FF))
+}
+
 /** Waveform and parade levels: 0–1023 in 10-bit steps of 128, or 0–100%. */
 private fun DrawScope.levelLines(area: Rect, s: ScopeSettings, grid: Color, labels: Color, p: ScopePaints, dp: Float) {
-    val steps = if (s.scale == ScopeScale.TEN_BIT) (0..8).map { min(1023, it * 128) to (min(1023, it * 128) / 1023f) } else (0..10).map { it * 10 to it / 10f }
+    val tenBit = s.scale != ScopeScale.PERCENT
+    val steps = if (tenBit) (0..8).map { min(1023, it * 128) to (min(1023, it * 128) / 1023f) } else (0..10).map { it * 10 to it / 10f }
     // Labels at least 11 dp apart: on a short scope only every second or fourth one, always the bottom and top.
     val gap = area.height / (steps.size - 1)
     val every = when { gap >= 11 * dp -> 1; gap * 2 >= 11 * dp -> 2; gap * 4 >= 11 * dp -> 4; else -> steps.size - 1 }
@@ -310,17 +506,19 @@ private fun DrawScope.levelLines(area: Rect, s: ScopeSettings, grid: Color, labe
         val (label, v) = lv
         val y = area.bottom - v * area.height
         drawLine(grid, Offset(area.left, y), Offset(area.right, y), if (label == 0 || v >= 0.999f) 1.2f * dp else 0.7f * dp)
-        val show = (i % every == 0 || i == steps.size - 1) && (s.scale == ScopeScale.TEN_BIT || label % 20 == 0 || every > 1)
+        val show = (i % every == 0 || i == steps.size - 1) && (tenBit || label % 20 == 0 || every > 1)
         if (show) text(label.toString(), area.left - 4 * dp, y + 3 * dp, p.label, labels, alignRight = true)
     }
 }
 
-private fun DrawScope.histogramGrid(area: Rect, grid: Color, labels: Color, p: ScopePaints, dp: Float) {
-    for (i in 0..4) {
-        val x = area.left + i / 4f * area.width
+private fun DrawScope.histogramGrid(area: Rect, grid: Color, labels: Color, p: ScopePaints, dp: Float, nits: Boolean) {
+    val marks = if (nits) listOf(0, 10, 100, 1000, 10000).map { (if (it >= 1000) "${it / 1000}k" else "$it") to pq(it.toFloat()) }
+        else listOf("0", "256", "512", "768", "1023").mapIndexed { i, l -> l to i / 4f }
+    for ((i, m) in marks.withIndex()) {
+        val x = area.left + m.second * area.width
         drawLine(grid, Offset(x, area.top), Offset(x, area.bottom), 0.7f * dp)
-        val l = listOf("0", "256", "512", "768", "1023")[i]
-        text(l, x + if (i == 4) -2 * dp else 2 * dp, area.bottom + 11 * dp, p.label, labels, alignRight = i == 4)
+        val last = i == marks.size - 1
+        text(m.first, x + if (last) -2 * dp else 2 * dp, area.bottom + p.label.textSize + 2 * dp, p.label, labels, alignRight = last)
     }
     drawLine(grid, Offset(area.left, area.bottom), Offset(area.right, area.bottom), 1.2f * dp)
 }
@@ -358,7 +556,8 @@ private fun cbcr(r: Float, g: Float, b: Float): Pair<Float, Float> {
 
 private fun DrawScope.vectorGrid(box: Rect, s: ScopeSettings, grid: Color, labels: Color, p: ScopePaints, dp: Float) {
     val c = box.center
-    val r = box.width * 0.45f
+    // The circle is chroma 0.6 (VEC_SCALE), where the engine puts it.
+    val r = box.width * VEC_SCALE * 0.6f
     drawCircle(grid, r, c, style = Stroke(1.1f * dp))
     drawCircle(grid.copy(alpha = grid.alpha * 0.6f), r * 0.5f, c, style = Stroke(0.7f * dp))
     drawLine(grid, Offset(c.x - r, c.y), Offset(c.x + r, c.y), 0.7f * dp)
@@ -377,27 +576,34 @@ private fun DrawScope.vectorGrid(box: Rect, s: ScopeSettings, grid: Color, label
     if (s.vecZoom2x) text("2×", box.right - 4 * dp, box.top + 12 * dp, p.label, labels, alignRight = true)
 }
 
-/** The colour-bar targets: R, Mg, B, Cy, G, Yl at 75% or 100%, where a pure bar would land. */
-private fun DrawScope.vectorTargets(box: Rect, s: ScopeSettings, labels: Color, p: ScopePaints, dp: Float) {
+/** The colour-bar targets: R, Mg, B, Cy, G, Yl at 75% or 100%, where a pure bar would land; labels inside them. */
+private fun DrawScope.vectorTargets(box: Rect, s: ScopeSettings, labels: Color, p: ScopePaints, dp: Float, hdr: Boolean) {
     val c = box.center
-    val k = box.width * 0.9f * (if (s.vecZoom2x) 2f else 1f)
+    val k = box.width * VEC_SCALE * (if (s.vecZoom2x) 2f else 1f)
     val amp = if (s.vecTargets75) 0.75f else 1f
+    val kr = if (hdr) 0.2627f else 0.2126f
+    val kb = if (hdr) 0.0593f else 0.0722f
     val bars = listOf(
         Triple("R", RCh, floatArrayOf(1f, 0f, 0f)), Triple("Mg", Color(0xFFE060E0), floatArrayOf(1f, 0f, 1f)),
         Triple("B", BCh, floatArrayOf(0f, 0f, 1f)), Triple("Cy", Color(0xFF50E0E0), floatArrayOf(0f, 1f, 1f)),
         Triple("G", GCh, floatArrayOf(0f, 1f, 0f)), Triple("Yl", Color(0xFFE8E050), floatArrayOf(1f, 1f, 0f)),
     )
-    val half = 5 * dp
+    val half = 4.5f * dp
     for ((name, col, rgb) in bars) {
-        val (cb, cr) = cbcr(rgb[0] * amp, rgb[1] * amp, rgb[2] * amp)
+        val r = rgb[0] * amp; val g = rgb[1] * amp; val b = rgb[2] * amp
+        val y0 = kr * r + (1 - kr - kb) * g + kb * b
+        val cb = (b - y0) / (2 * (1 - kb)); val cr = (r - y0) / (2 * (1 - kr))
         val x = c.x + cb * k
         val y = c.y - cr * k
         if (!box.contains(Offset(x, y))) continue
-        drawRect(col.copy(alpha = 0.7f), Offset(x - half, y - half), Size(2 * half, 2 * half), style = Stroke(1.1f * dp))
-        val dx = (x - c.x).let { if (abs(it) < 1f) 1f else it }
-        val dy = y - c.y
+        drawRect(col.copy(alpha = 0.75f), Offset(x - half, y - half), Size(2 * half, 2 * half), style = Stroke(1.1f * dp))
+        // The name sits on the centre side of its box, so it never leaves the scope.
+        val dx = x - c.x; val dy = y - c.y
         val n = hypot(dx, dy).coerceAtLeast(1f)
-        text(name, x + dx / n * 13 * dp - 5 * dp, y + dy / n * 13 * dp + 3 * dp, p.label, col.copy(alpha = 0.8f))
+        val tw = p.label.measureText(name)
+        val lx = x - dx / n * (half + 4 * dp + tw / 2) - tw / 2
+        val ly = y - dy / n * (half + 4 * dp + p.label.textSize / 2) + p.label.textSize * 0.35f
+        text(name, lx, ly, p.label, col.copy(alpha = 0.85f))
     }
 }
 
@@ -513,6 +719,14 @@ private fun ScopeOptions(vm: EditorViewModel) {
                 Section("Mode") { for (m in WaveMode.entries) Pill(m.label, s.wave == m) { set(s.copy(wave = m)) } }
                 Channels(s, ::set, y = s.wave != WaveMode.RGB, rgb = s.wave != WaveMode.Y)
                 Toggles { Toggle("Log scale", s.histLog) { set(s.copy(histLog = it)) } }
+                Section("Scale") { for (sc in listOf(ScopeScale.AUTO, ScopeScale.TEN_BIT, ScopeScale.NITS)) Pill(sc.label, s.scale == sc) { set(s.copy(scale = sc)) } }
+            }
+            ScopeType.HDR -> {
+                Toggles {
+                    Toggle("Zones", s.hdrZones) { set(s.copy(hdrZones = it)) }
+                    Toggle("Log count", s.hdrLog) { set(s.copy(hdrLog = it)) }
+                }
+                HdrRefs(s, ::set)
             }
             ScopeType.CIE -> {
                 Section("Diagram") { for (c in CieSpace.entries) Pill(c.label, s.cie == c) { set(s.copy(cie = c)) } }
@@ -572,8 +786,19 @@ private fun Channels(s: ScopeSettings, set: (ScopeSettings) -> Unit, y: Boolean,
 }
 
 @Composable
+private fun HdrRefs(s: ScopeSettings, set: (ScopeSettings) -> Unit) {
+    Section("HDR reference lines") {
+        Pill("SDR white 203", s.refSdrWhite) { set(s.copy(refSdrWhite = !s.refSdrWhite)) }
+        Pill("Peak ${s.peakNits}", s.refPeak) { set(s.copy(refPeak = !s.refPeak)) }
+        Pill("Screen ${s.screenNits}", s.refScreen) { set(s.copy(refScreen = !s.refScreen)) }
+    }
+}
+
+@Composable
 private fun Levels(s: ScopeSettings, set: (ScopeSettings) -> Unit) {
     Section("Scale") { for (sc in ScopeScale.entries) Pill(sc.label, s.scale == sc) { set(s.copy(scale = sc)) } }
+    Text("Auto shows nits for HDR and 10-bit levels for SDR.", color = Palette.TextDim, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+    if (s.scale == ScopeScale.NITS || (s.scale == ScopeScale.AUTO && s.hdr)) HdrRefs(s, set)
     Toggles { Toggle("Highs and lows", s.refLevels) { set(s.copy(refLevels = it)) } }
     if (s.refLevels) {
         Stepper("High", s.refHigh, 512..1023) { set(s.copy(refHigh = it)) }
@@ -632,22 +857,41 @@ private fun Timecode(vm: EditorViewModel, modifier: Modifier) {
 
 @Composable
 private fun ColorTransport(vm: EditorViewModel) {
-    Row(Modifier.fillMaxWidth().height(40.dp).padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-        Timecode(vm, Modifier.width(92.dp))
-        Spacer(Modifier.weight(1f))
-        RoundIcon(Lucide.SkipBack, "Previous clip") { vm.jumpClip(-1) }
-        RoundIcon(Lucide.ChevronsLeft, "Back one frame") { vm.stepFrames(-1) }
-        Box(
-            Modifier.size(38.dp).clip(CircleShape).background(Palette.Accent).clickable { vm.togglePlay() },
-            contentAlignment = Alignment.Center,
-        ) { Icon(if (vm.isPlaying) Lucide.Pause else Lucide.Play, "Play", tint = Color.Black, modifier = Modifier.size(18.dp)) }
-        RoundIcon(Lucide.ChevronsRight, "Forward one frame") { vm.stepFrames(1) }
-        RoundIcon(Lucide.SkipForward, "Next clip") { vm.jumpClip(1) }
-        Spacer(Modifier.weight(1f))
-        // Which clip of the project this is, counting the pictures on every layer in time order.
-        val all = vm.tracks.filter { it.video }.flatMap { it.clips }.sortedBy { it.startUs }
-        val i = vm.gradeTarget?.let { t -> all.indexOfFirst { it.id == t.clip.id } } ?: -1
-        Text(if (i >= 0) "${i + 1} / ${all.size}" else "– / ${all.size}", color = Palette.TextDim, fontSize = 12.sp, fontFamily = Mono, modifier = Modifier.width(92.dp), textAlign = androidx.compose.ui.text.style.TextAlign.End)
+    // Everything here is sized from the width of the screen (one unit is 1/400 of it), as the editor's transport is,
+    // so the row keeps its proportions on any phone, at any display size or font size, and nothing wraps or crowds.
+    androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val u = maxWidth / 400f
+        val density = LocalDensity.current
+        fun sp(v: Float) = with(density) { (u * v).toPx().toSp() / fontScale }
+        @Composable
+        fun Btn(icon: ImageVector, label: String, onClick: () -> Unit) {
+            Box(Modifier.size(u * 34f).clip(CircleShape).clickable(onClick = onClick), contentAlignment = Alignment.Center) {
+                Icon(icon, label, tint = Ink, modifier = Modifier.size(u * 18f))
+            }
+        }
+        Row(Modifier.fillMaxWidth().height(u * 44f).padding(horizontal = u * 10f), verticalAlignment = Alignment.CenterVertically) {
+            // The timecode and the HDR switch get the room they need; the clip count is short.
+            Row(Modifier.weight(1.7f), verticalAlignment = Alignment.CenterVertically) {
+                Text(vm.tc(vm.playheadUs), color = Palette.Accent, fontSize = sp(12.5f), fontFamily = Mono, maxLines = 1, softWrap = false)
+                Spacer(Modifier.width(u * 6f))
+                HdrToggle(vm, sp(10f), u * 7f, u * 3f)
+            }
+            Btn(Lucide.SkipBack, "Previous clip") { vm.jumpClip(-1) }
+            Btn(Lucide.ChevronsLeft, "Back one frame") { vm.stepFrames(-1) }
+            Box(
+                Modifier.size(u * 38f).clip(CircleShape).background(Palette.Accent).clickable { vm.togglePlay() },
+                contentAlignment = Alignment.Center,
+            ) { Icon(if (vm.isPlaying) Lucide.Pause else Lucide.Play, "Play", tint = Color.Black, modifier = Modifier.size(u * 18f)) }
+            Btn(Lucide.ChevronsRight, "Forward one frame") { vm.stepFrames(1) }
+            Btn(Lucide.SkipForward, "Next clip") { vm.jumpClip(1) }
+            // Which clip of the project this is, counting the pictures on every layer in time order.
+            val all = vm.tracks.filter { it.video }.flatMap { it.clips }.sortedBy { it.startUs }
+            val i = vm.gradeTarget?.let { t -> all.indexOfFirst { it.id == t.clip.id } } ?: -1
+            Text(
+                if (i >= 0) "${i + 1}/${all.size}" else "–/${all.size}", color = Palette.TextDim, fontSize = sp(12f), fontFamily = Mono,
+                maxLines = 1, softWrap = false, modifier = Modifier.weight(0.8f), textAlign = androidx.compose.ui.text.style.TextAlign.End,
+            )
+        }
     }
 }
 
@@ -908,23 +1152,72 @@ private fun clipAt(vm: EditorViewModel, lanes: List<com.graden.editor.Track>, p:
 // ---- controls --------------------------------------------------------------------------------------
 
 /** Room the grading controls keep: the tab row, a 112 dp wheel, its master strip and its channel pills. */
-private val ControlsH = 228.dp
+private val ControlsH = 300.dp
 
 @Composable
 private fun Controls(vm: EditorViewModel, modifier: Modifier) {
+    var layer by remember { mutableStateOf(Layer.CORRECTION) }
     var tab by remember { mutableIntStateOf(0) }
+    var wheels by remember { mutableIntStateOf(0) }
+    var picking by remember { mutableStateOf(false) }
     Column(modifier.fillMaxWidth().background(Panel)) {
         Box(Modifier.fillMaxWidth().height(1.dp).background(Palette.Line))
-        Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-            Segmented(listOf("Lift · Gamma", "Gain · Offset", "Primaries"), tab) { tab = it }
+        LayerStrip(vm, layer) { layer = it }
+        if (layer == Layer.CORRECTION) {
+            val g = vm.gradeTarget?.clip?.grade ?: Grade()
+            val cv = g.curves
+            val marks = listOf(
+                !(g.lift.isZero && g.gamma.isZero && g.gain.isZero && g.offset.isZero),
+                g.temp != 0f || g.tint != 0f || g.contrast != 1f || g.pivot != 0.435f || g.shadows != 0f || g.highlights != 0f || g.saturation != 50f || g.hue != 50f || g.colorBoost != 0f || g.lumMix != 100f,
+                g.zones.active, g.logWheels.active,
+                cv.y != com.graden.editor.Curves.LINE || cv.r != com.graden.editor.Curves.LINE || cv.g != com.graden.editor.Curves.LINE || cv.b != com.graden.editor.Curves.LINE,
+                cv.hueHue.isNotEmpty() || cv.hueSat.isNotEmpty() || cv.hueLum.isNotEmpty() || cv.lumSat.isNotEmpty() || cv.satSat.isNotEmpty(),
+                g.mixer.active, g.warper.active, g.slice.active, g.detail.active || g.midDetail != 0f,
+            )
+            PaletteTabs(listOf("Wheels", "Primaries", "HDR zones", "Log", "Curves", "Hue curves", "Mixer", "Warper", "Slice", "Detail"), tab, marks) { tab = it }
         }
         BoxWithConstraints(Modifier.fillMaxWidth().weight(1f)) {
             if (vm.gradeTarget == null) {
                 Text("No clip under the playhead", color = Palette.TextDim, fontSize = 13.sp, modifier = Modifier.align(Alignment.Center))
-            } else if (tab < 2) Wheels(vm, if (tab == 0) listOf(WheelKind.LIFT, WheelKind.GAMMA) else listOf(WheelKind.GAIN, WheelKind.OFFSET))
-            else Primaries(vm, maxHeight)
+            } else if (layer != Layer.CORRECTION) when (layer) {
+                Layer.RAW -> RawPanel(vm)
+                Layer.NOISE -> NoisePanel(vm)
+                Layer.LENS -> LensPanel(vm)
+                Layer.DEFLICKER -> DeflickerPanel(vm)
+                Layer.CST -> CstPalette(vm) { picking = true }
+                Layer.SECONDARIES -> SecondariesPanel(vm)
+                Layer.LUTS -> LutPalette(vm)
+                Layer.FILM -> FilmPanel(vm)
+                else -> OutputPanel(vm)
+            }
+            else when (tab) {
+                // All four wheels when there is room for them, as on Resolve's palette; otherwise two at a time.
+                0 -> if (maxHeight >= 420.dp) Column(Modifier.fillMaxSize().padding(top = 4.dp)) {
+                    Box(Modifier.weight(1f)) { Wheels(vm, listOf(WheelKind.LIFT, WheelKind.GAMMA)) }
+                    Box(Modifier.fillMaxWidth().padding(horizontal = 24.dp).height(1.dp).background(Palette.Line))
+                    Box(Modifier.weight(1f)) { Wheels(vm, listOf(WheelKind.GAIN, WheelKind.OFFSET)) }
+                } else Column(Modifier.fillMaxSize()) {
+                    Box(Modifier.fillMaxWidth().padding(horizontal = 10.dp).height(34.dp)) {
+                        Segmented(listOf("Lift · Gamma", "Gain · Offset"), wheels) { wheels = it }
+                    }
+                    Box(Modifier.weight(1f)) {
+                        Wheels(vm, if (wheels == 0) listOf(WheelKind.LIFT, WheelKind.GAMMA) else listOf(WheelKind.GAIN, WheelKind.OFFSET))
+                    }
+                }
+                1 -> Primaries(vm, maxHeight)
+                2 -> ZonesPanel(vm)
+                3 -> LogPanel(vm)
+                4 -> CurvesPalette(vm)
+                5 -> HslPalette(vm)
+                6 -> MixerPanel(vm)
+                7 -> WarperPanel(vm)
+                8 -> SlicePanel(vm)
+                else -> DetailPanel(vm)
+            }
         }
     }
+    val target = vm.gradeTarget
+    if (picking && target != null) InputSpaceDialog(vm, target.clip) { picking = false }
 }
 
 @Composable
@@ -1228,7 +1521,7 @@ private fun MasterJog(vm: EditorViewModel, kind: WheelKind, w: Wheel) {
 
 // ---- primaries -------------------------------------------------------------------------------------
 
-private class Primary(
+internal class Primary(
     val label: String, val min: Float, val max: Float, val default: Float, val format: String,
     val get: (Grade) -> Float, val set: (Grade, Float) -> Grade,
 )
@@ -1245,20 +1538,39 @@ private val primaries = listOf(
     Primary("Saturation", 0f, 100f, 50f, "%.1f", { it.saturation }, { g, v -> g.copy(saturation = v) }),
     Primary("Hue", 0f, 100f, 50f, "%.1f", { it.hue }, { g, v -> g.copy(hue = v) }),
     Primary("Lum Mix", 0f, 100f, 100f, "%.1f", { it.lumMix }, { g, v -> g.copy(lumMix = v) }),
+    Primary("Correction mix", 0f, 1f, 1f, "%.2f", { it.correctionMix }, { g, v -> g.copy(correctionMix = v) }),
 )
 
-/** The primary controls as a grid of jog cards, three across, filling the room. */
+/** The primaries, grouped as they are used: balance, tone, colour; each value a slider over what it does. */
 @Composable
-private fun Primaries(vm: EditorViewModel, height: androidx.compose.ui.unit.Dp) {
-    val rows = primaries.chunked(3)
-    val cardH = ((height - 12.dp) / rows.size - 6.dp).coerceIn(52.dp, 74.dp)
-    Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 6.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        for (row in rows) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            for (p in row) JogCard(vm, p, Modifier.weight(1f).height(cardH))
-            repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
+private fun Primaries(vm: EditorViewModel, @Suppress("UNUSED_PARAMETER") height: androidx.compose.ui.unit.Dp) {
+    val g = vm.gradeTarget?.clip?.grade ?: Grade()
+    fun pr(label: String) = primaries.first { it.label == label }
+    val tempTrack = Brush.horizontalGradient(listOf(Color(0xFF4F7BD9), Color(0xFF8A8A8A), Color(0xFFE0A84A)))
+    val tintTrack = Brush.horizontalGradient(listOf(Color(0xFF4CC36A), Color(0xFF8A8A8A), Color(0xFFD052C8)))
+    val satTrack = Brush.horizontalGradient(listOf(Color(0xFF7A7A7A), Color(0xFFE0544A)))
+    val hueTrack = Brush.horizontalGradient((0..12).map { hueColour(it / 12f) })
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = 6.dp)) {
+        SectionCard("Balance", "White balance of the whole picture", g.temp != 0f || g.tint != 0f, onReset = { vm.gradeOnce { it.copy(temp = 0f, tint = 0f) } }) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                ProSlider(vm, pr("Temp"), Modifier.weight(1f), track = tempTrack)
+                ProSlider(vm, pr("Tint"), Modifier.weight(1f), track = tintTrack)
+            }
+        }
+        SectionCard("Tone", "Contrast about the pivot, and the ends of the range", g.contrast != 1f || g.pivot != 0.435f || g.shadows != 0f || g.highlights != 0f || g.midDetail != 0f,
+            onReset = { vm.gradeOnce { it.copy(contrast = 1f, pivot = 0.435f, shadows = 0f, highlights = 0f, midDetail = 0f) } }) {
+            SliderGrid(vm, listOf(pr("Contrast"), pr("Pivot"), pr("Shadows"), pr("Highlights"), pr("Mid/Detail")))
+        }
+        SectionCard("Colour", "How much colour, which way round, and how the wheels' masters act", g.saturation != 50f || g.hue != 50f || g.colorBoost != 0f || g.lumMix != 100f,
+            onReset = { vm.gradeOnce { it.copy(saturation = 50f, hue = 50f, colorBoost = 0f, lumMix = 100f) } }) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                ProSlider(vm, pr("Saturation"), Modifier.weight(1f), track = satTrack)
+                ProSlider(vm, pr("Hue"), Modifier.weight(1f), track = hueTrack)
+            }
+            SliderGrid(vm, listOf(pr("Color Boost"), pr("Lum Mix")))
+        }
+        SectionCard("Correction layer", "How strongly the whole correction applies", g.correctionMix != 1f, onReset = { vm.gradeOnce { it.copy(correctionMix = 1f) } }) {
+            ProSlider(vm, pr("Correction mix"), Modifier.fillMaxWidth())
         }
     }
 }
@@ -1268,7 +1580,7 @@ private fun Primaries(vm: EditorViewModel, height: androidx.compose.ui.unit.Dp) 
  * the full range, so it is precise), with a click as it passes its neutral value. Double tap resets.
  */
 @Composable
-private fun JogCard(vm: EditorViewModel, p: Primary, modifier: Modifier) {
+internal fun JogCard(vm: EditorViewModel, p: Primary, modifier: Modifier) {
     val view = LocalView.current
     val g = vm.gradeTarget?.clip?.grade ?: Grade()
     val value = p.get(g)

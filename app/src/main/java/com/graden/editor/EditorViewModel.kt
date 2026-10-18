@@ -126,10 +126,13 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private var _exportOpen by mutableStateOf(false)
 
     /** A frozen copy of the project for export, read from the original files. */
-    fun exportProject(): com.graden.editor.export.ExportProject {
+    fun exportProject(output: String = meta.colorSpace): com.graden.editor.export.ExportProject {
         val norm = HashMap<Long, Float>()
         for (t in tracks) for (c in t.clips) if (c.snd.normalize) norm[c.id] = normalizeGain(c)
-        return com.graden.editor.export.ExportProject(meta, tracks, assets, assets.mapValues { originalOf(it.value) }, mutedTracks, hiddenTracks, norm)
+        val app = getApplication<Application>()
+        return com.graden.editor.export.ExportBuild.build(meta, tracks, assets, assets.mapValues { originalOf(it.value) }, mutedTracks, hiddenTracks, norm, output,
+            raw = { a, layer -> rawBlock(a, layer) },
+            stab = { c, a, st -> stabTracks[c.id]?.takeIf { it.sig == stabSig(c) }?.track ?: Stabilizer.track(app, a, c.inUs, c.outUs, st) })
     }
 
     /** The clip details panel, opened from the top bar. */
@@ -407,7 +410,45 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun refreshProjects() {
-        viewModelScope.launch { projectList = withContext(Dispatchers.IO) { runCatching { projects.list() }.getOrDefault(emptyList()) } }
+        viewModelScope.launch {
+            projectList = withContext(Dispatchers.IO) { runCatching { projects.list() }.getOrDefault(emptyList()) }
+            projectsLoaded = true
+        }
+    }
+
+    private var projectsLoaded = false
+
+    /**
+     * False while the app gets ready at launch: the preview's shaders, the project list and the first covers. The
+     * start-up screen shows meanwhile, so everything after it is smooth.
+     */
+    var startupReady by mutableStateOf(false)
+        private set
+    /** How far getting ready is, 0..1, for the start-up screen. */
+    var startupProgress by mutableFloatStateOf(0f)
+        private set
+
+    init {
+        viewModelScope.launch {
+            val t0 = android.os.SystemClock.uptimeMillis()
+            fun elapsed() = android.os.SystemClock.uptimeMillis() - t0
+            while (!projectsLoaded && elapsed() < 6000) { startupProgress = 0.15f; kotlinx.coroutines.delay(16) }
+            startupProgress = 0.35f
+            // The covers the screen will show first.
+            val covers = projectList.take(8).mapNotNull { it.cover }
+            covers.forEach { thumbs.get(it, 0L) }
+            while (elapsed() < 8000) {
+                val got = covers.count { thumbs.has(it, 0L) }
+                startupProgress = 0.35f + 0.35f * (if (covers.isEmpty()) 1f else got / covers.size.toFloat()) + (if (ShaderCache.ready) 0.3f else 0f)
+                if (ShaderCache.ready && got == covers.size) break
+                // Covers that cannot be read do not hold up the start for long.
+                if (ShaderCache.ready && elapsed() > 3000) break
+                kotlinx.coroutines.delay(30)
+            }
+            startupProgress = 1f
+            kotlinx.coroutines.delay(120)
+            startupReady = true
+        }
     }
 
     /** Starts a project with the settings from the new-project sheet, and opens it. */
@@ -437,6 +478,8 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             }
             selectedClipId = null
             importQueue = emptyList()
+            importOpen = false
+            importSession = emptyList()
             proxies = emptyMap()
             playProxies = emptyMap()
             seekables = emptyMap()
@@ -444,6 +487,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             clearDrop()
             fxTarget = null
             assets = if (black != null) withBlack(loaded.assets, black) else loaded.assets
+            probeColours()
             assets.values.forEach {
                 proxyBuilder.enqueue(it)
                 waves.request(it)
@@ -473,6 +517,10 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         store = null
         projectId = null
         mediaBoxOpen = false
+        importJobs.forEach { it.cancel() }
+        importJobs.clear()
+        importOpen = false
+        importSession = emptyList()
         notice = null
         closeColor()
         reverseJobs.values.forEach { it.cancel() }
@@ -543,17 +591,287 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Analyses each file into the media pool. Nothing is placed on the timeline here. */
+    /**
+     * The import window: the files picked together, shown with their proxies being made until every one is ready to
+     * edit. Closing it early cancels the files that are not finished.
+     */
+    var importOpen by mutableStateOf(false)
+    var importSession by mutableStateOf<List<Int>>(emptyList())
+    private val importJobs = mutableListOf<kotlinx.coroutines.Job>()
+
+    /** Every file in the import window is read and has its proxies. */
+    val importFinished: Boolean
+        get() = importQueue.none { !it.failed } && importSession.all { id -> assets[id]?.let { statusOf(it).ready } ?: true }
+
+    /** All done: the window closes and the media box opens, ready to drag the new files onto the timeline. */
+    fun finishImport() {
+        // The list stays while the window fades out; the next import starts a new one.
+        importOpen = false
+        importJobs.clear()
+        mediaBoxOpen = true
+    }
+
+    /** Closing the import window early: files still being read or made into proxies are not imported. */
+    fun cancelImport() {
+        importJobs.forEach { it.cancel() }
+        importJobs.clear()
+        importQueue = importQueue.filter { it.failed }
+        val unfinished = importSession.filter { id -> assets[id]?.let { !statusOf(it).ready } ?: false }.toSet()
+        dropAssets(unfinished)
+        importOpen = false
+        importSession = emptyList()
+        mediaBoxOpen = true
+    }
+
+    /** The built-in Black picture: part of every project, so it cannot be deleted. */
+    fun isBuiltIn(a: MediaAsset) = a.uri == blackUri()
+
+    /** How far [a] is through its import, 0 to 1: both proxies counted as one step. */
+    fun importProgress(a: MediaAsset): Float {
+        if (statusOf(a).ready) return 1f
+        val needPlay = DeviceProfiler.needsPlayProxy(a)
+        val running = if (jobAssetId == a.id) jobPercent / 100f else 0f
+        return when {
+            a.id !in proxies -> (if (jobKind == ProxyBuilder.Kind.SCRUB) running else 0f) * (if (needPlay) 0.2f else 1f)
+            needPlay && a.id !in playProxies -> 0.2f + 0.8f * (if (jobKind == ProxyBuilder.Kind.PLAY) running else 0f)
+            else -> 1f
+        }.coerceIn(0f, 0.99f)
+    }
+
+    // ---- colour management --------------------------------------------------------------
+
+    /** Bumped when HDR files have been read for their curve, so pictures redraw with the right input. */
+    var colourProbes by mutableIntStateOf(0)
+        private set
+
+    /** Reads, in the background, whether each HDR file is PQ or HLG. */
+    private fun probeColours() {
+        val list = assets.values.filter { it.hdr }
+        if (list.isEmpty()) return
+        val app = getApplication<Application>()
+        viewModelScope.launch(Dispatchers.IO) {
+            for (a in list) ColorSpaces.probe(app, a, originalOf(a))
+            withContext(Dispatchers.Main) { colourProbes++ }
+        }
+    }
+
+    /** Marks clip [clipId] as shot in [space] (null: read it from the file). One undo step. */
+    fun setClipSpace(clipId: Long, space: String?) {
+        val l = locate(clipId) ?: return
+        if (l.clip.cs == space) return
+        commit(tracks.map { t -> if (t.clips.none { it.id == clipId }) t else t.copy(clips = t.clips.map { if (it.id == clipId) it.copy(cs = space) else it }) })
+    }
+
+    /**
+     * How a picture of [c] is colour managed in the preview. [native]: the view shows the original file; otherwise it
+     * shows the scrub proxy ([scrub]) or the edit proxy. Proxies of HDR clips are HDR too where the phone could make them
+     * so (their names end in "h"); otherwise they were tone-mapped to Rec.709 and come in as Rec.709.
+     */
+    /** How much of the Color page the controls take (the rest is scope or timeline), moved by the handle between them. */
+    var controlsFraction by mutableFloatStateOf(0.8f)
+
+    /** The Secondaries palette: which one is being worked on, whether it is shown (Highlight), picking a colour, and open. */
+    var secondaryEdit by mutableIntStateOf(0)
+    var secondaryHighlight by mutableStateOf(false)
+    var pickingColour by mutableStateOf(false)
+    var secondaryOverlay by mutableStateOf(false)
+
+    /**
+     * The colour at ([x], [y]) of the picture (0..1, y down) becomes what the secondary being worked on selects: its hue,
+     * with saturation and luminance ranges round it.
+     */
+    fun pickColourAt(x: Float, y: Float) {
+        pickingColour = false
+        val rgb = scopes.sample(x, y) ?: return
+        val l = 0.2126f * rgb[0] + 0.7152f * rgb[1] + 0.0722f * rgb[2]
+        val cb = (rgb[2] - l) / 1.8556f; val cr = (rgb[0] - l) / 1.5748f
+        val mx = maxOf(rgb[0], rgb[1], rgb[2]); val mn = minOf(rgb[0], rgb[1], rgb[2])
+        val sat = if (mx > 1e-5f) ((mx - mn) / mx).coerceIn(0f, 1f) else 0f
+        var hue = (kotlin.math.atan2(cr, cb + 1e-9f) / (2 * Math.PI.toFloat()) - Curves.HUE0 + 1f) % 1f
+        if (hue < 0f) hue += 1f
+        val i = secondaryEdit
+        gradeOnce { g ->
+            g.copy(secondaries = g.secondaries.mapIndexed { k, s ->
+                if (k != i) s else s.copy(qualify = true, qualifier = s.qualifier.copy(
+                    useHue = sat > 0.05f, hueCentre = hue, hueWidth = 0.05f, useSat = true, satLo = (sat - 0.25f).coerceAtLeast(0f), satHi = (sat + 0.35f).coerceAtMost(1f),
+                    useLum = true, lumLo = (l - 0.3f).coerceAtLeast(0f), lumHi = (l + 0.3f).coerceAtMost(1f),
+                ))
+            })
+        }
+    }
+
+    /** The HDR palette's zone view: the picture painted by zone. */
+    var zoneView by mutableStateOf(false)
+
+    /** Before/after wipe on the preview: where the split is (0..1 across), or -1 for none. */
+    var wipe by mutableFloatStateOf(-1f)
+
+    /** Switches a layer of the clip being graded on or off (a long press on its card). One undo step. */
+    internal fun toggleLayer(l: com.graden.editor.ui.Layer) = gradeOnce { g ->
+        when (l) {
+            com.graden.editor.ui.Layer.RAW -> g.copy(raw = g.raw.copy(on = !g.raw.on))
+            com.graden.editor.ui.Layer.NOISE -> g.copy(noise = g.noise.copy(on = !g.noise.on))
+            com.graden.editor.ui.Layer.LENS -> g.copy(lens = g.lens.copy(on = !g.lens.on))
+            com.graden.editor.ui.Layer.DEFLICKER -> g.copy(deflicker = g.deflicker.copy(on = !g.deflicker.on))
+            com.graden.editor.ui.Layer.CST -> g.copy(cst = g.cst.copy(on = !g.cst.on))
+            com.graden.editor.ui.Layer.CORRECTION -> g.copy(correctionOn = !g.correctionOn)
+            com.graden.editor.ui.Layer.SECONDARIES -> g.copy(secondaries = g.secondaries.map { it.copy(on = !g.secondaries.any { s -> s.on }) })
+            com.graden.editor.ui.Layer.LUTS -> g.copy(lutsOn = !g.lutsOn)
+            com.graden.editor.ui.Layer.FILM -> g.copy(film = g.film.copy(on = !g.film.on))
+            com.graden.editor.ui.Layer.OUTPUT -> g.copy(limiter = g.limiter.copy(on = !g.limiter.on))
+        }
+    }
+
+    /** The layers of [c] packed for the preview's shader. */
+    fun layersFor(c: Clip?): FloatArray? {
+        if (c == null || colorBypass) return null
+        val a = assets[c.assetId] ?: return null
+        val input = if (a.isImage) ColorSpaces.REC709 else ColorSpaces.inputOf(c, a)
+        return LayerPack.pack(c.grade, ColorPipe.workGamma(c, input, meta), yUp = true, wipe = if (colorOpen) wipe else -1f, zoneView = colorOpen && zoneView,
+            highlight = if (colorOpen && secondaryOverlay && secondaryHighlight && !pickingColour) secondaryEdit + 1 else 0)
+    }
+
+    /** HDR preview chosen by hand; null follows the project (on when it has HDR clips or an HDR output). */
+    var hdrChoice by mutableStateOf<Boolean?>(null)
+
+    /** The preview is shown in HDR on this phone's screen right now. */
+    val hdrPreview: Boolean
+        get() = GradeGl.hdrSupported && (hdrChoice ?: (ColorSpaces.output(meta.colorSpace).hdr || assets.values.any { it.hdr }))
+
+    /**
+     * The colour path of a picture of [c] in the preview, as [ColorPipe] packs it. On an HDR screen the preview is
+     * Rec.2100 PQ, its highlights rolled off to what the screen can show; otherwise Rec.709.
+     */
+    fun cmFor(c: Clip?, native: Boolean, scrub: Boolean = false): FloatArray? {
+        colourProbes
+        if (c == null) return null
+        val a = assets[c.assetId] ?: return null
+        val proxy = if (native) null else if (scrub) proxies[a.id] else playProxies[a.id]
+        val sdrProxy = proxy != null && !proxy.endsWith("h.mp4")
+        // An SDR proxy of an HDR clip was tone-mapped to Rec.709 when it was made.
+        val input = if (a.isImage || (sdrProxy && a.hdr)) ColorSpaces.REC709 else ColorSpaces.inputOf(c, a)
+        val hdr = hdrPreview
+        GradeGl.masterNits = meta.masterNits.toFloat()
+        syncScopes()
+        val dest = if (hdr) ColorSpaces.PQ else ColorSpaces.REC709
+        val b = ColorPipe.block(c, input, meta, dest, if (hdr) minOf(meta.masterNits.toFloat(), GradeGl.displayPeak) else 100f, bypass = colorBypass,
+            raw = rawBlock(a, if (colorBypass) RawLayer() else c.grade.raw), fullRange = a.fullRange)
+        return if (ColorPipe.isOff(b)) null else b
+    }
+
+    // ---- RAW ---------------------------------------------------------------------------------------------
+
+    private val rawCals = HashMap<Int, RawCal>()
+    private val rawBlocks = HashMap<Int, Pair<RawLayer, FloatArray>>()
+
+    /** The colour calibration of RAW asset [a] (null for other files). */
+    fun rawCal(a: MediaAsset): RawCal? {
+        val j = a.rawCal ?: return null
+        return rawCals.getOrPut(a.id) { RawCal(org.json.JSONObject(j)) }
+    }
+
+    /** The raw stage's uniforms for [a] developed as [layer]; null when [a] is not RAW. */
+    fun rawBlock(a: MediaAsset, layer: RawLayer): FloatArray? {
+        val cal = rawCal(a) ?: return null
+        rawBlocks[a.id]?.let { (l, b) -> if (l == layer) return b }
+        val b = RawColor.block(cal, layer)
+        rawBlocks[a.id] = layer to b
+        return b
+    }
+
+    // ---- LUTs -------------------------------------------------------------------------------------------
+
+    /** The .cube LUTs imported on this phone, shared by every project. */
+    var lutLibrary by mutableStateOf<List<File>>(emptyList())
+        private set
+
+    private val lutDir get() = File(getApplication<Application>().filesDir, "luts").apply { mkdirs() }
+
+    fun refreshLuts() {
+        lutLibrary = lutDir.listFiles()?.filter { it.extension.equals("cube", true) }?.sortedBy { it.name.lowercase() } ?: emptyList()
+    }
+
+    /** Copies a .cube into the library (after checking it reads) and puts it on the clip being graded. */
+    fun importLut(uri: Uri) {
+        val app = getApplication<Application>()
+        viewModelScope.launch {
+            val f = withContext(Dispatchers.IO) {
+                runCatching {
+                    val text = app.contentResolver.openInputStream(uri)!!.use { it.readBytes().decodeToString() }
+                    CubeLut.parse(text)
+                    val name = MediaProbe.displayName(app, uri).substringBeforeLast('.').replace(Regex("[^A-Za-z0-9 ._()-]"), "_").ifEmpty { "LUT" }
+                    var out = File(lutDir, "$name.cube")
+                    var n = 2
+                    while (out.exists()) out = File(lutDir, "$name ($n).cube").also { n++ }
+                    out.writeText(text)
+                    out
+                }.onFailure { android.util.Log.w("Graden", "LUT import failed", it) }.getOrNull()
+            }
+            if (f == null) {
+                tell("That file isn't a 3D .cube LUT")
+                return@launch
+            }
+            refreshLuts()
+            applyLut(f)
+        }
+    }
+
+    /** Puts LUT [f] on the clip being graded (null takes it off). Names with "log" are taken as camera LUTs. */
+    /** Adds LUT [f] to the end of the clip's LUT layer, with what it converts to guessed from its name. */
+    fun applyLut(f: File?) {
+        if (f == null) return
+        gradeOnce { g ->
+            if (g.luts.size >= GradeTextures.MAX_LUTS) g
+            else g.copy(luts = g.luts + LutLayer(f.path, f.nameWithoutExtension, 1f, true, LutLayer.guessTo(f.nameWithoutExtension)))
+        }
+    }
+
+    fun deleteLut(f: File) {
+        f.delete()
+        refreshLuts()
+    }
+
+    /** How many clips on the timeline use [a]. */
+    fun clipsUsing(a: MediaAsset): Int = tracks.sumOf { t -> t.clips.count { it.assetId == a.id } }
+
+    /** Delete from the media box: the file leaves the project, with its clips. */
+    fun removeAsset(a: MediaAsset) {
+        if (!isBuiltIn(a)) dropAssets(setOf(a.id))
+    }
+
+    private fun dropAssets(ids: Set<Int>) {
+        if (ids.isEmpty()) return
+        proxyBuilder.cancel(ids)
+        fun strip(ts: List<Track>) = ts.map { t -> t.copy(clips = t.clips.filter { it.assetId !in ids }) }
+        // Undo steps lose those clips too, so no step can bring back a clip whose file is gone.
+        val u = undo.map(::strip)
+        val r = redo.map(::strip)
+        undo.clear(); undo.addAll(u)
+        redo.clear(); redo.addAll(r)
+        assets = assets - ids
+        proxies = proxies - ids
+        playProxies = playProxies - ids
+        seekables = seekables - ids
+        retrying = retrying.filterKeys { it.first !in ids }
+        apply(strip(tracks))
+        saveHistorySoon()
+        save()
+    }
+
+    /** Analyses each file into the media pool and makes its proxies, in the import window. Nothing goes on the timeline. */
     fun import(uris: List<Uri>) {
         if (uris.isEmpty()) return
         val app = getApplication<Application>()
+        if (!importOpen) importSession = emptyList()
+        importOpen = true
+        mediaBoxOpen = false
         val fresh = uris.filter { u -> importQueue.none { it.key == u.toString() && !it.failed } }
         importQueue = importQueue.filterNot { q -> q.failed && fresh.any { it.toString() == q.key } } +
             fresh.map { ImportItem(it.toString(), "Importing…", false) }
-        viewModelScope.launch {
+        importJobs += viewModelScope.launch {
             for (uri in fresh) {
                 val key = uri.toString()
-                if (assets.values.any { it.uri == key }) {
+                if (assets.values.any { it.uri == key || it.raw == key }) {
                     importQueue = importQueue.filterNot { it.key == key }
                     continue
                 }
@@ -561,7 +879,8 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
                 val asset = withContext(Dispatchers.IO) {
                     runCatching { app.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
                     name = MediaProbe.displayName(app, uri)
-                    MediaProbe.probe(app, uri)?.let { if (it.isAudio || it.isImage) it else it.copy(tier = DeviceProfiler.profile(app, uri, it).tier) }
+                    if (McRaw.isMcRaw(app, uri, name)) importRaw(uri, key, name)
+                    else MediaProbe.probe(app, uri)?.let { if (it.isAudio || it.isImage) it else it.copy(tier = DeviceProfiler.profile(app, uri, it).tier) }
                 }
                 if (asset == null) {
                     importQueue = importQueue.map { if (it.key == key) ImportItem(key, name, true) else it }
@@ -569,11 +888,92 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 val a = asset.copy(id = (assets.keys.maxOrNull() ?: 0) + 1)
                 assets = assets + (a.id to a)
+                importSession = importSession + a.id
                 importQueue = importQueue.filterNot { it.key == key }
-                proxyBuilder.enqueue(a)
+                proxyBuilder.enqueue(a, clipByClip = true)
+                if (a.hdr) probeColours()
                 waves.request(a)
                 save()
             }
+        }
+    }
+
+    /** RAW recordings being developed on import, by their key: how far along (0..1). */
+    var rawProgress by mutableStateOf<Map<String, Float>>(emptyMap())
+        private set
+
+    /**
+     * A MotionCam RAW recording: developed once into its master (see [RawDevelop]), which then stands in for it
+     * everywhere; the recording and its colour calibration stay with the asset for the raw stage. Call off the main thread.
+     */
+    private suspend fun importRaw(uri: Uri, key: String, name: String): MediaAsset? {
+        val app = getApplication<Application>()
+        val job = kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]
+        if (!McRaw.available) { tell("RAW isn't supported on this phone"); return null }
+        val size = runCatching {
+            app.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { c -> if (c.moveToFirst()) c.getLong(0) else 0L } ?: 0L
+        }.getOrDefault(0L)
+        val out = RawDevelop.masterFile(app, uri, size)
+        val info = runCatching { McRaw.open(app, uri).use { it.info } }.getOrElse {
+            android.util.Log.w("McRaw", "can't read $name", it); return null
+        }
+        if (!out.exists()) {
+            main.post { rawProgress = rawProgress + (key to 0f) }
+            var last = 0f
+            val r = runCatching {
+                RawDevelop.develop(app, uri, out, progress = { p -> if (p - last > 0.01f) { last = p; main.post { if (key in rawProgress) rawProgress = rawProgress + (key to p) } } },
+                    cancelled = { job?.isActive == false })
+            }.onFailure { android.util.Log.w("RawDevelop", "develop failed", it) }.getOrNull()
+            main.post { rawProgress = rawProgress - key }
+            if (r == null) return null
+        }
+        val master = Uri.fromFile(out)
+        val probed = MediaProbe.probe(app, master) ?: return null
+        return probed.copy(name = name, raw = key, rawCal = info.toJson().toString(), tier = DeviceProfiler.profile(app, master, probed).tier)
+    }
+
+    /** RAW recordings whose master is being developed again (new decode quality or shading), by asset: how far along. */
+    var redeveloping by mutableStateOf<Map<Int, Float>>(emptyMap())
+        private set
+
+    /**
+     * Develops RAW asset [a]'s master again at [half] resolution and with or without lens [shading]. Its clips keep
+     * everything; the new master and its proxies take over once ready.
+     */
+    fun redevelopRaw(a: MediaAsset, half: Boolean, shading: Boolean) {
+        val rawUri = a.raw?.let(Uri::parse) ?: return
+        if (a.id in redeveloping || (a.rawHalf == half && a.rawShading == shading)) return
+        val app = getApplication<Application>()
+        redeveloping = redeveloping + (a.id to 0f)
+        viewModelScope.launch {
+            val fresh = withContext(Dispatchers.IO) {
+                val size = runCatching {
+                    app.contentResolver.query(rawUri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { c -> if (c.moveToFirst()) c.getLong(0) else 0L } ?: 0L
+                }.getOrDefault(0L).let { if (it == 0L && rawUri.scheme == "file") File(rawUri.path!!).length() else it }
+                val out = RawDevelop.masterFile(app, rawUri, size, half, shading)
+                var last = 0f
+                val ok = out.exists() || runCatching {
+                    RawDevelop.develop(app, rawUri, out, progress = { p -> if (p - last > 0.01f) { last = p; main.post { if (a.id in redeveloping) redeveloping = redeveloping + (a.id to p) } } },
+                        cancelled = { false }, half = half, shading = shading) != null
+                }.onFailure { android.util.Log.w("RawDevelop", "develop failed", it) }.getOrDefault(false)
+                if (!ok) null
+                else MediaProbe.probe(app, Uri.fromFile(out))?.let { p ->
+                    a.copy(uri = Uri.fromFile(out).toString(), width = p.width, height = p.height, durationUs = p.durationUs, fps = p.fps,
+                        hasAudio = p.hasAudio, rawHalf = half, rawShading = shading, tier = DeviceProfiler.profile(app, Uri.fromFile(out), p).tier)
+                }
+            }
+            redeveloping = redeveloping - a.id
+            if (fresh == null) { tell("Couldn't develop the RAW again"); return@launch }
+            val id = a.id
+            proxyBuilder.cancel(setOf(id))
+            assets = assets + (id to fresh)
+            proxies = proxies - id
+            playProxies = playProxies - id
+            seekables = seekables - id
+            proxyBuilder.enqueue(fresh)
+            syncLayers(true)
+            save()
+            confirmTick++
         }
     }
 
@@ -1936,13 +2336,24 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private val scopes = ScopeEngine { bmp -> if (colorOpen) scopeImage = bmp.asImageBitmap() }
     private var gradeBefore: List<Track>? = null
 
+    /** Light levels of the picture the scopes see (for the HDR scope). */
+    var scopeStats by mutableStateOf<ScopeEngine.Stats?>(null)
+        private set
+
     init {
         GradeGl.scopeSink = { buf, w, h -> if (scopesWanted) scopes.submit(buf, w, h) }
+        scopes.onStats = { scopeStats = it }
     }
 
     fun setScopes(s: ScopeSettings) {
         scopeSettings = s
-        scopes.settings = s
+        syncScopes()
+    }
+
+    /** The scope engine is told what the read-back signal is (HDR PQ or SDR) and the peaks to mark. */
+    private fun syncScopes() {
+        val s = scopeSettings.copy(hdr = hdrPreview, peakNits = meta.masterNits, screenNits = GradeGl.displayPeak.toInt())
+        if (s != scopes.settings) scopes.settings = s
     }
 
     /**
@@ -2312,6 +2723,185 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     fun closeCrop() {
         cropSession = null
         cropFrame = null
+    }
+
+    // ---- stabilisation ---------------------------------------------------------------
+
+    /** The clip open on the Stabilize page (null: closed). */
+    var stabClipId by mutableStateOf<Long?>(null)
+        private set
+    val stabOpen: Boolean get() = stabClipId != null
+    /** Shows the clip as shot, to compare. */
+    var stabCompare by mutableStateOf(false)
+    /** Per clip being measured: how far along, 0..1. */
+    var stabProgress by mutableStateOf<Map<Long, Float>>(emptyMap())
+        private set
+    private val stabJobs = HashMap<Long, java.util.concurrent.atomic.AtomicBoolean>()
+
+    /** A clip's stabilisation ready to draw, and what it was made from (so a change makes it again). */
+    class StabEntry(val sig: List<Any?>, val track: StabTrack?, val analysed: Boolean)
+    var stabTracks by mutableStateOf<Map<Long, StabEntry>>(emptyMap())
+        private set
+    private val stabBusy = HashSet<Long>()
+    private val stabAgain = HashSet<Long>()
+    private val stabExec = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+
+    private fun stabSig(c: Clip) = listOf(c.assetId, c.inUs, c.outUs, c.stab, stabProgress.containsKey(c.id))
+
+    /** The stabilisation [c] is drawn with in the preview right now, if any. Asks for it to be made when it is out of date. */
+    fun stabFor(c: Clip?): StabTrack? {
+        val s = c?.stab ?: return null
+        if (!s.on || (stabCompare && c.id == stabClipId)) return null
+        return stabTrackOf(c)
+    }
+
+    /** [c]'s stabilisation track whether it is shown or not (for the page's graph); made when out of date. */
+    fun stabTrackOf(c: Clip): StabTrack? {
+        if (c.stab == null) return null
+        val e = stabTracks[c.id]
+        if (e == null || e.sig != stabSig(c)) makeStab(c)
+        // While it is made again, the last one is kept, so a slider drag never flickers.
+        return e?.track
+    }
+
+    /** Whether [c] has been measured (its motion is known), from the last time its stabilisation was made. */
+    fun stabAnalysed(c: Clip): Boolean? = stabTracks[c.id]?.analysed
+
+    private fun makeStab(c: Clip) {
+        if (c.id in stabBusy) { stabAgain += c.id; return }
+        val a = assets[c.assetId] ?: return
+        val app = getApplication<Application>()
+        stabBusy += c.id
+        val sig = stabSig(c)
+        viewModelScope.launch {
+            val e = withContext(stabExec) {
+                val t = Stabilizer.track(app, a, c.inUs, c.outUs, c.stab ?: Stab())
+                StabEntry(sig, t, t != null)
+            }
+            stabBusy -= c.id
+            stabTracks = stabTracks + (c.id to e)
+            // On the page, a method whose measurement is not there yet (Gyro and the others measure differently) is
+            // measured straight away.
+            if (!e.analysed && c.id == stabClipId && c.stab != null && c.id !in stabProgress) analyseStab()
+            if (stabAgain.remove(c.id)) locate(c.id)?.clip?.let { makeStab(it) }
+        }
+    }
+
+    /** The file time of [c]'s frame at the playhead (for pictures that are not playing). */
+    fun stabStillUs(c: Clip?): Long? = c?.srcAt((playheadUs - c.startUs).coerceIn(0L, (c.durationUs - 1).coerceAtLeast(0L)))
+
+    /** The clip on the Stabilize page. */
+    val stabTarget: Located? get() = stabClipId?.let(::locate)
+
+    fun openStab(): Boolean {
+        val l = (selectedClipId?.let(::locate)?.takeIf { tracks.firstOrNull { t -> t.id == it.trackId }?.video == true } ?: topVideoAt(playheadUs))
+            ?.takeIf { it.trackId !in lockedTracks } ?: return false
+        val a = assets[l.clip.assetId] ?: return false
+        if (a.isImage) { tell("A still picture has no motion to stabilise"); return false }
+        pause()
+        selectedClipId = l.clip.id
+        stabClipId = l.clip.id
+        stabCompare = false
+        if (playheadUs < l.clip.startUs || playheadUs >= l.clip.endUs) seek(l.clip.startUs)
+        // Measured already (now or before): shown at once. Otherwise the motion is measured straight away.
+        val c = l.clip
+        viewModelScope.launch {
+            val has = withContext(stabExec) {
+                Stabilizer.measured(getApplication(), a, c.inUs, c.outUs, c.stab ?: Stab())
+            }
+            if (!has && stabClipId == c.id && c.id !in stabProgress) analyseStab()
+            else if (c.stab == null && stabClipId == c.id) setStabOnce { it }
+        }
+        return true
+    }
+
+    fun closeStab() {
+        gradeEnd()
+        stabClipId = null
+        stabCompare = false
+    }
+
+    /** Measures the motion of the clip on the page (again, if [detailed] differs). Runs in the background, with progress. */
+    fun analyseStab() {
+        val l = stabTarget ?: return
+        val c = l.clip
+        val a = assets[c.assetId] ?: return
+        if (c.id in stabProgress) return
+        val detailed = c.stab?.detailed == true
+        val gyro = Stabilizer.engineOf(c.stab ?: Stab()) == Stab.GYRO
+        val stop = java.util.concurrent.atomic.AtomicBoolean(false)
+        stabJobs[c.id] = stop
+        stabProgress = stabProgress + (c.id to 0f)
+        val app = getApplication<Application>()
+        // The edit proxy is quicker to read than the original and has the same frames at the same times. The visual
+        // gyro reads the original: it needs the rows in the order the sensor read them, and every bit of detail.
+        val path = if (gyro) a.uri else playProxies[a.id] ?: originalOf(a)
+        viewModelScope.launch {
+            var last = 0f
+            val result = withContext(Dispatchers.Default) {
+                val progress = { p: Float -> if (p - last > 0.01f) { last = p; main.post { if (c.id in stabProgress) stabProgress = stabProgress + (c.id to p) } } }
+                if (gyro) Stabilizer.analyseGyro(app, path, 0, c.inUs, c.outUs, detailed, Stabilizer.key(a, c.inUs, c.outUs, detailed), progress, { stop.get() })
+                    // A file the phone cannot read as it is: its seekable copy instead.
+                    ?: originalOf(a).takeIf { it != path && !stop.get() }?.let { alt ->
+                        Stabilizer.analyseGyro(app, alt, 0, c.inUs, c.outUs, detailed, Stabilizer.key(a, c.inUs, c.outUs, detailed), progress, { stop.get() })
+                    }
+                else Stabilizer.analyse(app, path, 0, c.inUs, c.outUs, detailed, Stabilizer.key(a, c.inUs, c.outUs, detailed), progress, { stop.get() })
+            }
+            stabJobs.remove(c.id)
+            stabProgress = stabProgress - c.id
+            if (result == null) {
+                if (!stop.get()) tell("Couldn't follow the motion in this clip")
+                return@launch
+            }
+            confirmTick++
+            val now = locate(c.id)?.clip ?: return@launch
+            if (now.stab == null) {
+                commit(withClip(c.id) { listOf(it.copy(stab = Stab(detailed = detailed))) })
+            } else stabTracks = stabTracks - c.id
+            locate(c.id)?.clip?.let { makeStab(it) }
+        }
+    }
+
+    /** Measures in detail when detailed analysis is asked for and only the quick measurement exists. */
+    fun analyseStabIfNeeded() {
+        val c = stabTarget?.clip ?: return
+        val a = assets[c.assetId] ?: return
+        if (c.stab?.detailed != true) { stabTracks = stabTracks - c.id; return }
+        viewModelScope.launch {
+            val has = withContext(stabExec) {
+                if (Stabilizer.engineOf(c.stab ?: Stab()) == Stab.GYRO) Stabilizer.findGyro(getApplication(), a, c.inUs, c.outUs, true) != null
+                else Stabilizer.find(getApplication(), a, c.inUs, c.outUs, true) != null
+            }
+            if (!has) analyseStab() else stabTracks = stabTracks - c.id
+        }
+    }
+
+    fun cancelStabAnalysis() {
+        val id = stabClipId ?: return
+        stabJobs[id]?.set(true)
+    }
+
+    /** Live change to the stabilisation of the clip on the page; [gradeEnd] makes the drag one undo step. */
+    fun setStab(update: (Stab) -> Stab) {
+        val l = stabTarget ?: return
+        if (l.trackId in lockedTracks) return
+        val s = update(l.clip.stab ?: Stab())
+        if (s == l.clip.stab) return
+        tracks = withClip(l.clip.id) { listOf(it.copy(stab = s)) }
+    }
+
+    /** One change, one undo step. */
+    fun setStabOnce(update: (Stab) -> Stab) {
+        gradeStart()
+        setStab(update)
+        gradeEnd()
+    }
+
+    /** Takes the stabilisation off the clip (its measurement is kept, so turning it back on is instant). */
+    fun removeStab() {
+        val l = stabTarget ?: return
+        if (l.clip.stab == null) return
+        commit(withClip(l.clip.id) { listOf(it.copy(stab = null)) })
     }
 
     // ---- the trim page ---------------------------------------------------------------

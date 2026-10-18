@@ -52,7 +52,24 @@ class ExportProject(
     val hidden: Set<Int>,
     /** Per clip: the gain that normalising its loudest moment gives, where normalising is on. */
     val normGain: Map<Long, Float>,
+    /** Per clip: its colour path into the delivery space (see [com.graden.editor.ColorPipe]). */
+    val pipes: Map<Long, FloatArray> = emptyMap(),
+    /** Rec.709 into the delivery space, for solid colours. */
+    val fillPipe: FloatArray? = null,
+    /** Clips whose pictures need more than 8 bits until they are converted (HDR, log). */
+    val deep: Set<Long> = emptySet(),
+    /** The delivery space's code, and its mastering peak. */
+    val output: Int = com.graden.editor.ColorSpaces.REC709.code,
+    val nits: Float = 1000f,
+    /** Per clip: its grade's layers packed for the shader (see [com.graden.editor.LayerPack]). */
+    val layers: Map<Long, FloatArray> = emptyMap(),
+    /** The delivery space shown as Rec.709, for the progress screen's picture; null when it is Rec.709 already. */
+    val preview: FloatArray? = null,
+    /** Per clip: its stabilisation, frame by frame (see [com.graden.editor.Stabilizer]). */
+    val stabs: Map<Long, com.graden.editor.StabTrack> = emptyMap(),
 ) {
+    /** Anything other than Rec.709 all the way through. */
+    val cmOn: Boolean get() = output != com.graden.editor.ColorSpaces.REC709.code || pipes.values.any { !com.graden.editor.ColorPipe.isOff(it) }
     val totalUs: Long = tracks.maxOfOrNull { it.endUs } ?: 0L
 
     /**
@@ -366,10 +383,24 @@ class Compositor(private val context: Context, private val project: ExportProjec
     /** Rendering in half float (for 10-bit output); false if this GPU cannot draw into float buffers. */
     var tenBit = tenBitWanted
         private set
+    /** The GPU can draw into half-float buffers. */
+    private var halfFloat = false
     /** The resolved frame as a texture (10-bit: sampled into the packed buffer), and the packed 10-bit buffer. */
     private var resolveTex = 0
     private var packFbo = 0
     private var packProg = 0
+    /** The frame in the output space (when colour management is on): what every consumer reads. */
+    private var outTex = 0
+    private var outFbo = 0
+    private var outProg = 0
+    private var yProg = 0
+    private var uvProg = 0
+    private var yFbo = 0
+    private var uvFbo = 0
+    private var yBuf: ByteBuffer? = null
+    private var uvBuf: ByteBuffer? = null
+    private val finalTex: Int get() = if (outTex != 0) outTex else resolveTex
+    private val finalFbo: Int get() = if (outFbo != 0) outFbo else resolveFbo
     private var display: EGLDisplay = EGL14.EGL_NO_DISPLAY
     private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
     private var config: EGLConfig? = null
@@ -378,6 +409,8 @@ class Compositor(private val context: Context, private val project: ExportProjec
 
     private var msaaFbo = 0
     private var msaaRb = 0
+    /** Where this frame is drawn: the 4× buffer when a picture on it is turned (its edges need smoothing), else straight into the resolved frame. */
+    private var drawFbo = 0
     private var smallFbo = 0
     /** The frame resolved from the multisampled buffer: what goes to the encoder and to the preview. */
     private var resolveFbo = 0
@@ -387,6 +420,7 @@ class Compositor(private val context: Context, private val project: ExportProjec
     val previewH: Int = (320f * outH / outW).toInt().coerceAtLeast(2) / 2 * 2
 
     private var gradeProg = 0
+    private val looks = com.graden.editor.GradeTextures()
     private var copyProg = 0
     private var fillProg = 0
     private val quad: FloatBuffer = ByteBuffer.allocateDirect(32).order(ByteOrder.nativeOrder()).asFloatBuffer().apply { put(floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)); position(0) }
@@ -452,29 +486,70 @@ class Compositor(private val context: Context, private val project: ExportProjec
     }
 
     /** Sets up the GL context, drawing into [encoderSurface] (or off-screen when null). */
-    fun start(encoderSurface: Surface?) {
+    /** The encoder's surface takes 10 bits a channel (RGBA1010102): the frame is drawn into it, not copied. */
+    var tenBitWindow = false
+        private set
+
+    /** A config of [bits] (8 or 10) a channel; [recordable] asks for the flag encoders like (Mali has no 10-bit one). */
+    private fun pick(bits: Int, recordable: Boolean): EGLConfig? {
+        val cfgs = arrayOfNulls<EGLConfig>(32)
+        val n = IntArray(1)
+        val alpha = if (bits == 10) 2 else 8
+        val attr = intArrayOf(
+            EGL14.EGL_RED_SIZE, bits, EGL14.EGL_GREEN_SIZE, bits, EGL14.EGL_BLUE_SIZE, bits, EGL14.EGL_ALPHA_SIZE, alpha,
+            EGL14.EGL_RENDERABLE_TYPE, EGLExt.EGL_OPENGL_ES3_BIT_KHR,
+        ) + (if (recordable) intArrayOf(EGL_RECORDABLE_ANDROID, 1) else IntArray(0)) + intArrayOf(
+            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT or EGL14.EGL_PBUFFER_BIT, EGL14.EGL_NONE,
+        )
+        if (!EGL14.eglChooseConfig(display, attr, 0, cfgs, 0, cfgs.size, n, 0)) return null
+        // Sizes are "at least": the one that is exactly what was asked.
+        for (i in 0 until n[0]) {
+            val c = cfgs[i] ?: continue
+            val r = IntArray(1)
+            EGL14.eglGetConfigAttrib(display, c, EGL14.EGL_RED_SIZE, r, 0)
+            if (r[0] == bits) return c
+        }
+        return null
+    }
+
+    /**
+     * Starts GL, drawing into [encoderSurface] when given. [tenBitSurface]: the encoder takes 10-bit RGB through its
+     * surface (HDR straight from the GPU, 3–6× faster than reading P010 back); returns false when this phone's GPU cannot
+     * draw 10 bits into it, and the caller uses another way.
+     */
+    fun start(encoderSurface: Surface?, tenBitSurface: Boolean = false): Boolean {
         display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
         val v = IntArray(2)
         EGL14.eglInitialize(display, v, 0, v, 1)
-        val configs = arrayOfNulls<EGLConfig>(1)
-        val n = IntArray(1)
-        EGL14.eglChooseConfig(
-            display,
-            intArrayOf(
-                EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
-                EGL14.EGL_RENDERABLE_TYPE, EGLExt.EGL_OPENGL_ES3_BIT_KHR, EGL_RECORDABLE_ANDROID, 1,
-                EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT or EGL14.EGL_PBUFFER_BIT, EGL14.EGL_NONE,
-            ), 0, configs, 0, 1, n, 0,
-        )
-        config = configs[0] ?: error("No GL configuration for export")
-        eglContext = EGL14.eglCreateContext(display, config, EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE), 0)
+        if (tenBitSurface && encoderSurface != null) {
+            // Recordable first; then without the flag, as Media3's HDR editing does (MediaTek's Mali has only that).
+            for (rec in booleanArrayOf(true, false)) {
+                val c = pick(10, rec) ?: continue
+                val ctx = EGL14.eglCreateContext(display, c, EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE), 0)
+                if (ctx == EGL14.EGL_NO_CONTEXT) continue
+                val w = EGL14.eglCreateWindowSurface(display, c, encoderSurface, intArrayOf(EGL14.EGL_NONE), 0)
+                if (w == EGL14.EGL_NO_SURFACE) { EGL14.eglDestroyContext(display, ctx); continue }
+                config = c; eglContext = ctx; window = w; tenBitWindow = true
+                android.util.Log.i("ExportProbe", "10-bit encoder surface (RGBA1010102${if (rec) ", recordable" else ""})")
+                break
+            }
+            if (!tenBitWindow) {
+                EGL14.eglTerminate(display)
+                display = EGL14.EGL_NO_DISPLAY
+                return false
+            }
+        } else {
+            config = pick(8, true) ?: error("No GL configuration for export")
+            eglContext = EGL14.eglCreateContext(display, config, EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE), 0)
+            if (encoderSurface != null) window = EGL14.eglCreateWindowSurface(display, config, encoderSurface, intArrayOf(EGL14.EGL_NONE), 0)
+        }
         pbuffer = EGL14.eglCreatePbufferSurface(display, config, intArrayOf(EGL14.EGL_WIDTH, 16, EGL14.EGL_HEIGHT, 16, EGL14.EGL_NONE), 0)
-        if (encoderSurface != null) window = EGL14.eglCreateWindowSurface(display, config, encoderSurface, intArrayOf(EGL14.EGL_NONE), 0)
         val target = if (window != EGL14.EGL_NO_SURFACE) window else pbuffer
         check(EGL14.eglMakeCurrent(display, target, target, eglContext)) { "Could not start GL for export" }
 
         val ext = GLES20.glGetString(GLES20.GL_EXTENSIONS) ?: ""
-        if (tenBit && !ext.contains("GL_EXT_color_buffer_half_float") && !ext.contains("GL_EXT_color_buffer_float")) tenBit = false
+        halfFloat = ext.contains("GL_EXT_color_buffer_half_float") || ext.contains("GL_EXT_color_buffer_float")
+        if (tenBit && !halfFloat) tenBit = false
         val colour = if (tenBit) GLES30.GL_RGBA16F else GLES30.GL_RGBA8
         val max = IntArray(1)
         GLES30.glGetIntegerv(GLES30.GL_MAX_SAMPLES, max, 0)
@@ -512,10 +587,16 @@ class Compositor(private val context: Context, private val project: ExportProjec
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, smallFbo)
         GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, smallTex, 0)
 
+        // Pictures are converted into the delivery space as they are drawn; the progress picture is shown as Rec.709.
+        if (project.preview != null) outProg = link(COPY_VERTEX, "precision highp float;\nvarying vec2 vUv;\nuniform sampler2D uSrc;\n" +
+            com.graden.editor.ColorSpaces.GLSL + com.graden.editor.ColorPipe.GLSL +
+            "\nvoid main() { gl_FragColor = vec4(clamp(xform(texture2D(uSrc, vUv).rgb, uXf[2], uXf[3], uXfY[1], uFinM), 0.0, 1.0), 1.0); }\n")
         gradeProg = link(PIC_VERTEX, gradeFragment())
         copyProg = link(COPY_VERTEX, COPY_FRAGMENT)
         packProg = link(COPY_VERTEX, PACK_FRAGMENT)
-        fillProg = link(COPY_VERTEX, FILL_FRAGMENT)
+        fillProg = link(COPY_VERTEX, "precision highp float;\nuniform vec4 uColor;\n" + com.graden.editor.ColorSpaces.GLSL + com.graden.editor.ColorPipe.GLSL +
+            "\nvoid main() { gl_FragColor = vec4(clamp(xform(uColor.rgb, uXf[2], uXf[3], uXfY[1], uFinM), 0.0, 1.0), 1.0); }\n")
+        return true
     }
 
     /** Renders the frame at timeline time [us] into the picture buffer, then to the encoder with time [ptsNs]. */
@@ -562,7 +643,11 @@ class Compositor(private val context: Context, private val project: ExportProjec
             copies.remove(id)?.let { GLES20.glDeleteTextures(1, intArrayOf(it[0]), 0); GLES30.glDeleteFramebuffers(1, intArrayOf(it[1]), 0) }
         }
 
-        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, msaaFbo)
+        // Edges only need the 4× buffer (and its copy, about 11 ms a 4K frame on Adreno and Mali) when a picture is turned
+        // by other than a quarter turn; upright pictures have straight pixel-aligned edges.
+        val smooth = pics.any { (_, list) -> list.any { p -> ((p.clip.tf.rot + (p.look?.rot ?: 0f)) % 90f).let { abs(it) > 0.01f && abs(it) < 89.99f } } }
+        drawFbo = if (smooth) msaaFbo else resolveFbo
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, drawFbo)
         GLES20.glViewport(0, 0, outW, outH)
         GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
@@ -578,16 +663,21 @@ class Compositor(private val context: Context, private val project: ExportProjec
         GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
         GLES20.glDisable(GLES20.GL_BLEND)
 
-        GLES20.glFinish()
         val tB = System.nanoTime()
         // Resolve the samples once; the resolved frame goes to the encoder (and the preview, when asked).
-        GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER, msaaFbo)
-        GLES30.glBindFramebuffer(GLES30.GL_DRAW_FRAMEBUFFER, resolveFbo)
-        GLES30.glBlitFramebuffer(0, 0, outW, outH, 0, 0, outW, outH, GLES20.GL_COLOR_BUFFER_BIT, GLES20.GL_NEAREST)
-        if (window != EGL14.EGL_NO_SURFACE) {
-            GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER, resolveFbo)
-            GLES30.glBindFramebuffer(GLES30.GL_DRAW_FRAMEBUFFER, 0)
+        if (smooth) {
+            GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER, msaaFbo)
+            GLES30.glBindFramebuffer(GLES30.GL_DRAW_FRAMEBUFFER, resolveFbo)
             GLES30.glBlitFramebuffer(0, 0, outW, outH, 0, 0, outW, outH, GLES20.GL_COLOR_BUFFER_BIT, GLES20.GL_NEAREST)
+        }
+        if (window != EGL14.EGL_NO_SURFACE) {
+            // A half-float frame cannot be blitted into a fixed-point surface: it is drawn into it.
+            if (tenBitWindow) drawTexture(finalTex, 0, outW, outH)
+            else {
+                GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER, finalFbo)
+                GLES30.glBindFramebuffer(GLES30.GL_DRAW_FRAMEBUFFER, 0)
+                GLES30.glBlitFramebuffer(0, 0, outW, outH, 0, 0, outW, outH, GLES20.GL_COLOR_BUFFER_BIT, GLES20.GL_NEAREST)
+            }
             EGLExt.eglPresentationTimeANDROID(display, window, ptsNs)
             EGL14.eglSwapBuffers(display, window)
         }
@@ -601,7 +691,16 @@ class Compositor(private val context: Context, private val project: ExportProjec
 
     /** A small picture of the last frame, for the progress screen. */
     fun preview(): Bitmap {
-        drawTexture(resolveTex, smallFbo, previewW, previewH)
+        if (project.preview != null && outProg != 0) {
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, smallFbo)
+            GLES20.glViewport(0, 0, previewW, previewH)
+            GLES20.glUseProgram(outProg)
+            com.graden.editor.ColorPipe.set(outProg, project.preview)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, resolveTex)
+            GLES20.glUniform1i(GLES20.glGetUniformLocation(outProg, "uSrc"), 0)
+            drawQuad(outProg)
+        } else drawTexture(resolveTex, smallFbo, previewW, previewH)
         GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER, smallFbo)
         val buf = ByteBuffer.allocateDirect(previewW * previewH * 4).order(ByteOrder.nativeOrder())
         GLES20.glReadPixels(0, 0, previewW, previewH, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf)
@@ -620,15 +719,73 @@ class Compositor(private val context: Context, private val project: ExportProjec
     fun readFrame(into: ByteBuffer): Int {
         into.position(0)
         if (tenBit) {
-            drawTexture(resolveTex, packFbo, outW, outH)
+            drawTexture(finalTex, packFbo, outW, outH)
             GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER, packFbo)
             GLES20.glReadPixels(0, 0, outW, outH, GLES20.GL_RGBA, GLES30.GL_UNSIGNED_INT_2_10_10_10_REV, into)
             return SoftEncoder.FMT_RGB10
         }
-        GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER, resolveFbo)
+        GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER, finalFbo)
         GLES20.glReadPixels(0, 0, outW, outH, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, into)
         return SoftEncoder.FMT_RGBA8
     }
+
+    /**
+     * Writes the frame into [out] as 10-bit P010 (luma plane then interleaved chroma, 16 bits a sample, rows [stride]
+     * bytes apart, the chroma plane starting [sliceHeight] rows in), converted to Y'CbCr with the Rec.2020 matrix when
+     * [rec2020], else Rec.709, limited range. Done on the GPU with OpenGL ES 3.0 only.
+     */
+    fun packP010(out: ByteBuffer, rec2020: Boolean, stride: Int, sliceHeight: Int) {
+        if (yProg == 0) {
+            yProg = link(P010_VERTEX, P010_Y)
+            uvProg = link(P010_VERTEX, P010_UV)
+            val ids = IntArray(2)
+            GLES30.glGenFramebuffers(2, ids, 0); yFbo = ids[0]; uvFbo = ids[1]
+            val t = IntArray(2)
+            GLES20.glGenTextures(2, t, 0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, t[0])
+            GLES30.glTexStorage2D(GLES20.GL_TEXTURE_2D, 1, GLES30.GL_RGBA8, outW / 2, outH)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, yFbo)
+            GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, t[0], 0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, t[1])
+            GLES30.glTexStorage2D(GLES20.GL_TEXTURE_2D, 1, GLES30.GL_RGBA8, outW / 2, outH / 2)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, uvFbo)
+            GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, t[1], 0)
+            yBuf = ByteBuffer.allocateDirect(outW * 2 * outH)
+            uvBuf = ByteBuffer.allocateDirect(outW * 2 * (outH / 2))
+        }
+        GLES20.glDisable(GLES20.GL_BLEND)
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+        val k = if (rec2020) floatArrayOf(0.2627f, 0.6780f, 0.0593f) else floatArrayOf(0.2126f, 0.7152f, 0.0722f)
+        for ((prog, fbo, h, buf) in listOf(Quad4(yProg, yFbo, outH, yBuf!!), Quad4(uvProg, uvFbo, outH / 2, uvBuf!!))) {
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo)
+            GLES20.glViewport(0, 0, outW / 2, h)
+            GLES20.glUseProgram(prog)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, finalTex)
+            GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uSrc"), 0)
+            GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uH"), outH)
+            GLES20.glUniform3f(GLES20.glGetUniformLocation(prog, "uK"), k[0], k[1], k[2])
+            drawQuad(prog)
+            buf.position(0)
+            GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER, fbo)
+            GLES20.glReadPixels(0, 0, outW / 2, h, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf)
+        }
+        // Rows into the encoder's layout.
+        val row = outW * 2
+        out.clear()
+        for ((buf, rows, base) in listOf(Triple(yBuf!!, outH, 0), Triple(uvBuf!!, outH / 2, stride * sliceHeight))) {
+            for (r in 0 until rows) {
+                buf.limit(r * row + row); buf.position(r * row)
+                out.position(base + r * stride)
+                out.put(buf)
+            }
+            buf.clear()
+        }
+    }
+
+    private data class Quad4(val prog: Int, val fbo: Int, val h: Int, val buf: ByteBuffer)
+
+    private val noPipe = com.graden.editor.GradeCore.CM_OFF
 
     /** Draws texture [tex] over the whole of framebuffer [fbo] ([w]×[h]). */
     private fun drawTexture(tex: Int, fbo: Int, w: Int, h: Int) {
@@ -646,10 +803,14 @@ class Compositor(private val context: Context, private val project: ExportProjec
     private fun fill(color: Int) {
         GLES20.glViewport(canvas[0], outH - canvas[1] - canvas[3], canvas[2], canvas[3])
         GLES20.glUseProgram(fillProg)
+        com.graden.editor.ColorPipe.set(fillProg, project.fillPipe ?: noPipe)
         GLES20.glUniform4f(GLES20.glGetUniformLocation(fillProg, "uColor"),
             android.graphics.Color.red(color) / 255f, android.graphics.Color.green(color) / 255f, android.graphics.Color.blue(color) / 255f, 1f)
         drawQuad(fillProg)
     }
+
+    private val stabTmp = FloatArray(9)
+    private val stabGl = com.graden.editor.StabGl()
 
     private fun drawPicture(p: Pic, us: Long) {
         val a = p.asset
@@ -706,15 +867,76 @@ class Compositor(private val context: Context, private val project: ExportProjec
         GLES20.glUniform1f(u("uAlpha"), alpha)
         val g = p.clip.grade
         GLES20.glUniform1f(u("uOn"), if (g.isIdentity) 0f else 1f)
+        com.graden.editor.ColorPipe.set(gradeProg, project.pipes[p.clip.id] ?: noPipe)
+        val stab = project.stabs[p.clip.id]?.takeIf { !a.isImage }
+        val stabI = stab?.at(srcAt(p, us), stabTmp) ?: -1
+        stabGl.set(gradeProg, stab, stabI, stabTmp)
+        var layers = project.layers[p.clip.id] ?: com.graden.editor.LayerPack.EXPORT_NONE
+        GLES20.glUniform1f(u("uTime"), us / 1e6f)
         GLES20.glUniform4fv(u("uG"), 7, g.uniforms(), 0)
+        looks.bind(gradeProg, if (g.isIdentity) null else g)
         // Mid/Detail measures its blur in pixels of the picture as the phone's preview shows it, so it looks the same.
         val previewScale = 1080f / max(cw, ch)
         GLES20.glUniform2f(u("uTexel"), 1f / (shownW * previewScale).coerceAtLeast(1f), 1f / (shownH * previewScale).coerceAtLeast(1f))
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, src)
         GLES20.glUniform1i(u("uSrc"), 0)
+        // What the grade needs besides the frame, as in the preview: the blurred copy and earlier frames.
+        val ex = extras.getOrPut(p.clip.id) { com.graden.editor.FrameExtras() }
+        val keep = if (a.isImage || g.isIdentity) 0 else g.noise.history
+        if (keep == 0) ex.resetHistory()
+        val needGlow = !g.isIdentity && (g.film.glows || g.deflicker.on)
+        val vx = canvas[0]; val vy = outH - canvas[1] - canvas[3]
+        if (needGlow) {
+            val blend = GLES20.glIsEnabled(GLES20.GL_BLEND)
+            GLES20.glDisable(GLES20.GL_BLEND)
+            ex.glowBegin(outW, outH)
+            val k = com.graden.editor.FrameExtras.GLOW_SCALE
+            GLES20.glViewport((vx * k).toInt(), (vy * k).toInt(), maxOf((canvas[2] * k).toInt(), 1), maxOf((canvas[3] * k).toInt(), 1))
+            val gl = layers.copyOf()
+            gl[70 * 4 + 2] = -1f
+            gl[70 * 4 + 3] = 1f
+            GLES20.glUniform4fv(u("uL"), com.graden.editor.LayerPack.SIZE, gl, 0)
+            ex.bindGlow(gradeProg, false, outW, outH)
+            ex.bindHistory(gradeProg, keep)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, src)
+            drawQuad(gradeProg)
+            ex.glowEnd()
+            layers = layers.copyOf()
+            if (g.deflicker.on) layers[5 * 4] = ex.deflickerGain(ex.mean(), g.deflicker.strength, g.deflicker.speed)
+            layers[68 * 4 + 3] = 1f
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, drawFbo)
+            GLES20.glViewport(vx, vy, canvas[2], canvas[3])
+            if (blend) GLES20.glEnable(GLES20.GL_BLEND)
+        }
+        GLES20.glUniform4fv(u("uL"), com.graden.editor.LayerPack.SIZE, layers, 0)
+        ex.bindGlow(gradeProg, needGlow, outW, outH)
+        ex.bindHistory(gradeProg, keep)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, src)
         drawQuad(gradeProg)
+        // This frame, as read in, joins the clip's history.
+        if (keep > 0) copies[p.clip.id]?.let { c ->
+            val blend = GLES20.glIsEnabled(GLES20.GL_BLEND)
+            val scissor = GLES20.glIsEnabled(GLES20.GL_SCISSOR_TEST)
+            GLES20.glDisable(GLES20.GL_BLEND)
+            GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+            ex.pushBegin(c[2], c[3], keep)
+            GLES20.glUseProgram(packProg)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, src)
+            GLES20.glUniform1i(GLES20.glGetUniformLocation(packProg, "uSrc"), 0)
+            drawQuad(packProg)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, drawFbo)
+            GLES20.glViewport(vx, vy, canvas[2], canvas[3])
+            if (blend) GLES20.glEnable(GLES20.GL_BLEND)
+            if (scissor) GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+        }
     }
+
+    /** Per clip: its glow copy, history and deflicker state. */
+    private val extras = HashMap<Long, com.graden.editor.FrameExtras>()
 
     /**
      * The picture to sample for [p] at [us], as a mip-mapped 2D texture: images as uploaded; video frames copied out of
@@ -749,7 +971,9 @@ class Compositor(private val context: Context, private val project: ExportProjec
             GLES20.glGenTextures(1, t, 0)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, t[0])
             val levels = 1 + (Math.log(max(w, h).toDouble()) / Math.log(2.0)).toInt()
-            GLES30.glTexStorage2D(GLES20.GL_TEXTURE_2D, levels, if (tenBit) GLES30.GL_RGBA16F else GLES30.GL_RGBA8, w, h)
+            // HDR and log pictures keep their full precision until they are brought into the working space.
+            val deep = tenBit || v.hdr > 0 || p.clip.id in project.deep
+            GLES30.glTexStorage2D(GLES20.GL_TEXTURE_2D, levels, if (deep && halfFloat) GLES30.GL_RGBA16F else GLES30.GL_RGBA8, w, h)
             val f = IntArray(1)
             GLES30.glGenFramebuffers(1, f, 0)
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, f[0])
@@ -768,11 +992,10 @@ class Compositor(private val context: Context, private val project: ExportProjec
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, v.oes)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(copyProg, "uSrc"), 0)
         GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(copyProg, "uTex"), 1, false, v.texM, 0)
-        GLES20.glUniform1f(GLES20.glGetUniformLocation(copyProg, "uHdr"), v.hdr.toFloat())
         drawQuad(copyProg)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, c[0])
         mip()
-        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, msaaFbo)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, drawFbo)
         if (blend) GLES20.glEnable(GLES20.GL_BLEND)
         if (scissor) GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
         return c[0]
@@ -799,24 +1022,18 @@ class Compositor(private val context: Context, private val project: ExportProjec
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
 
+    /**
+     * Through the shader cache: built once on this phone, then loaded from the cache in milliseconds (building the grade
+     * shader takes 1–20 s on Adreno and Mali drivers, every export, otherwise).
+     */
     private fun link(vs: String, fs: String): Int {
-        fun sh(type: Int, src: String): Int {
-            val s = GLES20.glCreateShader(type)
-            GLES20.glShaderSource(s, src)
-            GLES20.glCompileShader(s)
-            val ok = IntArray(1)
-            GLES20.glGetShaderiv(s, GLES20.GL_COMPILE_STATUS, ok, 0)
-            check(ok[0] != 0) { "Export shader: " + GLES20.glGetShaderInfoLog(s) }
-            return s
-        }
-        val p = GLES20.glCreateProgram()
-        GLES20.glAttachShader(p, sh(GLES20.GL_VERTEX_SHADER, vs))
-        GLES20.glAttachShader(p, sh(GLES20.GL_FRAGMENT_SHADER, fs))
-        GLES20.glLinkProgram(p)
-        return p
+        if (com.graden.editor.ShaderCache.dir == null) com.graden.editor.ShaderCache.dir = java.io.File(context.cacheDir, "shaders")
+        return com.graden.editor.ShaderCache.program(vs, fs)
     }
 
     fun release() {
+        extras.values.forEach { it.release() }
+        extras.clear()
         pool.shutdownNow()
         videos.values.forEach { it.release() }
         videos.clear()
@@ -824,19 +1041,20 @@ class Compositor(private val context: Context, private val project: ExportProjec
             EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
             if (window != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(display, window)
             if (pbuffer != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(display, pbuffer)
+            com.graden.editor.SatCompTable.forget(eglContext)
             EGL14.eglDestroyContext(display, eglContext)
             EGL14.eglTerminate(display)
         }
         display = EGL14.EGL_NO_DISPLAY
     }
 
-    private companion object {
+    internal companion object {
         const val EGL_RECORDABLE_ANDROID = 0x3142
         /** How far ahead clips are opened, and how many decoders may be open at once (the encoder needs one too). */
         const val PREFETCH_US = 1_500_000L
         const val MAX_DECODERS = 12
 
-        const val PIC_VERTEX = """
+        internal const val PIC_VERTEX = """
 attribute vec2 aPos;
 uniform mat3 uM;
 uniform vec2 uCanvas;
@@ -853,12 +1071,13 @@ void main() {
         /** The preview's grade, word for word, reading a 2D texture and placed, cropped and masked for export. */
         fun gradeFragment(): String {
             val g = GradeShader.FRAGMENT
-            var body = g.substring(g.indexOf("const vec3 LUMA"))
-            body = body.replace("vec3 at(vec2 p) { return texture2D(uSrc, (uTex * vec4(p, 0.0, 1.0)).xy).rgb; }", "vec3 at(vec2 p) { return texture2D(uSrc, p).rgb; }")
-            body = body.replace("gl_FragColor = vec4(src, 1.0); return;", "return vec4(src, 1.0);")
+            var body = g.substring(g.indexOf("// GRADE-BODY"))
+            body = body.replace("vec3 raw(vec2 p) { vec2 s = stabUv(p); return texture2D(uSrc, (uTex * vec4(s, 0.0, 1.0)).xy).rgb; }", "vec3 raw(vec2 p) { return texture2D(uSrc, stabUv(p)).rgb; }")
             body = body.replace("void main()", "vec4 gradeMain()")
             body = body.replace("gl_FragColor = ", "return ")
-            check(body.contains("vec4 gradeMain()") && body.contains("texture2D(uSrc, p)")) { "Grade shader changed; export needs updating" }
+            // An early "gl_FragColor = …; return;" becomes "return …; return;": the second return goes.
+            body = body.replace(Regex("""(return [^;]+;)\s*return;"""), "$1")
+            check(body.contains("vec4 gradeMain()") && body.contains("texture2D(uSrc, stabUv(p))") && body.contains("vec3 o = fin(c);")) { "Grade shader changed; export needs updating" }
             return """
 #extension GL_OES_standard_derivatives : enable
 precision highp float;
@@ -901,40 +1120,63 @@ void main() {
 }
 """
 
-        /** Copies a decoded frame upright into a 2D texture; HDR (PQ or HLG) is tone-mapped to SDR Rec.709. */
+        /** Copies a decoded frame upright into a 2D texture, as it is: its colour space is handled when it is drawn. */
         const val COPY_FRAGMENT = """
 #extension GL_OES_EGL_image_external : require
 precision highp float;
 varying vec2 vUv;
 uniform samplerExternalOES uSrc;
 uniform mat4 uTex;
-uniform float uHdr;
-
-vec3 pq(vec3 e) {
-    vec3 p = pow(max(e, 0.0), vec3(1.0 / 78.84375));
-    return pow(max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p), vec3(1.0 / 0.1593017578125)) * 10000.0;
-}
-vec3 hlg(vec3 e) {
-    vec3 a = e * e / 3.0;
-    vec3 b = (exp((e - 0.55991073) / 0.17883277) + 0.28466892) / 12.0;
-    vec3 s = mix(a, b, step(0.5, e));
-    float y = dot(s, vec3(0.2627, 0.6780, 0.0593));
-    return s * pow(max(y, 1e-6), 0.2) * 1000.0;
-}
-vec3 toSdr(vec3 nits) {
-    // BT.2020 to BT.709 primaries, then a smooth roll-off with diffuse white at 203 nits.
-    vec3 c = mat3(1.6605, -0.1246, -0.0182, -0.5876, 1.1329, -0.1006, -0.0728, -0.0083, 1.1187) * nits;
-    vec3 x = max(c, 0.0) / 203.0;
-    float L = 1000.0 / 203.0;
-    vec3 y = x * (1.0 + x / (L * L)) / (1.0 + x);
-    return pow(clamp(y, 0.0, 1.0), vec3(1.0 / 2.4));
-}
 void main() {
     // The decoder's frames are stored bottom row first; this copy is top row first, like an image.
-    vec3 c = texture2D(uSrc, (uTex * vec4(vUv.x, 1.0 - vUv.y, 0.0, 1.0)).xy).rgb;
-    if (uHdr > 1.5) c = toSdr(hlg(c));
-    else if (uHdr > 0.5) c = toSdr(pq(c));
-    gl_FragColor = vec4(c, 1.0);
+    gl_FragColor = vec4(texture2D(uSrc, (uTex * vec4(vUv.x, 1.0 - vUv.y, 0.0, 1.0)).xy).rgb, 1.0);
+}
+"""
+
+        const val P010_VERTEX = """#version 300 es
+in vec2 aPos;
+void main() { gl_Position = vec4(aPos * 2.0 - 1.0, 0.0, 1.0); }
+"""
+
+        /** Two luma samples per output pixel, each 10 bits in the top of 16, little-endian bytes. */
+        const val P010_Y = """#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D uSrc;
+uniform int uH;
+uniform vec3 uK;
+out vec4 o;
+uint y10(int x, int r) {
+    vec3 c = clamp(texelFetch(uSrc, ivec2(x, uH - 1 - r), 0).rgb, 0.0, 1.0);
+    return uint(clamp(floor(64.0 + 876.0 * dot(c, uK) + 0.5), 0.0, 1023.0)) << 6u;
+}
+void main() {
+    ivec2 f = ivec2(gl_FragCoord.xy);
+    uint a = y10(f.x * 2, f.y);
+    uint b = y10(f.x * 2 + 1, f.y);
+    o = vec4(float(a & 255u), float(a >> 8u), float(b & 255u), float(b >> 8u)) / 255.0;
+}
+"""
+
+        /** One Cb, Cr pair per output pixel, from the average of 2×2 pixels. */
+        const val P010_UV = """#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D uSrc;
+uniform int uH;
+uniform vec3 uK;
+out vec4 o;
+vec3 px(int x, int r) { return clamp(texelFetch(uSrc, ivec2(x, uH - 1 - r), 0).rgb, 0.0, 1.0); }
+void main() {
+    ivec2 f = ivec2(gl_FragCoord.xy);
+    int x = f.x * 2; int r = f.y * 2;
+    vec3 c = (px(x, r) + px(x + 1, r) + px(x, r + 1) + px(x + 1, r + 1)) * 0.25;
+    float y = dot(c, uK);
+    float cb = (c.b - y) / (2.0 * (1.0 - uK.z));
+    float cr = (c.r - y) / (2.0 * (1.0 - uK.x));
+    uint u = uint(clamp(floor(512.0 + 896.0 * cb + 0.5), 0.0, 1023.0)) << 6u;
+    uint v = uint(clamp(floor(512.0 + 896.0 * cr + 0.5), 0.0, 1023.0)) << 6u;
+    o = vec4(float(u & 255u), float(u >> 8u), float(v & 255u), float(v >> 8u)) / 255.0;
 }
 """
 

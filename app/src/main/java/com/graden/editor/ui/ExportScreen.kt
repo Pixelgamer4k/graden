@@ -113,17 +113,49 @@ fun ExportScreen(vm: EditorViewModel) {
     val meta = vm.meta
     val encoders = remember { EncoderInfo.discover() }
     fun encoderFor(c: VideoCodec) = encoders.firstOrNull { it.codec == c && it.hardware }?.name ?: encoders.firstOrNull { it.codec == c }?.name ?: ""
+    fun canWrite(e: EncoderInfo, o: com.graden.editor.ColorSpaces.Space) = !o.hdr || (e.tenBit && (o != com.graden.editor.ColorSpaces.PQ || e.hdr10 || e.hdrEditing))
+    /** For an HDR output: the encoder built for HDR editing first (it writes the HDR10 metadata into the stream), then any that can. */
+    fun hdrEncoderFor(c: VideoCodec, o: com.graden.editor.ColorSpaces.Space): String? =
+        encoders.filter { it.codec == c && canWrite(it, o) }.sortedWith(compareBy({ !it.hdrEditing }, { !it.hardware }, { it.unlistedMain10 })).firstOrNull()?.name
     var s by remember {
         mutableStateOf(
             ExportPresets.builtIn[0].apply(
                 ExportSettings(fileName = meta.name.replace(Regex("[\\\\/:*?\"<>|]"), "_"), width = meta.width, height = meta.height), meta.width, meta.height,
-            ).let { st -> st.copy(encoder = encoderFor(st.codec), loudnessTarget = meta.loudness ?: -14f) },
+            ).let { st ->
+                val o = com.graden.editor.ColorSpaces.output(meta.colorSpace)
+                st.copy(encoder = (if (o.hdr) hdrEncoderFor(st.codec, o) else null) ?: encoderFor(st.codec), loudnessTarget = meta.loudness ?: -14f, output = o.name)
+            },
         )
     }
     var preset by remember { mutableStateOf(ExportPresets.builtIn[0].name) }
     var userPresets by remember { mutableStateOf(ExportPresets.loadUser(context)) }
     var naming by remember { mutableStateOf(false) }
     val enc = encoders.firstOrNull { it.name == s.encoder && it.codec == s.codec } ?: encoders.firstOrNull { it.codec == s.codec }
+    // The footage's own bitrate (read once, off the main thread): "Best" never goes below it.
+    val used = remember(vm.tracks) { vm.tracks.flatMap { t -> t.clips.mapNotNull { vm.assets[it.assetId] } }.distinctBy { it.id } }
+    val floor by androidx.compose.runtime.produceState(0, used, s.width, s.height, s.codec, meta.fps) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            com.graden.editor.export.SourceRate.floor(context, used, s.width, s.height, meta.fps, s.codec)
+        }
+    }
+    if (s.sourceFloor != floor) s = s.copy(sourceFloor = floor)
+    // An HDR output this encoder cannot write: another encoder of the codec that can is taken; if none can, Rec.709,
+    // and the screen says why (never silently).
+    var hdrNote by remember { mutableStateOf<String?>(null) }
+    run {
+        val o = com.graden.editor.ColorSpaces.output(s.output)
+        if (o.hdr && (enc == null || !canWrite(enc, o))) {
+            val other = hdrEncoderFor(s.codec, o)
+            if (other != null) s = s.copy(encoder = other, bitDepth = 10)
+            else {
+                hdrNote = if (encoders.none { it.codec == s.codec && it.tenBit })
+                    "This phone's ${s.codec.label} encoder cannot write 10-bit, so ${o.name} is not possible here; the export is SDR Rec.709." +
+                        (if (s.codec == VideoCodec.H264 && encoders.any { it.codec == VideoCodec.H265 && canWrite(it, o) }) " Choose H.265 for HDR." else "")
+                else "This phone's encoders cannot write HDR10 metadata; the export is SDR Rec.709. Rec.2100 HLG works here."
+                s = s.copy(output = com.graden.editor.ColorSpaces.REC709.name)
+            }
+        }
+    }
     val notifyAsk = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     fun change(update: (ExportSettings) -> ExportSettings) {
@@ -271,6 +303,30 @@ fun ExportScreen(vm: EditorViewModel) {
                         }
                     }
                     Divider()
+                    // Output colour space. HDR is offered only where this encoder can write 10-bit (and HDR10 metadata).
+                    val outSpace = com.graden.editor.ColorSpaces.output(s.output)
+                    val outs = com.graden.editor.ColorSpaces.outputs.filter {
+                        !it.hdr || hdrEncoderFor(s.codec, it) != null
+                    }
+                    Expandable("Colour", {
+                        ValueText(outSpace.name.replace(" Gamma ", " γ"))
+                        if (outSpace.hdr) { Spacer(Modifier.width(8.dp)); Badge("HDR", Palette.Accent) }
+                    }) {
+                        for (o in outs) ColourOption(o.name, o.note, o == outSpace, o.hdr) {
+                            hdrNote = null
+                            change { it.copy(output = o.name, bitDepth = if (o.hdr) 10 else it.bitDepth, profile = 0, encoder = (if (o.hdr) hdrEncoderFor(it.codec, o) else null) ?: it.encoder) }
+                        }
+                        hdrNote?.let { Hint(it) }
+                        if (hdrNote == null && com.graden.editor.ColorSpaces.outputs.any { it.hdr && it !in outs }) Hint(
+                            if (encoders.none { it.codec == s.codec && it.tenBit }) "HDR needs 10-bit encoding, which this phone's ${s.codec.label} encoder does not have" +
+                                (if (s.codec == VideoCodec.H264 && encoders.any { it.codec == VideoCodec.H265 && it.tenBit }) "; H.265 has it" else "")
+                            else "HDR10 needs an encoder that writes HDR10 metadata; this phone has none for ${s.codec.label}",
+                        )
+                        if (outSpace.hdr && !com.graden.editor.ColorSpaces.working(meta.workingSpace).log) Hint(
+                            "The project is graded in an SDR working space, so highlights are rolled off. For full HDR, set the working space to DaVinci Wide Gamut or ACEScct in project settings.",
+                        )
+                    }
+                    Divider()
                     RowItem("Frame rate") {
                         Icon(Lucide.Lock, null, tint = Faint, modifier = Modifier.size(14.dp))
                         Spacer(Modifier.width(6.dp))
@@ -288,8 +344,10 @@ fun ExportScreen(vm: EditorViewModel) {
                         val br = s.videoBitrate(meta.fps, enc)
                         when (s.quality) {
                             QualityMode.AUTO_BEST -> Hint(
-                                "%.0f Mbps · visually lossless for this size and frame rate".format(br / 1e6) +
-                                    if (enc != null && ExportSettings.autoBest(s.codec, s.width, s.height, meta.fps) > enc.maxBitrate) " (encoder maximum)" else "",
+                                (if (s.sourceFloor > ExportSettings.autoBest(s.codec, s.width, s.height, meta.fps))
+                                    "%.0f Mbps · the footage's own bitrate, kept in full".format(br / 1e6)
+                                else "%.0f Mbps · visually lossless for this size and frame rate".format(br / 1e6)) +
+                                    if (enc != null && maxOf(ExportSettings.autoBest(s.codec, s.width, s.height, meta.fps), s.sourceFloor) > enc.maxBitrate) " (encoder maximum)" else "",
                             )
                             QualityMode.RESTRICT -> {
                                 val max = ((enc?.maxBitrate ?: 200_000_000) / 1_000_000).coerceAtLeast(2)
@@ -336,7 +394,7 @@ fun ExportScreen(vm: EditorViewModel) {
                         Segments(listOf("Auto", "Every"), if (s.keyframeEvery == 0) 0 else 1) { i -> change { it.copy(keyframeEvery = if (i == 0) 0 else meta.fps.roundToInt().coerceAtLeast(1)) } }
                     }
                     Divider()
-                    RowItem("Colour") { ValueText("Rec.709 · ${s.bitDepth}-bit · SDR") }
+                    RowItem("Working space") { ValueText(com.graden.editor.ColorSpaces.working(meta.workingSpace).name) }
                 }
 
                 Card("Audio") {
@@ -388,7 +446,7 @@ fun ExportScreen(vm: EditorViewModel) {
                             .clickable(enabled = ok) {
                                 if (Build.VERSION.SDK_INT >= 33) notifyAsk.launch(Manifest.permission.POST_NOTIFICATIONS)
                                 vm.pause()
-                                ExportJob.start(context, vm.exportProject(), s, enc!!)
+                                ExportJob.start(context, vm.exportProject(s.output), s, enc!!)
                             }.padding(horizontal = 26.dp),
                         contentAlignment = Alignment.Center,
                     ) { Text("Render", color = if (ok) Dark else Faint, fontSize = 16.sp, fontWeight = FontWeight.Bold) }
@@ -781,6 +839,23 @@ private fun SizeTile(label: String, size: String, on: Boolean, enabled: Boolean,
     ) {
         Text(label, color = if (!enabled) Faint else if (on) Palette.Accent else Ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
         Text(if (enabled) size else "Too large", color = if (enabled) Sub else Faint, fontSize = 11.sp, fontFamily = MonoFont)
+    }
+}
+
+@Composable
+private fun ColourOption(name: String, note: String, on: Boolean, hdr: Boolean, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(top = 8.dp).clip(RoundedCornerShape(12.dp)).background(if (on) Color(0xFF2B2016) else Field)
+            .border(1.dp, if (on) Palette.Accent else Color.Transparent, RoundedCornerShape(12.dp)).clickable(onClick = onClick).padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Badge(if (hdr) "HDR" else "SDR", if (hdr) Palette.Accent else Sub)
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(name, color = if (on) Palette.Accent else Ink, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            Text(note, color = Sub, fontSize = 11.sp)
+        }
+        if (on) Icon(Lucide.Check, null, tint = Palette.Accent, modifier = Modifier.size(18.dp))
     }
 }
 

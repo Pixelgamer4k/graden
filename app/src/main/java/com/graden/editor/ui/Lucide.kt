@@ -109,6 +109,26 @@ object Lucide {
             "M10 11 v6", "M14 11 v6",
         )
     }
+    /** A lens aperture: the camera's own (RAW) data. */
+    val Aperture by lazy {
+        icon(circle(12f, 12f, 10f), "M14.31 8 l5.74 9.94", "M9.69 8 h11.48", "M7.38 12 l5.74 -9.94", "M9.69 16 L3.95 6.06", "M14.31 16 H2.83", "M16.62 12 l-5.74 9.94")
+    }
+    /** A frame whose wobble is straightened: stabilisation. */
+    val Stabilize by lazy {
+        icon(
+            "M3 7 V5 a2 2 0 0 1 2 -2 h2", "M17 3 h2 a2 2 0 0 1 2 2 v2", "M21 17 v2 a2 2 0 0 1 -2 2 h-2", "M7 21 H5 a2 2 0 0 1 -2 -2 v-2",
+            "M7 12 c1.5 -3 3.5 -3 5 0 s3.5 3 5 0",
+        )
+    }
+    /** A level: lock horizon. */
+    val Horizon by lazy { icon("M2 12 h4", "M18 12 h4", "M12 8 a4 4 0 1 1 0 8 a4 4 0 1 1 0 -8", "M8 12 h8") }
+    /** A tripod's lock: camera lock. */
+    val Tripod by lazy { icon(rect(7f, 3f, 10f, 7f, 2f), "M12 10 v3", "M12 13 L6 21", "M12 13 L18 21", "M12 13 v8") }
+    val Activity by lazy { icon("M22 12 h-4 l-3 9 L9 3 l-3 9 H2") }
+    /** A gyroscope: the visual gyro stabiliser. */
+    val Gyro by lazy { icon("M2 12 a10 4 0 1 0 20 0 a10 4 0 1 0 -20 0", "M12 2 a4 10 0 1 0 0 20 a4 10 0 1 0 0 -20", circle(12f, 12f, 1.6f)) }
+    /** Stacked flat layers: the classic (2D) stabiliser methods. */
+    val Planes by lazy { icon("M12 3 L22 8 L12 13 L2 8 Z", "M2 13 L12 18 L22 13", "M2 17.5 L12 22.5 L22 17.5") }
     val Crop by lazy { icon("M6 2 v14 a2 2 0 0 0 2 2 h14", "M18 22 V8 a2 2 0 0 0 -2 -2 H2") }
     val Flip by lazy {
         icon(

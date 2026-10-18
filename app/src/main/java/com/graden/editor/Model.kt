@@ -21,8 +21,22 @@ data class MediaAsset(
     val reverseOf: Int = -1,
     val revInUs: Long = 0L,
     val revOutUs: Long = 0L,
+    /**
+     * For a MotionCam RAW recording: the recording itself ([uri] is then its developed master, which everything else
+     * reads), and its colour calibration (see [McRawInfo.toJson]).
+     */
+    val raw: String? = null,
+    val rawCal: String? = null,
+    /** How the master was developed: at half resolution, and with the lens's shading corrected. */
+    val rawHalf: Boolean = false,
+    val rawShading: Boolean = true,
+    /** The file says its picture uses full range (0–1023); most video is recorded in video levels (64–940). */
+    val fullRange: Boolean = false,
+    /** An HDR file's curve as the file says: HLG (else PQ). Read at import, so it is known before anything is drawn. */
+    val hlg: Boolean = false,
 ) {
     val isReversed: Boolean get() = reverseOf >= 0
+    val isRaw: Boolean get() = raw != null
     /** Audio-only files have no picture size. */
     val isAudio: Boolean get() = width == 0
     /** A still picture: it has no length of its own, so a clip of it can be stretched to any duration. */
@@ -71,6 +85,10 @@ data class Clip(
     val speed: Float = 1f,
     /** The colour grade, made on the Color page. */
     val grade: Grade = Grade(),
+    /** The colour space the file is in, when set by hand (a camera log, say); null reads it from the file. */
+    val cs: String? = null,
+    /** Optical stabilisation, made on the Stabilize page; null: none. */
+    val stab: Stab? = null,
 ) {
     /** How long the clip lasts on the timeline. */
     val durationUs: Long get() = ((outUs - inUs) / speed).toLong()

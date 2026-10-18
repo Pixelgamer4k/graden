@@ -1,5 +1,25 @@
 package com.graden.editor.ui
 
+import androidx.compose.runtime.rememberUpdatedState
+
+import androidx.compose.ui.graphics.drawscope.rotate
+
+import androidx.compose.foundation.gestures.detectTapGestures
+
+import androidx.compose.foundation.gestures.calculateRotation
+
+import androidx.compose.foundation.gestures.calculateZoom
+
+import androidx.compose.foundation.gestures.calculatePan
+
+import androidx.compose.foundation.gestures.awaitFirstDown
+
+import androidx.compose.foundation.gestures.awaitEachGesture
+
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.layout.fillMaxHeight
+
 import android.os.Build
 import android.view.HapticFeedbackConstants
 import android.view.LayoutInflater
@@ -144,12 +164,28 @@ fun EditorScreen(vm: EditorViewModel) {
     com.graden.editor.RecomposeProbe.hit("EditorScreen")
     // The dashboard comes first; the editor is shown once a project is open.
     if (vm.projectId == null) {
-        Dashboard(vm)
+        Box(Modifier.fillMaxSize()) {
+            Dashboard(vm)
+            androidx.compose.animation.AnimatedVisibility(!vm.startupReady, enter = androidx.compose.animation.EnterTransition.None,
+                exit = androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(380))) { Splash(vm) }
+        }
         return
     }
     BackHandler { vm.closeProject() }
+    // HDR preview: the window becomes an HDR window and the pictures draw Rec.2100 PQ.
+    val activity = androidx.compose.ui.platform.LocalContext.current as? android.app.Activity
+    val hdr = vm.hdrPreview
+    androidx.compose.runtime.DisposableEffect(hdr) {
+        com.graden.editor.GradeGl.setHdr(hdr)
+        if (android.os.Build.VERSION.SDK_INT >= 34) activity?.window?.colorMode =
+            if (hdr) android.content.pm.ActivityInfo.COLOR_MODE_HDR else android.content.pm.ActivityInfo.COLOR_MODE_DEFAULT
+        onDispose {
+            com.graden.editor.GradeGl.setHdr(false)
+            if (android.os.Build.VERSION.SDK_INT >= 34) activity?.window?.colorMode = android.content.pm.ActivityInfo.COLOR_MODE_DEFAULT
+        }
+    }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { vm.import(it) }
-    val import = { picker.launch(arrayOf("video/*", "audio/*", "image/*")) }
+    val import = { picker.launch(arrayOf("video/*", "audio/*", "image/*", "application/octet-stream")) }
     val density = LocalDensity.current
     val context = LocalContext.current
     // Controls that are in the design but have nothing behind them yet say so instead of doing nothing.
@@ -204,9 +240,17 @@ fun EditorScreen(vm: EditorViewModel) {
 
     Box(Modifier.fillMaxSize().background(Palette.Bg)) {
         Column(Modifier.fillMaxSize().systemBarsPadding()) {
-            if (vm.colorOpen) ColorTopBar(vm) else HostBar(vm, soon, onClose = { vm.closeProject() }, onSettings = { settingsOpen = true })
+            when {
+                vm.colorOpen -> ColorTopBar(vm)
+                vm.stabOpen -> StabTopBar(vm)
+                else -> HostBar(vm, soon, onClose = { vm.closeProject() }, onSettings = { settingsOpen = true })
+            }
             Preview(vm)
-            if (vm.colorOpen) ColorBody(vm, Modifier.weight(1f)) else EditBody(vm, soon) { timelineBounds = it }
+            when {
+                vm.colorOpen -> ColorBody(vm, Modifier.weight(1f))
+                vm.stabOpen -> StabBody(vm, Modifier.weight(1f))
+                else -> EditBody(vm, soon) { timelineBounds = it }
+            }
         }
         if (vm.colorOpen) ColorOverlays(vm)
         TransitionSheet(vm, Modifier.align(Alignment.BottomCenter))
@@ -237,6 +281,7 @@ fun EditorScreen(vm: EditorViewModel) {
                 dragAsset = null
             },
         )
+        ImportWindow(vm)
         // The item being dragged out of the media window stays centred under the fingertip, above
         // everything else, and shrinks once it is over a place it can be dropped.
         dragAsset?.let { a ->
@@ -432,7 +477,7 @@ private fun Preview(vm: EditorViewModel) {
     // A square area, the canvas centred in it at its own shape: wide canvases with bars above and below, tall ones (reels)
     // with bars at the sides, so a tall canvas gets the whole height. While grading the scopes and wheels need the room,
     // so the area is wide there.
-    val areaAspect = if (vm.colorOpen) maxOf(canvasAspect, 1.78f) else 1f
+    val areaAspect = if (vm.colorOpen || vm.stabOpen) maxOf(canvasAspect, 1.78f) else 1f
     Box(Modifier.fillMaxWidth().aspectRatio(areaAspect).background(Color(0xFF060709))) {
     Box(
         Modifier.align(Alignment.Center).padding(if (canvasAspect >= areaAspect - 0.01f) 0.dp else 4.dp)
@@ -459,7 +504,10 @@ private fun Preview(vm: EditorViewModel) {
                 }
             },
             factory = { ctx -> GradedVideoView(ctx, "still").apply { onInput = playerInput(vm.still) } },
-            update = { it.setLook(vm.gradeFor(top), topAspect, vm.meta.scaling == "Fill") },
+            update = {
+                it.setLook(vm.gradeFor(top), topAspect, vm.meta.scaling == "Fill", vm.cmFor(top, native = true), vm.layersFor(top))
+                it.setStab(vm.stabFor(top)) { _ -> vm.stabStillUs(top) }
+            },
         )
         // Proxy scrub frame, drawn over the players only while scrubbing or trimming.
         val aspect = vm.overlayAspect
@@ -484,13 +532,17 @@ private fun Preview(vm: EditorViewModel) {
             factory = { ctx ->
                 GradedVideoView(ctx, "scrub").apply { onInput = { s, attached -> vm.scrub.setSurface(if (attached) s else null) } }
             },
-            update = { it.setLook(vm.gradeFor(top), 0f, false) },
+            update = {
+                it.setLook(vm.gradeFor(top), 0f, false, vm.cmFor(top, native = false, scrub = true), vm.layersFor(top))
+                // The scrub decoder stamps each frame with its own time.
+                it.setStab(vm.stabFor(top)) { ns -> ns / 1000L }
+            },
         )
         // The picture being graded feeds the scopes.
         val scopeKey by remember { derivedStateOf { vm.scopeKey() } }
         SideEffect { GradeGl.scopeTag = scopeKey }
         // Touching the canvas: select, move, resize, turn and crop pictures. Not while grading.
-        if (!vm.colorOpen) CanvasOverlay(vm)
+        if (!vm.colorOpen && !vm.stabOpen) CanvasOverlay(vm)
     }
         // Details of the picture on screen: opened from the "i" in the top bar; nothing sits on the canvas otherwise.
         val infoOpen = vm.infoOpen
@@ -530,6 +582,112 @@ private fun Preview(vm: EditorViewModel) {
                 }
             }
         }
+        if (vm.colorOpen && vm.wipe >= 0f) WipeLine(vm)
+        if (vm.colorOpen && vm.secondaryOverlay) SecondaryOverlay(vm)
+    }
+}
+
+/**
+ * Over the picture while the Secondaries palette is open: the chosen secondary's window, drawn with its soft edge,
+ * moved by dragging, sized by pinching and turned by twisting; or, while picking, a tap that picks the colour there.
+ */
+@Composable
+private fun SecondaryOverlay(vm: EditorViewModel) {
+    val g = vm.gradeTarget?.clip?.grade ?: return
+    val i = vm.secondaryEdit
+    val s = g.secondaries.getOrNull(i) ?: return
+    val w = s.window
+    val vmNow by rememberUpdatedState(vm)
+    if (vm.pickingColour) {
+        Box(Modifier.fillMaxSize().pointerInput(Unit) {
+            detectTapGestures { p -> vmNow.pickColourAt(p.x / size.width, p.y / size.height) }
+        }) {
+            Text(
+                "Tap the colour to select", color = Color.Black, fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.align(Alignment.TopCenter).padding(8.dp).clip(RoundedCornerShape(12.dp)).background(Color(0xFFF2C14E)).padding(horizontal = 10.dp, vertical = 4.dp),
+            )
+        }
+        return
+    }
+    if (w.type == com.graden.editor.Window.NONE) return
+    androidx.compose.foundation.Canvas(
+        Modifier.fillMaxSize().pointerInput(i) {
+            awaitEachGesture {
+                awaitFirstDown()
+                val m = vmNow
+                m.gradeStart()
+                do {
+                    val e = awaitPointerEvent()
+                    val pan = e.calculatePan()
+                    val zoom = e.calculateZoom()
+                    val rot = e.calculateRotation()
+                    if (pan != Offset.Zero || zoom != 1f || rot != 0f) {
+                        val sw = size.width.toFloat(); val sh = size.height.toFloat()
+                        m.setGrade { gr ->
+                            gr.copy(secondaries = gr.secondaries.mapIndexed { k, x ->
+                                if (k != i) x else x.copy(window = x.window.copy(
+                                    cx = (x.window.cx + pan.x / sw).coerceIn(-0.5f, 1.5f), cy = (x.window.cy + pan.y / sh).coerceIn(-0.5f, 1.5f),
+                                    w = (x.window.w * zoom).coerceIn(0.02f, 2f), h = (x.window.h * zoom).coerceIn(0.02f, 2f),
+                                    angle = ((x.window.angle + rot + 540f) % 360f) - 180f,
+                                ))
+                            })
+                        }
+                    }
+                    e.changes.forEach { it.consume() }
+                } while (e.changes.any { it.pressed })
+                m.gradeEnd()
+            }
+        },
+    ) {
+        val c = Offset(w.cx * size.width, w.cy * size.height)
+        val stroke = 1.5.dp.toPx()
+        val softPx = w.softness * size.height
+        rotate(w.angle, c) {
+            when (w.type) {
+                com.graden.editor.Window.CIRCLE -> {
+                    val rx = w.w * size.height; val ry = w.h * size.height
+                    drawOval(Color.White, Offset(c.x - rx, c.y - ry), Size(2 * rx, 2 * ry), style = Stroke(stroke))
+                    drawOval(Color.White.copy(alpha = 0.35f), Offset(c.x - rx - softPx, c.y - ry - softPx), Size(2 * (rx + softPx), 2 * (ry + softPx)),
+                        style = Stroke(1.dp.toPx(), pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(6.dp.toPx(), 5.dp.toPx()))))
+                }
+                com.graden.editor.Window.RECT -> {
+                    val rx = w.w * size.height; val ry = w.h * size.height
+                    drawRect(Color.White, Offset(c.x - rx, c.y - ry), Size(2 * rx, 2 * ry), style = Stroke(stroke))
+                    drawRect(Color.White.copy(alpha = 0.35f), Offset(c.x - rx - softPx, c.y - ry - softPx), Size(2 * (rx + softPx), 2 * (ry + softPx)),
+                        style = Stroke(1.dp.toPx(), pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(6.dp.toPx(), 5.dp.toPx()))))
+                }
+                else -> {
+                    // The edge of a linear window, across the frame; the selected side is above it.
+                    val l = size.width * 2f
+                    drawLine(Color.White, Offset(c.x - l, c.y), Offset(c.x + l, c.y), stroke)
+                    for (o in listOf(-softPx, softPx)) drawLine(Color.White.copy(alpha = 0.35f), Offset(c.x - l, c.y + o), Offset(c.x + l, c.y + o), 1.dp.toPx(),
+                        pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(6.dp.toPx(), 5.dp.toPx())))
+                    drawLine(Color.White, c, Offset(c.x, c.y - 22.dp.toPx()), stroke)
+                }
+            }
+            drawCircle(Color.Black.copy(alpha = 0.5f), 7.dp.toPx(), c)
+            drawCircle(Color.White, 5.dp.toPx(), c)
+        }
+    }
+}
+
+/** The before/after split: graded on the left, as shot on the right; drag the line to move it. */
+@Composable
+private fun WipeLine(vm: EditorViewModel) {
+    androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxSize().pointerInput(Unit) {
+        detectDragGestures { change, _ ->
+            change.consume()
+            vm.wipe = (change.position.x / size.width).coerceIn(0.02f, 0.98f)
+        }
+    }) {
+        val x = maxWidth * vm.wipe
+        Box(Modifier.offset(x = x - 1.dp).width(2.dp).fillMaxHeight().background(Color.White.copy(alpha = 0.85f)))
+        Box(
+            Modifier.offset(x = x - 14.dp).align(Alignment.CenterStart).size(28.dp).clip(CircleShape).background(Color.White),
+            contentAlignment = Alignment.Center,
+        ) { Text("⇆", color = Color.Black, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
+        Text("Graded", color = Color.White, fontSize = 10.sp, modifier = Modifier.align(Alignment.TopStart).padding(6.dp).clip(RoundedCornerShape(4.dp)).background(Color(0x99000000)).padding(horizontal = 5.dp, vertical = 1.dp))
+        Text("Original", color = Color.White, fontSize = 10.sp, modifier = Modifier.align(Alignment.TopEnd).padding(6.dp).clip(RoundedCornerShape(4.dp)).background(Color(0x99000000)).padding(horizontal = 5.dp, vertical = 1.dp))
     }
 }
 
@@ -609,7 +767,12 @@ private fun LaneLayers(vm: EditorViewModel, t: com.graden.editor.Track) {
                     factory = { ctx ->
                         GradedVideoView(ctx, "L${t.id}-$k").apply { onInput = playerInput(lp.players[k]) }
                     },
-                    update = { it.setLook(vm.gradeFor(shownClip), pictureAspect, vm.meta.scaling == "Fill") },
+                    update = {
+                        it.setLook(vm.gradeFor(shownClip), pictureAspect, vm.meta.scaling == "Fill", vm.cmFor(shownClip, native = false), vm.layersFor(shownClip))
+                        // Playing: the exact frame on screen, from the player's record of what it released with that stamp.
+                        val clipNow = shownClip
+                        it.setStab(vm.stabFor(clipNow)) { ns -> lp.frameForStamp(k, ns) ?: vm.stabStillUs(clipNow) }
+                    },
                 )
             }
             // At rest: the original file's own frame, placed and graded exactly like the clip, over the proxy picture.
@@ -637,7 +800,10 @@ private fun LaneLayers(vm: EditorViewModel, t: com.graden.editor.Track) {
                     }
                 },
                 factory = { ctx -> GradedVideoView(ctx, "R${t.id}") },
-                update = { it.setLook(vm.gradeFor(here), restAspect, vm.meta.scaling == "Fill") },
+                update = {
+                    it.setLook(vm.gradeFor(here), restAspect, vm.meta.scaling == "Fill", vm.cmFor(here, native = true), vm.layersFor(here))
+                    it.setStab(vm.stabFor(here)) { _ -> vm.stabStillUs(here) }
+                },
             )
         }
 }
@@ -746,6 +912,8 @@ private fun TransportRow(vm: EditorViewModel) {
                     maxLines = 1, softWrap = false,
                 )
                 Spacer(Modifier.weight(1f))
+                HdrToggle(vm, k.sp(10.5f), k.dp(8f), k.dp(3f))
+                Spacer(Modifier.width(k.dp(6f)))
                 SourceTag(vm, k)
             }
             Box(Modifier.fillMaxWidth().height(k.dp(56f)).padding(horizontal = k.dp(10f))) {
@@ -816,6 +984,22 @@ private fun PlayheadText(vm: EditorViewModel, color: Color, k: DeckUnit) {
  * until the originals' frames arrive), the originals' own frames at rest, or a proxy still being made; with the live frame
  * rate while playing. A small pill on the right of the info line.
  */
+/** HDR / SDR switch for the preview, on phones whose screen shows HDR. */
+@Composable
+internal fun HdrToggle(
+    vm: EditorViewModel, size: androidx.compose.ui.unit.TextUnit = 10.5.sp,
+    padH: androidx.compose.ui.unit.Dp = 8.dp, padV: androidx.compose.ui.unit.Dp = 3.dp,
+) {
+    if (!com.graden.editor.GradeGl.hdrSupported) return
+    val on = vm.hdrPreview
+    Text(
+        if (on) "HDR" else "SDR", color = if (on) Color.Black else Palette.Text.copy(alpha = 0.8f), fontSize = size, fontWeight = FontWeight.Bold,
+        maxLines = 1, softWrap = false,
+        modifier = Modifier.clip(RoundedCornerShape(50)).background(if (on) Color(0xFFF2C14E) else Color(0xFF1A1B21))
+            .clickable { vm.hdrChoice = !on }.padding(horizontal = padH, vertical = padV),
+    )
+}
+
 @Composable
 private fun SourceTag(vm: EditorViewModel, k: DeckUnit) {
     val source by remember { derivedStateOf { vm.previewSource } }
@@ -877,6 +1061,7 @@ private fun Tools(vm: EditorViewModel, soon: (String) -> Unit) {
                 Tool(Lucide.Palette, "Color", tinted = true) { vm.openColor() }
                 Tool(Lucide.Sparkles, "Effects", tinted = true) { soon("Effects") }
                 Tool(Lucide.Crop, "Crop") { vm.openCrop() }
+                if (video) Tool(Lucide.Stabilize, "Stabilize", tinted = true) { vm.openStab() }
                 Tool(Lucide.AnimIn, "In") { vm.selectedClipId?.let { vm.openFx(it, EditorViewModel.FxSlot.IN) } }
                 Tool(Lucide.AnimOut, "Out") { vm.selectedClipId?.let { vm.openFx(it, EditorViewModel.FxSlot.OUT) } }
             }

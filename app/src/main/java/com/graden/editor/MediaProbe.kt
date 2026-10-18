@@ -104,6 +104,8 @@ object MediaProbe {
                 hasAudio = hasAudio,
                 hdr = hdr,
                 mime = v.getString(MediaFormat.KEY_MIME) ?: "",
+                fullRange = v.containsKey(MediaFormat.KEY_COLOR_RANGE) && v.getInteger(MediaFormat.KEY_COLOR_RANGE) == MediaFormat.COLOR_RANGE_FULL,
+                hlg = transfer == MediaFormat.COLOR_TRANSFER_HLG,
             )
         } catch (e: Exception) {
             Log.w("Graden", "probe failed for $uri", e)

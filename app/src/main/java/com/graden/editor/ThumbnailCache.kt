@@ -33,6 +33,12 @@ class ThumbnailCache(private val context: Context) {
     private val pending = HashSet<Long>()
     private val failed = HashSet<Long>()
     private val main = Handler(Looper.getMainLooper())
+    /** Every thumbnail is also kept on disk, small, so the next time (the project list, reopening) it is there at once. */
+    private val disk = java.io.File(context.cacheDir, "thumbs").apply { mkdirs() }
+    private fun diskFile(key: Long) = java.io.File(disk, java.lang.Long.toHexString(key) + ".jpg")
+
+    /** Whether the thumbnail is ready in memory (for the start-up screen to wait for the first covers). */
+    fun has(asset: MediaAsset, timeUs: Long): Boolean = cache.get((asset.uri.hashCode().toLong() shl 32) xor (timeUs / 1000)) != null
 
     /**
      * While true (playing, scrubbing) nothing new is read: reading needs a hardware decoder, and playback needs every one
@@ -76,7 +82,8 @@ class ThumbnailCache(private val context: Context) {
                 while (stack.isEmpty() || paused) lock.wait()
                 stack.removeLast()
             }
-            val bitmap = if (req.image) picture(req.source) else try {
+            val saved = diskFile(req.key).takeIf { it.exists() }?.let { runCatching { BitmapFactory.decodeFile(it.path) }.getOrNull() }
+            val bitmap = saved ?: if (req.image) picture(req.source) else try {
                 val r = retrievers.getOrPut(req.source) {
                     if (retrievers.size >= 1) {
                         val eldest = retrievers.keys.first()
@@ -92,6 +99,12 @@ class ThumbnailCache(private val context: Context) {
                 null
             }
             if (bitmap != null) cache.put(req.key, bitmap.asImageBitmap())
+            if (bitmap != null && saved == null) runCatching {
+                val f = diskFile(req.key)
+                val tmp = java.io.File(f.path + ".tmp")
+                tmp.outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, it) }
+                tmp.renameTo(f)
+            }
             synchronized(lock) {
                 pending.remove(req.key)
                 if (bitmap == null) failed.add(req.key)

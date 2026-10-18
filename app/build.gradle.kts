@@ -23,23 +23,21 @@ android {
         applicationId = "com.graden.editor"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0-beta"
-        if (softenc) {
-            // x264 / x265 are built for 64-bit ARM, which every current Android phone uses.
-            ndk { abiFilters += listOf("arm64-v8a") }
-            externalNativeBuild { cmake { arguments += listOf("-DANDROID_STL=c++_static") } }
-        }
-    }
-    if (softenc) {
+        versionCode = 2
+        versionName = "0.2.0-beta"
+        // MotionCam RAW decoding is native, on every phone; the software encoders only on 64-bit ARM.
+        ndk { abiFilters += if (softenc) listOf("arm64-v8a") else listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
         externalNativeBuild {
-            cmake {
-                path = file("src/main/cpp/CMakeLists.txt")
-                version = "3.22.1"
-            }
+            cmake { arguments += listOf("-DANDROID_STL=c++_static", "-DGRADEN_SOFTENC=" + (if (softenc) "ON" else "OFF")) }
         }
-        ndkVersion = "27.2.12479018"
     }
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+    ndkVersion = "27.2.12479018"
     signingConfigs {
         if (signing.getProperty("storeFile") != null) create("release") {
             storeFile = file(signing.getProperty("storeFile"))
@@ -86,4 +84,19 @@ dependencies {
     implementation("androidx.media3:media3-ui:1.8.0")
     implementation("androidx.media3:media3-transformer:1.8.0")
     implementation("androidx.media3:media3-effect:1.8.0")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20231013")
+}
+
+// The stabiliser bench (StabBench) runs on the desktop: ./gradlew :app:testDebugUnitTest --tests '*StabBench*' -Pbench=frames.raw,512,288,30
+tasks.withType<Test>().configureEach {
+    (project.findProperty("bench") as String?)?.let { systemProperty("bench", it) }
+    (project.findProperty("benchModes") as String?)?.let { systemProperty("benchModes", it) }
+    (project.findProperty("benchSynthetic") as String?)?.let { systemProperty("benchSynthetic", it) }
+    (project.findProperty("benchOut") as String?)?.let { systemProperty("benchOut", it) }
+    (project.findProperty("benchOutMode") as String?)?.let { systemProperty("benchOutMode", it) }
+    for (k in listOf("benchPath", "benchDetailed", "benchDump", "benchCorr", "benchMatch", "benchMatchDump", "benchMatchAll")) (project.findProperty(k) as String?)?.let { systemProperty(k, it) }
+    for (k in listOf("resSigma", "lam0", "lim", "w1", "w2", "w3", "meshBlur", "spike", "prior", "rows", "blend", "meshThr", "meshClamp", "meshRad", "zoomSigma", "zoomMargin", "zoomMax", "pGate", "ease", "area", "dsm", "near")) (project.findProperty("stab.$k") as String?)?.let { systemProperty("stab.$k", it) }
+    maxHeapSize = "3g"
+    testLogging { showStandardStreams = true }
 }
