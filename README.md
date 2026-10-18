@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/icon.png" alt="Graden icon" width="128">
+
 # Graden
 
 **A multi-layer video editor and colour grading app for Android, built for real footage.**
@@ -35,6 +37,9 @@
   (rolling shutter included), and works out the lens on its own, so it needs no gyro data
 - Choose what to hold steadiest (background, balanced or subject), with smoothing, strength and framing controls
 - Natural motion is kept; shake and jitter go, with the least crop that does it
+- **3D camera view**: a modelled camera moves exactly as the visual gyro measured, at its real size of motion; switch
+  to *Stabilized* to watch the same camera move on the smoothed path
+- Analyse first, at the resolution you choose (480p to 4K), and see the analysis and stabilised render speed while exporting
 
 **Colour management, matched to DaVinci Resolve**
 - Colour Space Transform with **28 camera and display curves** and **20+ gamuts** (ARRI, Sony, Canon, Panasonic, RED,
@@ -83,7 +88,7 @@ hardware encoder. The results and the fixes they led to are in [docs/TESTING.md]
 
 ## Install
 
-1. Download **`Graden-0.2.0-beta.apk`** from the [latest release](https://github.com/Pixelgamer4k/graden/releases).
+1. Download **`Graden-0.2.1-beta.apk`** from the [latest release](https://github.com/Pixelgamer4k/graden/releases).
 2. Open it on your phone and allow installing from this source when Android asks.
 
 Needs **Android 10 or newer**. A recent phone with a capable chip gives the best experience with 4K footage.
@@ -102,7 +107,7 @@ This beta exists to collect feedback, so every report helps:
 - 10-bit and HDR export depend on the phone's encoder; where it cannot, the export screen says so
 - The colour wheels follow Resolve's manual but are not yet measured against Resolve the way the colour space
   transform is
-- 0.2 is signed with the same key as 0.1, so it installs over it and keeps your projects
+- 0.2.1 is signed with the same key as 0.1 and 0.2, so it installs over them and keeps your projects
 - Software encoders (x264 / x265) are built in but switched off in this beta (see below)
 - Projects and media are stored inside the app; uninstalling removes them
 

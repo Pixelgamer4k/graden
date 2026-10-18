@@ -594,6 +594,15 @@ private fun ExportProgress(vm: EditorViewModel) {
                     Stat("Speed", if (ExportJob.speed > 0f) "%.1f fps".format(ExportJob.speed) else "–", Modifier.weight(1f))
                     Stat("Frames", if (ExportJob.framesTotal > 0) "${ExportJob.framesDone}/${ExportJob.framesTotal}" else "–", Modifier.weight(1f))
                 }
+                // Stabilisation: how long it took to prepare, and how fast the stabilised frames render.
+                if (ExportJob.stabClips > 0) {
+                    Spacer(Modifier.height(10.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Stat("Stabilise prep", if (ExportJob.stabPrepMs < 1000) "${ExportJob.stabPrepMs} ms" else "%.1f s".format(ExportJob.stabPrepMs / 1000f), Modifier.weight(1f))
+                        Stat("Stabilised render", if (ExportJob.stabFps > 0f) "%.1f fps".format(ExportJob.stabFps) else "–", Modifier.weight(1f))
+                        Stat("Stabilised", "${ExportJob.stabFrames} fr", Modifier.weight(1f))
+                    }
+                }
                 if (ExportJob.speed > 0f) Text(
                     "%.2f× real time · %s".format(ExportJob.speed / ExportJob.fps, s?.let { "${it.codec.label} · ${it.width}×${it.height}" } ?: ""),
                     color = Faint, fontSize = 12.sp, modifier = Modifier.padding(top = 10.dp),

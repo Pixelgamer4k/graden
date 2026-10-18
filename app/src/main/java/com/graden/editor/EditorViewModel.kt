@@ -2780,9 +2780,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             }
             stabBusy -= c.id
             stabTracks = stabTracks + (c.id to e)
-            // On the page, a method whose measurement is not there yet (Gyro and the others measure differently) is
-            // measured straight away.
-            if (!e.analysed && c.id == stabClipId && c.stab != null && c.id !in stabProgress) analyseStab()
+            // A measurement that is not there yet is not started on its own: the page asks for Analyse.
             if (stabAgain.remove(c.id)) locate(c.id)?.clip?.let { makeStab(it) }
         }
     }
@@ -2803,15 +2801,10 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         stabClipId = l.clip.id
         stabCompare = false
         if (playheadUs < l.clip.startUs || playheadUs >= l.clip.endUs) seek(l.clip.startUs)
-        // Measured already (now or before): shown at once. Otherwise the motion is measured straight away.
+        // Nothing starts on its own: the page offers Analyse (or, when the motion is measured already, Stabilize).
         val c = l.clip
-        viewModelScope.launch {
-            val has = withContext(stabExec) {
-                Stabilizer.measured(getApplication(), a, c.inUs, c.outUs, c.stab ?: Stab())
-            }
-            if (!has && stabClipId == c.id && c.id !in stabProgress) analyseStab()
-            else if (c.stab == null && stabClipId == c.id) setStabOnce { it }
-        }
+        c.stab?.let { stabRes = it.analysisRes }
+        refreshStabMeasured()
         return true
     }
 
@@ -2829,6 +2822,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         if (c.id in stabProgress) return
         val detailed = c.stab?.detailed == true
         val gyro = Stabilizer.engineOf(c.stab ?: Stab()) == Stab.GYRO
+        val res = stabRes
         val stop = java.util.concurrent.atomic.AtomicBoolean(false)
         stabJobs[c.id] = stop
         stabProgress = stabProgress + (c.id to 0f)
@@ -2840,10 +2834,10 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             var last = 0f
             val result = withContext(Dispatchers.Default) {
                 val progress = { p: Float -> if (p - last > 0.01f) { last = p; main.post { if (c.id in stabProgress) stabProgress = stabProgress + (c.id to p) } } }
-                if (gyro) Stabilizer.analyseGyro(app, path, 0, c.inUs, c.outUs, detailed, Stabilizer.key(a, c.inUs, c.outUs, detailed), progress, { stop.get() })
+                if (gyro) Stabilizer.analyseGyro(app, path, 0, c.inUs, c.outUs, detailed, Stabilizer.key(a, c.inUs, c.outUs, detailed, res), progress, { stop.get() }, res)
                     // A file the phone cannot read as it is: its seekable copy instead.
                     ?: originalOf(a).takeIf { it != path && !stop.get() }?.let { alt ->
-                        Stabilizer.analyseGyro(app, alt, 0, c.inUs, c.outUs, detailed, Stabilizer.key(a, c.inUs, c.outUs, detailed), progress, { stop.get() })
+                        Stabilizer.analyseGyro(app, alt, 0, c.inUs, c.outUs, detailed, Stabilizer.key(a, c.inUs, c.outUs, detailed, res), progress, { stop.get() }, res)
                     }
                 else Stabilizer.analyse(app, path, 0, c.inUs, c.outUs, detailed, Stabilizer.key(a, c.inUs, c.outUs, detailed), progress, { stop.get() })
             }
@@ -2854,10 +2848,14 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
             confirmTick++
+            if (stabClipId == c.id) stabMeasured = true
             val now = locate(c.id)?.clip ?: return@launch
             if (now.stab == null) {
-                commit(withClip(c.id) { listOf(it.copy(stab = Stab(detailed = detailed))) })
-            } else stabTracks = stabTracks - c.id
+                commit(withClip(c.id) { listOf(it.copy(stab = Stab(detailed = detailed, analysisRes = res))) })
+            } else {
+                if (now.stab.analysisRes != res) tracks = withClip(c.id) { listOf(it.copy(stab = it.stab?.copy(analysisRes = res))) }
+                stabTracks = stabTracks - c.id
+            }
             locate(c.id)?.clip?.let { makeStab(it) }
         }
     }
@@ -2897,11 +2895,48 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         gradeEnd()
     }
 
+    /** Whether the clip on the page has its motion measured already, at [stabRes] (null: not known yet). */
+    var stabMeasured by mutableStateOf<Boolean?>(null)
+        private set
+
+    /** The resolution the motion is measured at, long side in px (the last one chosen; 960 to start with). */
+    var stabRes by mutableStateOf(VGyro.LONG)
+        private set
+
+    fun chooseStabRes(r: Int) {
+        if (r == stabRes) return
+        stabRes = r
+        // A stabilised clip keeps the resolution its measurement is used at.
+        if (stabTarget?.clip?.stab != null) setStabOnce { it.copy(analysisRes = r) }
+        refreshStabMeasured()
+    }
+
+    private fun refreshStabMeasured() {
+        val l = stabTarget ?: return
+        val a = assets[l.clip.assetId] ?: return
+        val c = l.clip
+        val r = stabRes
+        stabMeasured = null
+        viewModelScope.launch {
+            val has = withContext(stabExec) { Stabilizer.measured(getApplication(), a, c.inUs, c.outUs, c.stab ?: Stab(), r) }
+            if (stabClipId == c.id && stabRes == r) stabMeasured = has
+        }
+    }
+
+    /** The page's main button: measures the motion when it is not measured yet, else stabilises with it. */
+    fun analyseOrApply() {
+        val c = stabTarget?.clip ?: return
+        if (stabMeasured == true && c.stab == null) { setStabOnce { it.copy(analysisRes = stabRes) }; return }
+        analyseStab()
+    }
+
     /** Takes the stabilisation off the clip (its measurement is kept, so turning it back on is instant). */
     fun removeStab() {
         val l = stabTarget ?: return
         if (l.clip.stab == null) return
         commit(withClip(l.clip.id) { listOf(it.copy(stab = null)) })
+        stabTracks = stabTracks - l.clip.id
+        tell("Stabilization removed")
     }
 
     // ---- the trim page ---------------------------------------------------------------

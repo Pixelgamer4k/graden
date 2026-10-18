@@ -35,11 +35,14 @@ object ExportBuild {
         }
         // Each stabilised clip's correction, frame by frame (the same the preview shows).
         val stabs = HashMap<Long, StabTrack>()
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        var stabFrames = 0L
         for (t in tracks) for (c in t.clips) {
             val st = c.stab?.takeIf { it.on } ?: continue
             val a = assets[c.assetId]?.takeIf { !it.isImage } ?: continue
-            stab(c, a, st)?.let { stabs[c.id] = it }
+            stab(c, a, st)?.let { stabs[c.id] = it; stabFrames += ((c.outUs - c.inUs) * meta.fps / 1_000_000.0).toLong() }
         }
+        val stabPrepMs = android.os.SystemClock.elapsedRealtime() - t0
         return ExportProject(
             meta, tracks, assets, sources, muted, hidden, norm,
             pipes, ColorPipe.plain(meta, dest, nits), deep, dest.code, nits, layerPacks,
@@ -48,6 +51,8 @@ object ExportBuild {
                 ColorSpaces.xf(dest, ColorSpaces.REC709, meta.toneMap, meta.gamutMap, 100f, nits).pack(it, ColorSpaces.XF_SIZE)
             },
             stabs = stabs,
+            stabPrepMs = stabPrepMs,
+            stabFrames = stabFrames,
         )
     }
 }

@@ -121,14 +121,21 @@ JNIEXPORT jint JNICALL Java_com_graden_editor_VGyroNative_pair(JNIEnv* env, jcla
     if (!da || !db) return 0;
     const cv::Mat A(t->h, t->w, CV_8U, da), Bm(t->h, t->w, CV_8U, db);
     const cv::Size win(15, 15);
+    // The analysis resolution is chosen by the user (480 … 3840 px on the long side; 960 by default). The pyramid gets
+    // a level more for each doubling over 960, so the same shake (in angle) is followed at any resolution; corners
+    // are found on the level nearest 480 px, so finding them costs the same at any resolution.
+    const double longSide = double(std::max(t->w, t->h));
+    const int lv = std::min(6, std::max(2, 3 + int(std::lround(std::log2(longSide / 960.0)))));
+    const int dl = std::max(0, int(std::lround(std::log2(longSide / 480.0))));
     long long c0 = nowUs();
     std::vector<cv::Mat> pa, pb;
-    cv::buildOpticalFlowPyramid(A, pa, win, 3, true);
-    cv::buildOpticalFlowPyramid(Bm, pb, win, 3, true);
+    cv::buildOpticalFlowPyramid(A, pa, win, lv, true);
+    cv::buildOpticalFlowPyramid(Bm, pb, win, lv, true);
     long long c1 = nowUs();
-    // Corners spread over the picture, found on the half-size level (the tracker refines from full size).
+    // Corners spread over the picture, found on a reduced level (the tracker refines from full size).
     std::vector<cv::Point2f> p0;
-    const cv::Mat& half = pa.size() > 2 ? pa[2] : A;   // with derivatives the pyramid holds image, derivative per level
+    const size_t di = std::min(size_t(2 * dl), (pa.size() / 2 - 1) * 2);
+    const cv::Mat& half = di > 0 ? pa[di] : A;   // with derivatives the pyramid holds image, derivative per level
     const float sc = float(A.cols) / half.cols;
     cv::goodFeaturesToTrack(half, p0, t->maxPts, 0.01, std::max(4.f, t->w / 80.f / sc), cv::noArray(), 3);
     for (auto& p : p0) { p.x = (p.x + 0.5f) * sc - 0.5f; p.y = (p.y + 0.5f) * sc - 0.5f; }
@@ -139,8 +146,8 @@ JNIEXPORT jint JNICALL Java_com_graden_editor_VGyroNative_pair(JNIEnv* env, jcla
         std::vector<uchar> s1, s2;
         std::vector<float> e1, e2;
         const cv::TermCriteria tc(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 20, 0.03);
-        cv::calcOpticalFlowPyrLK(pa, pb, p0, nx, s1, e1, win, 3, tc);
-        cv::calcOpticalFlowPyrLK(pb, pa, nx, back, s2, e2, win, 3, tc);
+        cv::calcOpticalFlowPyrLK(pa, pb, p0, nx, s1, e1, win, lv, tc);
+        cv::calcOpticalFlowPyrLK(pb, pa, nx, back, s2, e2, win, lv, tc);
         std::vector<cv::Point2f> a, b;
         const float m = 2.f;
         for (size_t i = 0; i < nx.size(); ++i) {

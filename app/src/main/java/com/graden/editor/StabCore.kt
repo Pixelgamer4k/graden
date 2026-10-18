@@ -54,6 +54,8 @@ data class Stab(
     val method: Int = CINEMATIC,
     /** Gyro: what to hold steadiest when near and far move differently ([VGyro.FOCUS_BACKGROUND], balanced, subject). */
     val focus: Int = 1,
+    /** Gyro: the resolution the motion is measured at, long side in px (see [VGyro.RESOLUTIONS]). */
+    val analysisRes: Int = 960,
 ) {
     companion object {
         const val CINEMATIC = 0; const val NATURAL = 1
@@ -121,6 +123,9 @@ class StabAnalysis(val times: LongArray, val steps: FloatArray, val mesh: FloatA
 class StabTrack(
     val times: LongArray, val mats: FloatArray, val grids: FloatArray?, val framing: Int,
     val rawPath: FloatArray, val smoothPath: FloatArray, val zooms: FloatArray,
+    /** The camera's turn as measured and as stabilised: rotation vectors (camera to world, upright picture axes:
+     *  x right, y down, z forward; radians), 3 per frame, from the first frame. Only the visual gyro measures them. */
+    val rawRot: FloatArray? = null, val smoothRot: FloatArray? = null, val hfov: Float = 0f, val aspect: Float = 0f,
 ) {
     /** The frame nearest file time [us]. */
     fun index(us: Long): Int {

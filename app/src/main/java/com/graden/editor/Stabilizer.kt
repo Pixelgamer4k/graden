@@ -18,12 +18,12 @@ import kotlin.math.roundToInt
 
 fun Stab.toJson(): JSONObject = JSONObject().put("on", on).put("m2", mode).put("l", lock).put("s", smooth.toDouble()).put("st", strength.toDouble())
     .put("h", horizon).put("f", framing).put("z", zoom.toDouble()).put("dz2", dynamicZoom).put("cl", cropLess.toDouble())
-    .put("rs", rollingShutter.toDouble()).put("d", detailed).put("md", method).put("fo", focus)
+    .put("rs", rollingShutter.toDouble()).put("d", detailed).put("md", method).put("fo", focus).put("ar", analysisRes)
 
 fun Stab.Companion.fromJson(o: JSONObject?): Stab? = o?.let {
     Stab(it.optBoolean("on", true), it.optInt("m2", WARP), it.optBoolean("l"), it.optDouble("s", 0.5).toFloat(), it.optDouble("st", 1.0).toFloat(),
         it.optBoolean("h"), it.optInt("f", AUTO_ZOOM), it.optDouble("z", 1.0).toFloat(), it.optBoolean("dz2", false), it.optDouble("cl", 0.5).toFloat(),
-        it.optDouble("rs", 0.0).toFloat(), it.optBoolean("d"), it.optInt("md", CINEMATIC), it.optInt("fo", 1))
+        it.optDouble("rs", 0.0).toFloat(), it.optBoolean("d"), it.optInt("md", CINEMATIC), it.optInt("fo", 1), it.optInt("ar", 960))
 }
 
 /**
@@ -35,7 +35,9 @@ object Stabilizer {
 
     private fun prefix(a: MediaAsset) = "${a.uri.hashCode().toUInt()}_${a.durationUs}_v4_"
 
-    fun key(a: MediaAsset, inUs: Long, outUs: Long, detailed: Boolean) = prefix(a) + "${inUs}_${outUs}_${if (detailed) "d" else "q"}"
+    /** A measurement's name: the clip span, quick or detailed, and the analysis resolution where it is not the default. */
+    fun key(a: MediaAsset, inUs: Long, outUs: Long, detailed: Boolean, res: Int = VGyro.LONG) =
+        prefix(a) + "${inUs}_${outUs}_${if (detailed) "d" else "q"}" + if (res != VGyro.LONG) "_r$res" else ""
 
     /**
      * A measurement of [a] that covers [inUs]..[outUs] (made for this clip, or for the clip it was split or trimmed
@@ -76,31 +78,33 @@ object Stabilizer {
     fun engineOf(s: Stab): Int = if (s.mode == Stab.GYRO && !gyroAvailable) Stab.WARP else s.mode
 
     /** The visual gyro's measurement covering [inUs]..[outUs], as [find] does for the other methods. */
-    fun findGyro(context: Context, a: MediaAsset, inUs: Long, outUs: Long, detailed: Boolean): VGyroAnalysis? {
+    fun findGyro(context: Context, a: MediaAsset, inUs: Long, outUs: Long, detailed: Boolean, res: Int? = null): VGyroAnalysis? {
         val p = prefix(a)
         val names = vgDir(context).list()?.filter { it.startsWith(p) && it.endsWith(".bin") } ?: return null
+        class Fit(val n: String, val span: Long, val d: Boolean, val r: Int)
         val fits = names.mapNotNull { n ->
             val parts = n.removePrefix(p).removeSuffix(".bin").split("_")
             val i = parts.getOrNull(0)?.toLongOrNull() ?: return@mapNotNull null
             val o = parts.getOrNull(1)?.toLongOrNull() ?: return@mapNotNull null
             val d = parts.getOrNull(2) == "d"
-            if (i <= inUs + 40_000 && o >= outUs - 40_000 && (d || !detailed)) Triple(n, o - i, d) else null
-        }.sortedWith(compareBy({ !it.third }, { it.second }))
-        for ((n, _, _) in fits) VGyroAnalysis.load(File(vgDir(context), n))?.let { return it }
+            val r = parts.getOrNull(3)?.removePrefix("r")?.toIntOrNull() ?: VGyro.LONG
+            if (i <= inUs + 40_000 && o >= outUs - 40_000 && (d || !detailed) && (res == null || r == res)) Fit(n, o - i, d, r) else null
+        }.sortedWith(compareBy({ !it.d }, { it.span }))
+        for (f in fits) VGyroAnalysis.load(File(vgDir(context), f.n))?.let { return it }
         return null
     }
 
     /** Measures [path] for the visual gyro (the original file: the sensor's own rows, at full detail) and keeps it. */
     fun analyseGyro(context: Context, path: String, rotation: Int, inUs: Long, outUs: Long, detailed: Boolean, key: String,
-                    progress: (Float) -> Unit, cancelled: () -> Boolean): VGyroAnalysis? {
-        val a = VGyro.analyse(context, path, rotation, inUs, outUs, detailed, progress, cancelled) ?: return null
+                    progress: (Float) -> Unit, cancelled: () -> Boolean, res: Int = VGyro.LONG): VGyroAnalysis? {
+        val a = VGyro.analyse(context, path, rotation, inUs, outUs, detailed, progress, cancelled, res) ?: return null
         a.save(File(vgDir(context), "$key.bin"))
         return a
     }
 
     /** Whether [a] has the measurement [s]'s method needs for [inUs]..[outUs]. */
-    fun measured(context: Context, a: MediaAsset, inUs: Long, outUs: Long, s: Stab): Boolean =
-        if (engineOf(s) == Stab.GYRO) findGyro(context, a, inUs, outUs, false) != null else find(context, a, inUs, outUs, false) != null
+    fun measured(context: Context, a: MediaAsset, inUs: Long, outUs: Long, s: Stab, res: Int? = null): Boolean =
+        if (engineOf(s) == Stab.GYRO) findGyro(context, a, inUs, outUs, false, res) != null else find(context, a, inUs, outUs, false) != null
 
     /**
      * [a]'s stabilisation with settings [s] over [inUs]..[outUs], from what has been measured (the detailed measurement
@@ -109,7 +113,9 @@ object Stabilizer {
     fun track(context: Context, a: MediaAsset, inUs: Long, outUs: Long, s: Stab): StabTrack? {
         val fps = a.fps.takeIf { it > 1f } ?: 30f
         return if (engineOf(s) == Stab.GYRO) {
-            val m = findGyro(context, a, inUs, outUs, s.detailed) ?: findGyro(context, a, inUs, outUs, false) ?: return null
+            // The measurement at the chosen resolution first, else any there is.
+            val m = findGyro(context, a, inUs, outUs, s.detailed, s.analysisRes) ?: findGyro(context, a, inUs, outUs, false, s.analysisRes)
+                ?: findGyro(context, a, inUs, outUs, s.detailed) ?: findGyro(context, a, inUs, outUs, false) ?: return null
             VGyro.track(m, VGyro.Settings.of(s), fps, inUs, outUs)
         } else {
             val m = find(context, a, inUs, outUs, s.detailed) ?: find(context, a, inUs, outUs, false) ?: return null

@@ -56,6 +56,15 @@ object ExportJob {
     /** When the job started (elapsed-realtime ms), for the elapsed time shown. */
     var startedAt by mutableStateOf(0L)
         internal set
+    /** Stabilisation: clips stabilised, how long it took to prepare, and the speed stabilised frames render at. */
+    var stabClips by mutableStateOf(0)
+        internal set
+    var stabPrepMs by mutableStateOf(0L)
+        internal set
+    var stabFrames by mutableStateOf(0)
+        internal set
+    var stabFps by mutableStateOf(0f)
+        internal set
     /** Frames per second of the project, for the timecode of the frame being rendered. */
     var fps by mutableStateOf(30f)
         internal set
@@ -270,8 +279,12 @@ class ExportEngine(
                 val t0 = SystemClock.elapsedRealtime()
                 var lastUi = 0L
                 var packNs = 0L
+                var stabNs = 0L
+                var stabN = 0
+                ui { ExportJob.stabClips = project.stabs.size; ExportJob.stabPrepMs = project.stabPrepMs; ExportJob.stabFrames = 0; ExportJob.stabFps = 0f }
                 for (n in 0 until total) {
                     if (ExportJob.cancel) throw Cancelled()
+                    val tf = System.nanoTime()
                     val us = frameUs(n.toLong())
                     comp.render(us, us * 1000L)
                     when (route) {
@@ -301,13 +314,18 @@ class ExportEngine(
                             drain(false)
                         }
                     }
+                    // Stabilised frames: the whole time each took (decode, warp, grade, encode), for their own speed.
+                    if (comp.lastStabilised) { stabNs += System.nanoTime() - tf; stabN++ }
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastUi > 400 || n == total - 1) {
                         lastUi = now
                         val bmp = if (now - t0 < 1500 || n % 15 == 0) comp.preview() else null
                         val done = n + 1
                         val rate = done * 1000f / (now - t0).coerceAtLeast(1)
+                        val sN = stabN; val sFps = if (stabNs > 0) (stabN * 1e9 / stabNs).toFloat() else 0f
                         ui {
+                            ExportJob.stabFrames = sN
+                            ExportJob.stabFps = sFps
                             ExportJob.framesDone = done
                             ExportJob.speed = rate
                             ExportJob.etaSec = ((total - done) / rate.coerceAtLeast(0.01f)).toInt()

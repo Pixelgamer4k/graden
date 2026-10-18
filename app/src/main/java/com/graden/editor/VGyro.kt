@@ -176,8 +176,12 @@ object VGyro {
      * Decodes [path] between [inUs] and [outUs] as fast as the decoder goes and tracks it ([VGyroNative]) on another
      * thread at the same time; progress 0..1; [cancelled] stops it.
      */
+    /** The analysis resolutions offered (long side, px); [LONG] is the default. */
+    val RESOLUTIONS = intArrayOf(480, 640, 960, 1280, 1920, 2880, 3840)
+
+    /** Measures at [longSide] px on the picture's long side (never more than the footage has). */
     fun analyse(context: Context, path: String, rotation: Int, inUs: Long, outUs: Long, detailed: Boolean = false,
-                progress: (Float) -> Unit, cancelled: () -> Boolean): VGyroAnalysis? {
+                progress: (Float) -> Unit, cancelled: () -> Boolean, longSide: Int = LONG): VGyroAnalysis? {
         val maxPts = if (detailed) MAX_PTS * 2 else MAX_PTS
         val ex = MediaExtractor()
         var codec: MediaCodec? = null
@@ -244,7 +248,8 @@ object VGyro {
                 val p = img.planes[0]; val cr = img.cropRect
                 if (handle == 0L) {
                     val sw = cr.width(); val sh = cr.height()
-                    if (sw >= sh) { w = LONG; h = (LONG * sh.toFloat() / sw).roundToInt() } else { h = LONG; w = (LONG * sw.toFloat() / sh).roundToInt() }
+                    val L = longSide.coerceIn(320, max(sw, sh)) / 2 * 2
+                    if (sw >= sh) { w = L; h = (L * sh.toFloat() / sw).roundToInt() / 2 * 2 } else { h = L; w = (L * sw.toFloat() / sh).roundToInt() / 2 * 2 }
                     handle = VGyroNative.create(w, h, maxPts)
                     repeat(workers * 2 + 4) { free.put(Slot(java.nio.ByteBuffer.allocateDirect(w * h))) }
                     val ww = w; val hh = h
@@ -655,8 +660,19 @@ object VGyro {
         }
         val rawP = FloatArray(n * 3); val smP = FloatArray(n * 3)
         for (i in 0 until n) { path(A[i], rawP, i); path(As[i], smP, i) }
+        // For the page's 3D camera: each orientation turned camera-to-world (the inverse) and into the upright
+        // picture's axes (stored x, y = R · upright x, y, so the rotation vector is −Rᵀ · log q).
+        val rawR = FloatArray(n * 3); val smR = FloatArray(n * 3)
+        fun upright(q: Quat, out: FloatArray, i: Int) {
+            val l = q.log(); val x = -l[0]; val y = -l[1]
+            val (ux, uy) = when (a.rotation) { 90 -> -y to x; 180 -> -x to -y; 270 -> y to -x; else -> x to y }
+            out[i * 3] = ux.toFloat(); out[i * 3 + 1] = uy.toFloat(); out[i * 3 + 2] = (-l[2]).toFloat()
+        }
+        for (i in 0 until n) { upright(A[i], rawR, i); upright(As[i], smR, i) }
+        val upW = if (a.rotation % 180 == 0) a.w else a.h; val upH = if (a.rotation % 180 == 0) a.h else a.w
+        val hfov = (2 * kotlin.math.atan(upW / 2.0 / f)).toFloat()
         log("zoom %.3f; path %d ms, mesh %d ms".format(zoom, t3 - t2, System.currentTimeMillis() - t3))
-        return StabTrack(a.times.copyOf(), mats, grids, s.framing, rawP, smP, zooms)
+        return StabTrack(a.times.copyOf(), mats, grids, s.framing, rawP, smP, zooms, rawR, smR, hfov, upW.toFloat() / upH)
     }
 
     /**

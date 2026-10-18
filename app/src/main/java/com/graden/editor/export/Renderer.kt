@@ -67,6 +67,9 @@ class ExportProject(
     val preview: FloatArray? = null,
     /** Per clip: its stabilisation, frame by frame (see [com.graden.editor.Stabilizer]). */
     val stabs: Map<Long, com.graden.editor.StabTrack> = emptyMap(),
+    /** How long the stabilisation took to prepare (solved from each clip's measured motion), and the frames it covers. */
+    val stabPrepMs: Long = 0L,
+    val stabFrames: Long = 0L,
 ) {
     /** Anything other than Rec.709 all the way through. */
     val cmOn: Boolean get() = output != com.graden.editor.ColorSpaces.REC709.code || pipes.values.any { !com.graden.editor.ColorPipe.isOff(it) }
@@ -603,6 +606,10 @@ class Compositor(private val context: Context, private val project: ExportProjec
     private val acc = LongArray(4)
     private var accN = 0
 
+    /** The last frame rendered had a stabilised picture on it. */
+    var lastStabilised = false
+        private set
+
     fun render(us: Long, ptsNs: Long) {
         val t0 = System.nanoTime()
         val used = HashSet<Long>()
@@ -643,6 +650,7 @@ class Compositor(private val context: Context, private val project: ExportProjec
             copies.remove(id)?.let { GLES20.glDeleteTextures(1, intArrayOf(it[0]), 0); GLES30.glDeleteFramebuffers(1, intArrayOf(it[1]), 0) }
         }
 
+        lastStabilised = pics.any { (_, list) -> list.any { project.stabs.containsKey(it.clip.id) } }
         // Edges only need the 4× buffer (and its copy, about 11 ms a 4K frame on Adreno and Mali) when a picture is turned
         // by other than a quarter turn; upright pictures have straight pixel-aligned edges.
         val smooth = pics.any { (_, list) -> list.any { p -> ((p.clip.tf.rot + (p.look?.rot ?: 0f)) % 90f).let { abs(it) > 0.01f && abs(it) < 89.99f } } }
