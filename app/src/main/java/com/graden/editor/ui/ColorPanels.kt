@@ -720,7 +720,7 @@ private fun SpaceDialog(title: String, options: List<Pair<String, String>>, sele
 
 /** The layers a clip's grade is made of, in the order they act on the picture. */
 internal enum class Layer(val title: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
-    RAW("Camera RAW", Lucide.Aperture), NOISE("Noise", Lucide.Feather), LENS("Lens", Lucide.Circle), DEFLICKER("Deflicker", Lucide.Gauge), CST("Colour space", Lucide.Globe),
+    RAW("MCRAW", Lucide.Aperture), NOISE("Noise", Lucide.Feather), LENS("Lens", Lucide.Circle), DEFLICKER("Deflicker", Lucide.Gauge), CST("Colour space", Lucide.Globe),
     CORRECTION("Correction", Lucide.Palette), SECONDARIES("Secondaries", Lucide.Droplet), LUTS("LUTs", Lucide.Wand), FILM("Film look", Lucide.Film),
     OUTPUT("Output", Lucide.Upload),
 }
@@ -744,10 +744,10 @@ internal fun LayerStrip(vm: EditorViewModel, selected: Layer, onSelect: (Layer) 
     val state: (Layer) -> Pair<String, Boolean> = { l ->
         when (l) {
             Layer.RAW -> when {
-                asset?.isRaw != true -> "Not RAW" to false
+                asset?.isRaw != true -> "Not MCRAW" to false
                 !g.raw.on -> "Off" to false
-                g.raw.decode == com.graden.editor.RawLayer.CAMERA -> "Camera" to false
-                else -> "Clip settings" to true
+                g.raw.decode == com.graden.editor.RawLayer.CAMERA && asset.developOptions == com.graden.editor.DevelopOptions() -> "As recorded" to false
+                else -> "Developed" to true
             }
             Layer.NOISE -> if (!g.noise.on) "Off" to false else if (g.noise.active) listOfNotNull("Temporal".takeIf { g.noise.temporal }, "Spatial".takeIf { g.noise.spatial }, "Blur".takeIf { g.noise.blur }).joinToString(" · ") to true else "None" to false
             Layer.LENS -> if (g.lens.active) "Corrected" to true else (if (g.lens.on) "None" else "Off") to false
@@ -770,7 +770,8 @@ internal fun LayerStrip(vm: EditorViewModel, selected: Layer, onSelect: (Layer) 
     val density = androidx.compose.ui.platform.LocalDensity.current
     androidx.compose.runtime.LaunchedEffect(selected) {
         val step = with(density) { (128.dp + 8.dp).toPx() }
-        scroll.animateScrollTo((selected.ordinal * step - step).toInt().coerceAtLeast(0))
+        val at = selected.ordinal - (if (asset?.isRaw == true) 0 else 1)
+        scroll.animateScrollTo((at * step - step).toInt().coerceAtLeast(0))
     }
     // The layers in the order they act, joined by a line: the picture flows left to right through them.
     Row(
@@ -778,7 +779,8 @@ internal fun LayerStrip(vm: EditorViewModel, selected: Layer, onSelect: (Layer) 
             .drawBehind { drawLine(Color(0xFF2A2C35), Offset(0f, size.height / 2), Offset(size.width, size.height / 2), 1.5.dp.toPx()) },
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        for (l in Layer.entries) {
+        // MCRAW is there only for MotionCam RAW clips.
+        for (l in Layer.entries.filter { it != Layer.RAW || asset?.isRaw == true }) {
             val on = l == selected
             val (text, active) = state(l)
             // Camera RAW only means something for RAW recordings; for other clips it is there, greyed.

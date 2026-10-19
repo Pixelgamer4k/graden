@@ -61,6 +61,8 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         /** Drop targets that create a track. */
         const val NEW_VIDEO = -1
         const val NEW_AUDIO = -2
+        /** The media box's orders. */
+        val MEDIA_SORTS = listOf("Newest", "Oldest", "Name A–Z", "Name Z–A", "Largest", "Longest")
     }
 
     class Located(val trackId: Int, val clip: Clip, val startUs: Long)
@@ -374,7 +376,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     /** Rule 1: the highest video layer that is not hidden and has a clip at [us]. */
     private fun topVideoAt(us: Long): Located? {
         for (t in tracks.asReversed()) {
-            if (!t.video || t.id in hiddenTracks) continue
+            if (!t.pictures || t.id in hiddenTracks) continue
             t.clipAt(us)?.let { return Located(t.id, it, it.startUs) }
         }
         return null
@@ -492,6 +494,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
                 proxyBuilder.enqueue(it)
                 waves.request(it)
             }
+            fillFileInfo()
             nextClipId = (loaded.tracks.flatMap { it.clips }.maxOfOrNull { it.id } ?: 0L) + 1
             nextTrackId = (loaded.tracks.maxOfOrNull { it.id } ?: 0) + 1
             val ui = loaded.ui
@@ -625,6 +628,81 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The built-in Black picture: part of every project, so it cannot be deleted. */
     fun isBuiltIn(a: MediaAsset) = a.uri == blackUri()
+
+    // ---- the media box: sections, order, and the media of other projects -----------------------------------
+
+    /** The media box section shown: "All", "Video", "Text", "Images", "GIFs", "Audio" or "MCRAW". */
+    var mediaTab by mutableStateOf("All")
+    /** How the media box is ordered ([MEDIA_SORTS]); newest first unless changed (kept for next time). */
+    var mediaSort by mutableIntStateOf(app.getSharedPreferences("media", 0).getInt("sort", 0))
+        private set
+    fun chooseMediaSort(i: Int) { mediaSort = i; getApplication<Application>().getSharedPreferences("media", 0).edit().putInt("sort", i).apply() }
+
+    /** [items] in the media box's order. */
+    fun <T> sortMedia(items: List<T>, asset: (T) -> MediaAsset): List<T> = when (mediaSort) {
+        1 -> items.sortedWith(compareBy({ asset(it).dateMs }, { asset(it).id }))
+        2 -> items.sortedBy { asset(it).name.lowercase() }
+        3 -> items.sortedByDescending { asset(it).name.lowercase() }
+        4 -> items.sortedByDescending { asset(it).bytes }
+        5 -> items.sortedByDescending { asset(it).durationUs }
+        else -> items.sortedWith(compareByDescending<T> { asset(it).dateMs }.thenByDescending { asset(it).id })
+    }
+
+    /** Whether [a] belongs in media box section [tab]. */
+    fun inMediaTab(a: MediaAsset, tab: String) = when (tab) {
+        "Video" -> !a.isAudio && !a.isImage && !a.isRaw
+        "Images" -> a.isImage && !a.isGif
+        "GIFs" -> a.isGif
+        "Audio" -> a.isAudio
+        "MCRAW" -> a.isRaw
+        else -> true
+    }
+
+    /** Media of the other projects (their project's name, the file), for using here too; newest projects first. */
+    var otherMedia by mutableStateOf<List<Pair<String, MediaAsset>>>(emptyList())
+        private set
+
+    /** Looks through the other projects for media this one hasn't got (each file once). */
+    fun loadOtherMedia() {
+        val here = projectId
+        viewModelScope.launch {
+            val found = withContext(Dispatchers.IO) {
+                val black = runCatching { blackUri() }.getOrNull()
+                val seen = HashSet<String>()
+                projects.list().filter { it.id != here }.flatMap { p ->
+                    val loaded = runCatching { projects.store(p.id).load() }.getOrNull() ?: return@flatMap emptyList()
+                    loaded.assets.values.filter { !it.isReversed && it.uri != black && seen.add(it.raw ?: it.uri) }.map { p.meta.name to it }
+                }
+            }
+            val mine = assets.values.map { it.raw ?: it.uri }.toSet()
+            otherMedia = found.filter { (_, a) -> (a.raw ?: a.uri) !in mine }
+        }
+    }
+
+    /** Brings [a] from another project into this one (its proxies are shared, so it is ready at once); this one's copy. */
+    fun adopt(a: MediaAsset): MediaAsset {
+        assets.values.firstOrNull { (it.raw ?: it.uri) == (a.raw ?: a.uri) }?.let { return it }
+        val b = a.copy(id = (assets.keys.maxOrNull() ?: 0) + 1)
+        assets = assets + (b.id to b)
+        otherMedia = otherMedia.filter { it.second.uri != a.uri }
+        proxyBuilder.enqueue(b)
+        if (b.hdr) probeColours()
+        waves.request(b)
+        save()
+        return b
+    }
+
+    /** Sizes and dates of media imported before they were kept, read now for sorting. */
+    private fun fillFileInfo() {
+        val app = getApplication<Application>()
+        val missing = assets.values.filter { it.dateMs == 0L && !isBuiltIn(it) && !it.isReversed }
+        if (missing.isEmpty()) return
+        viewModelScope.launch {
+            val info = withContext(Dispatchers.IO) { missing.associate { a -> a.id to MediaProbe.fileInfo(app, Uri.parse(a.raw ?: a.uri)) } }
+            assets = assets.mapValues { (id, a) -> info[id]?.let { (b, d) -> a.copy(bytes = b, dateMs = d.takeIf { it > 0 } ?: 1L) } ?: a }
+            save()
+        }
+    }
 
     /** How far [a] is through its import, 0 to 1: both proxies counted as one step. */
     fun importProgress(a: MediaAsset): Float {
@@ -886,7 +964,9 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
                     importQueue = importQueue.map { if (it.key == key) ImportItem(key, name, true) else it }
                     continue
                 }
-                val a = asset.copy(id = (assets.keys.maxOrNull() ?: 0) + 1)
+                val (bytes, date) = withContext(Dispatchers.IO) { MediaProbe.fileInfo(app, asset.raw?.let(Uri::parse) ?: uri) }
+                // Imported now: when the phone doesn't say when it was made, now is when it arrived.
+                val a = asset.copy(id = (assets.keys.maxOrNull() ?: 0) + 1, bytes = bytes, dateMs = date.takeIf { it > 0 } ?: System.currentTimeMillis())
                 assets = assets + (a.id to a)
                 importSession = importSession + a.id
                 importQueue = importQueue.filterNot { it.key == key }
@@ -940,9 +1020,14 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
      * Develops RAW asset [a]'s master again at [half] resolution and with or without lens [shading]. Its clips keep
      * everything; the new master and its proxies take over once ready.
      */
-    fun redevelopRaw(a: MediaAsset, half: Boolean, shading: Boolean) {
+    fun redevelopRaw(a: MediaAsset, half: Boolean, shading: Boolean) =
+        redevelopRaw(a, a.developOptions.copy(half = half, vignette = if (!shading) DevelopOptions.VIGNETTE_OFF else a.developOptions.vignette.coerceAtLeast(DevelopOptions.VIGNETTE_FULL)))
+
+    /** Develops RAW asset [a]'s master again with options [o] (the MCRAW panel's Develop section). */
+    fun redevelopRaw(a: MediaAsset, o: DevelopOptions) {
         val rawUri = a.raw?.let(Uri::parse) ?: return
-        if (a.id in redeveloping || (a.rawHalf == half && a.rawShading == shading)) return
+        val half = o.half; val shading = o.shading
+        if (a.id in redeveloping || a.developOptions == o) return
         val app = getApplication<Application>()
         redeveloping = redeveloping + (a.id to 0f)
         viewModelScope.launch {
@@ -950,16 +1035,16 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
                 val size = runCatching {
                     app.contentResolver.query(rawUri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { c -> if (c.moveToFirst()) c.getLong(0) else 0L } ?: 0L
                 }.getOrDefault(0L).let { if (it == 0L && rawUri.scheme == "file") File(rawUri.path!!).length() else it }
-                val out = RawDevelop.masterFile(app, rawUri, size, half, shading)
+                val out = RawDevelop.masterFile(app, rawUri, size, o)
                 var last = 0f
                 val ok = out.exists() || runCatching {
                     RawDevelop.develop(app, rawUri, out, progress = { p -> if (p - last > 0.01f) { last = p; main.post { if (a.id in redeveloping) redeveloping = redeveloping + (a.id to p) } } },
-                        cancelled = { false }, half = half, shading = shading) != null
+                        cancelled = { false }, opts = o) != null
                 }.onFailure { android.util.Log.w("RawDevelop", "develop failed", it) }.getOrDefault(false)
                 if (!ok) null
                 else MediaProbe.probe(app, Uri.fromFile(out))?.let { p ->
                     a.copy(uri = Uri.fromFile(out).toString(), width = p.width, height = p.height, durationUs = p.durationUs, fps = p.fps,
-                        hasAudio = p.hasAudio, rawHalf = half, rawShading = shading, tier = DeviceProfiler.profile(app, Uri.fromFile(out), p).tier)
+                        hasAudio = p.hasAudio, rawHalf = half, rawShading = shading, rawDev = o.toJson().toString(), tier = DeviceProfiler.profile(app, Uri.fromFile(out), p).tier)
                 }
             }
             redeveloping = redeveloping - a.id
@@ -1001,13 +1086,13 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private fun targetLane(video: Boolean, laneKey: Int, exceptClip: Long?): Int {
         val lane = tracks.firstOrNull { it.id == laneKey }
         // Rule 5: with no other video anywhere, video can only go on V0.
-        val noOtherVideo = tracks.none { t -> t.video && t.clips.any { it.id != exceptClip } }
+        val noOtherVideo = tracks.none { t -> t.pictures && t.clips.any { it.id != exceptClip } }
         return when {
             !video -> if (lane != null && !lane.video && lane.id !in lockedTracks) lane.id else NEW_AUDIO
             noOtherVideo -> V0
-            lane != null && lane.video && lane.id !in lockedTracks -> lane.id
+            lane != null && lane.pictures && lane.id !in lockedTracks -> lane.id
             // Over the audio lanes or below them: the nearest video layer is the base.
-            laneKey == NEW_AUDIO || (lane != null && !lane.video) -> V0
+            laneKey == NEW_AUDIO || (lane != null && !lane.pictures) -> V0
             else -> NEW_VIDEO
         }
     }
@@ -1155,7 +1240,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         var i = list.indexOfFirst { it.id == trackId }
         if (i < 0) {
             // A new video layer goes on top of the existing ones; a new audio lane at the bottom of the stack.
-            i = if (video) list.indexOfLast { it.video } + 1 else 0
+            i = if (video) list.indexOfLast { it.pictures } + 1 else 0
             list.add(i, Track(nextTrackId++, video, emptyList(), nextName(video, list)))
         }
         val t = list[i]
@@ -1200,11 +1285,12 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         tracks.map { t -> if (t.clips.none { it.id == clipId }) t else t.copy(clips = t.clips.flatMap { if (it.id == clipId) f(it) else listOf(it) }) }
 
     /** What is selected, which decides which tools and pages make sense to offer. */
-    enum class Selection { NONE, VIDEO, SILENT_VIDEO, PICTURE, AUDIO }
+    enum class Selection { NONE, VIDEO, SILENT_VIDEO, PICTURE, AUDIO, CAPTION }
 
     val selection: Selection
         get() {
             val l = selectedClipId?.let(::locate) ?: return Selection.NONE
+            if (l.clip.isCaption) return Selection.CAPTION
             val a = assets[l.clip.assetId] ?: return Selection.NONE
             return when {
                 tracks.firstOrNull { it.id == l.trackId }?.video != true -> Selection.AUDIO
@@ -1260,7 +1346,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         // A transition belongs to the cut it sits on; the copy has no cut, so it starts plain.
         val copy = l.clip.copy(id = nextClipId++, transition = null)
         val list = tracks.toMutableList()
-        list.add(idx + 1, Track(nextTrackId++, src.video, listOf(copy), nextName(src.video)))
+        list.add(idx + 1, Track(nextTrackId++, src.video, listOf(copy), nextName(src.video, list), src.captions))
         commit(list)
         selectedClipId = copy.id
     }
@@ -1315,7 +1401,8 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             list = list.take(at) + Track(V0, true, emptyList()) + list.drop(at)
         }
         val base = list.indexOfFirst { it.id == V0 }
-        val above = list.drop(base + 1).firstOrNull { it.video }
+        // Only a layer of pictures takes V0's place (never a caption layer).
+        val above = list.drop(base + 1).firstOrNull { it.pictures }
         if (list[base].clips.isEmpty() && above != null && above.id !in lockedTracks && V0 !in lockedTracks) {
             // The layer's eye and mute state follow it down to V0.
             fun carry(set: Set<Int>) = if (above.id in set) set - above.id + V0 else set - V0
@@ -1334,6 +1421,12 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         val v0 = list.indexOfFirst { it.id == V0 }
         val stray = list.take(v0).filter { it.video }
         if (stray.isNotEmpty()) list = list.take(v0).filter { !it.video } + list[v0] + stray + list.drop(v0 + 1)
+        // Text lanes are visual layers like any other: named V1, V2… (projects from before called them C1, C2…).
+        if (list.any { it.captions && it.name.startsWith("C") }) {
+            val named = ArrayList<Track>()
+            for (t in list) named += if (t.captions && t.name.startsWith("C")) t.copy(name = nextName(true, list.filter { o -> !(o.captions && o.name.startsWith("C")) } + named)) else t
+            list = named
+        }
         return list.map { if (it.id == V0) it.copy(clips = pack(it.clips)) else it }
     }
 
@@ -1463,7 +1556,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             // At rest: how many of the video pictures on screen are already the originals' own frames.
             var visible = 0
             for (t in tracks) {
-                if (!t.video || t.id in hiddenTracks) continue
+                if (!t.pictures || t.id in hiddenTracks) continue
                 val c = t.clipAt(playheadUs) ?: continue
                 val a = assets[c.assetId] ?: continue
                 if (a.isImage || a.isAudio) continue
@@ -1481,7 +1574,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     /** The clip on screen at the playhead is still waiting for its edit proxy: (asset name, percent or null). */
     val optimizingHere: Pair<String, Int?>?
         get() {
-            for (t in tracks) if (t.video && t.id !in hiddenTracks) {
+            for (t in tracks) if (t.pictures && t.id !in hiddenTracks) {
                 val c = t.clipAt(playheadUs) ?: continue
                 val a = assets[c.assetId] ?: continue
                 if (a.isAudio || a.isImage || a.id in playProxies) continue
@@ -1521,7 +1614,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private fun buildItem(c: Clip?, lane: Track? = null): LayerPlayer.Item? {
         val a = c?.let { assets[it.assetId] } ?: return null
         var clip: Clip = c
-        if (lane != null && lane.video) {
+        if (lane != null && lane.pictures) {
             val after = lane.clips.firstOrNull { it.startUs == c.endUs && it.transition != null }
             val tIn = c.transition?.takeIf { lane.clips.any { it.endUs == c.startUs } }
             val longest = if (a.isImage) Long.MAX_VALUE / 4 else a.durationUs
@@ -1634,7 +1727,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
                 cur?.let { it.copy(gain = it.gain * (mix ?: 1f)) }, current?.snd?.pitch ?: 0f,
                 oth?.let { it.copy(gain = it.gain * (1f - (mix ?: 1f))) }, other?.snd?.pitch ?: 0f,
             )
-            val visible = t.video && current != null
+            val visible = t.pictures && current != null
             if (trackVisible[t.id] != visible) trackVisible[t.id] = visible
         }
         if (only == null) updateStill()
@@ -1679,7 +1772,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         val jobs = ArrayList<Pair<Float, RestJob>>()
         var unsure = false
         for (t in tracks) {
-            if (!t.video || t.id in hiddenTracks) continue
+            if (!t.pictures || t.id in hiddenTracks) continue
             if (restReady.containsKey(t.id) || t.id in restQueued) continue
             val c = t.clipAt(playheadUs) ?: continue
             if (laneFx(t) != null) continue
@@ -1753,8 +1846,8 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         // in progress is drawn by the lanes themselves, which a still on top would hide.
         // Only when that one picture fills the canvas as it is: the still covers the whole canvas, so with a
         // placed or cropped layer, or with more than one layer showing, it would hide what is underneath.
-        val layersShowing = tracks.count { it.video && it.id !in hiddenTracks && it.clipAt(playheadUs) != null }
-        if (top == null || a == null || a.isImage || a.id !in playProxies || tracks.any { it.video && laneFx(it) != null } ||
+        val layersShowing = tracks.count { it.pictures && it.id !in hiddenTracks && it.clipAt(playheadUs) != null }
+        if (top == null || a == null || a.isImage || a.id !in playProxies || tracks.any { it.pictures && laneFx(it) != null } ||
             !top.clip.tf.isIdentity || layersShowing > 1
         ) {
             stillWanted = false
@@ -1866,7 +1959,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     /** Timeline time of the frame the top picture lane really has on screen, if it is close to the playhead. */
     private fun shownFrameTime(): Long? {
         for (t in tracks.asReversed()) {
-            if (!t.video || t.id in hiddenTracks) continue
+            if (!t.pictures || t.id in hiddenTracks) continue
             val clips = playClips(t)
             val c = clips.getOrNull(laneAt(clips, playheadUs))?.takeIf { playheadUs >= it.startUs } ?: continue
             val i = item(c, t) ?: continue
@@ -1925,7 +2018,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             val now = android.os.SystemClock.uptimeMillis()
             if (now - lastScrubSync >= 12L) {
                 lastScrubSync = now
-                val video = tracks.filter { it.video }
+                val video = tracks.filter { it.pictures }
                 if (video.isNotEmpty()) {
                     scrubLane = (scrubLane + 1) % video.size
                     syncLayers(true, light = true, only = video[scrubLane].id)
@@ -1944,7 +2037,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun showScrubFrame(us: Long): Boolean {
         // In a transition the lanes draw the blend themselves; a single scrub frame would hide it.
-        if (tracks.any { it.video && laneFxAt(it, us) }) return false
+        if (tracks.any { it.pictures && laneFxAt(it, us) }) return false
         val top = topVideoAt(us) ?: return false
         scrubTf = top.clip.tf
         val p = proxies[top.clip.assetId] ?: return false
@@ -1993,9 +2086,13 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- trimming ------------------------------------------------------------------
 
+    /** A caption has no file: it trims as a still picture does, either edge out as far as its neighbours allow. */
+    private val captionAsset = MediaAsset(CAPTION_ASSET, "", "Caption", 0L, 1920, 1080, 30f, false, false, "image/x-caption")
+    private fun assetOf(c: Clip): MediaAsset? = assets[c.assetId] ?: if (c.isCaption) captionAsset else null
+
     fun trimStart(left: Boolean) {
         val l = selectedClipId?.let(::locate) ?: return
-        val a = assets[l.clip.assetId] ?: return
+        val a = assetOf(l.clip) ?: return
         pause()
         trimOrig = l
         trimLeft = left
@@ -2015,7 +2112,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     fun trimDrag(deltaUs: Long) {
         val l = trimOrig ?: return
         val orig = l.clip
-        val a = assets[orig.assetId] ?: return
+        val a = assetOf(orig) ?: return
         val sp = orig.speed
         // The finger moves in timeline time; the source moves at the clip's speed.
         val srcDelta = (deltaUs * sp).toLong()
@@ -2121,7 +2218,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     fun openFx(clipId: Long, slot: FxSlot) {
         val l = locate(clipId) ?: return
         // Transitions and animations act on pictures, so only clips on video layers have them.
-        if (tracks.firstOrNull { it.id == l.trackId }?.video != true) return
+        if (tracks.firstOrNull { it.id == l.trackId }?.pictures != true) return
         if (l.trackId in lockedTracks || (slot == FxSlot.TRANSITION && clipBefore(l.clip) == null)) return
         pause()
         fxBefore = tracks
@@ -2251,13 +2348,13 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     /** The selected clip if it is a picture under the playhead, which the canvas can place. */
     fun canvasClip(): Located? {
         val l = selectedClipId?.let(::locate) ?: return null
-        if (tracks.firstOrNull { it.id == l.trackId }?.video != true || l.trackId in hiddenTracks) return null
+        if (tracks.firstOrNull { it.id == l.trackId }?.pictures != true || l.trackId in hiddenTracks) return null
         return l.takeIf { playheadUs >= it.clip.startUs && playheadUs < it.clip.endUs }
     }
 
     /** Video lanes from the highest down, with the clip each shows at the playhead: the order to test touches in. */
     fun canvasStack(): List<Pair<Track, Clip>> =
-        tracks.asReversed().filter { it.video && it.id !in hiddenTracks && it.id !in lockedTracks }.mapNotNull { t -> t.clipAt(playheadUs)?.let { t to it } }
+        tracks.asReversed().filter { it.pictures && it.id !in hiddenTracks && it.id !in lockedTracks }.mapNotNull { t -> t.clipAt(playheadUs)?.let { t to it } }
 
     fun selectOnCanvas(clipId: Long?) {
         selectedClipId = clipId
@@ -2363,7 +2460,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     val gradeTarget: Located?
         get() {
             val sel = selectedClipId?.let(::locate)
-            if (sel != null && tracks.firstOrNull { it.id == sel.trackId }?.video == true &&
+            if (sel != null && tracks.firstOrNull { it.id == sel.trackId }?.pictures == true &&
                 playheadUs >= sel.clip.startUs && playheadUs < sel.clip.endUs
             ) return sel
             return topVideoAt(playheadUs)
@@ -2792,7 +2889,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     val stabTarget: Located? get() = stabClipId?.let(::locate)
 
     fun openStab(): Boolean {
-        val l = (selectedClipId?.let(::locate)?.takeIf { tracks.firstOrNull { t -> t.id == it.trackId }?.video == true } ?: topVideoAt(playheadUs))
+        val l = (selectedClipId?.let(::locate)?.takeIf { tracks.firstOrNull { t -> t.id == it.trackId }?.pictures == true } ?: topVideoAt(playheadUs))
             ?.takeIf { it.trackId !in lockedTracks } ?: return false
         val a = assets[l.clip.assetId] ?: return false
         if (a.isImage) { tell("A still picture has no motion to stabilise"); return false }
@@ -2938,6 +3035,323 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         stabTracks = stabTracks - l.clip.id
         tell("Stabilization removed")
     }
+
+    // ---- captions ---------------------------------------------------------------------
+
+    /** A caption run in progress: what it is doing, how far (0..1), and which clip of how many. */
+    class CaptionRun(val title: String, val progress: Float, val detail: String)
+    var captionRun by mutableStateOf<CaptionRun?>(null)
+        private set
+    @Volatile private var captionStop = false
+    /** The captions sheet: null closed; else for the whole project (-1) or a clip's id. */
+    var captionSheetFor by mutableStateOf<Long?>(null)
+
+    fun openCaptions(clipId: Long?) {
+        captionSheetFor = clipId ?: -1L
+        // The earlier speaker and sound models are replaced by better ones: free their space.
+        val app = getApplication<Application>()
+        viewModelScope.launch(Dispatchers.IO) { CaptionModels.removeRetired(app) }
+    }
+
+    /** The clips whose sound is captioned, in timeline order: every clip with sound, on picture and sound lanes. */
+    private fun soundClips(only: Long?): List<Pair<Track, Clip>> = tracks.flatMap { t ->
+        if (t.captions) emptyList() else t.clips.filter { c ->
+            val a = assets[c.assetId] ?: return@filter false
+            (only == null || c.id == only) && (a.hasAudio || a.isAudio) && !a.isImage
+        }.map { t to it }
+    }.sortedBy { it.second.startUs }
+
+    /**
+     * Makes captions: for the whole project ([clipId] null) onto one new caption layer at the top, or for one clip into
+     * the free space of the caption layer right above it (a new one there when that is taken). Each caption is a line
+     * of dialogue or a sentence, as subtitles are cut.
+     */
+    fun makeCaptions(clipId: Long?, lang: String) {
+        if (captionRun != null) return
+        val app = getApplication<Application>()
+        val sources = soundClips(clipId)
+        if (sources.isEmpty()) { tell(if (clipId == null) "No clip with sound to caption" else "This clip has no sound"); return }
+        captionStop = false
+        captionRun = CaptionRun("Loading the speech model", 0f, "")
+        viewModelScope.launch {
+            val made = withContext(Dispatchers.Default) {
+                // The voice finder (under 1 MB) comes with the speech models; fetched here for those downloaded before it.
+                if (CaptionModels.vad(app) == null) withContext(Dispatchers.IO) { CaptionModels.download(app, CaptionModels.VAD, {}, { false }) }
+                runCatching {
+                    Captioner.Session(app).use { session ->
+                        val all = ArrayList<Pair<Clip, Cue>>()
+                        for ((i, pair) in sources.withIndex()) {
+                            if (captionStop) return@runCatching null
+                            val (_, c) = pair
+                            val a = assets[c.assetId] ?: continue
+                            main.post { captionRun = CaptionRun("Listening", i.toFloat() / sources.size, "${a.name} · ${i + 1} of ${sources.size}") }
+                            val cues = session.caption(originalOf(a), c.inUs, c.outUs, lang) { p ->
+                                main.post { if (captionRun != null) captionRun = CaptionRun("Writing captions", (i + p) / sources.size, "${a.name} · ${i + 1} of ${sources.size}") }
+                            } ?: if (captionStop) return@runCatching null else continue
+                            for (cue in cues) all += c to cue
+                        }
+                        all
+                    }
+                }
+            }
+            captionRun = null
+            val list = made.getOrElse { tell(it.message ?: "Couldn't make captions"); return@launch } ?: run { tell("Captions stopped"); return@launch }
+            // To the timeline: each caption where its words are heard (the clip's speed and trim applied).
+            val timed = list.mapNotNull { (c, cue) ->
+                val s = (c.startUs + (cue.startUs - c.inUs) / c.speed).toLong().coerceIn(c.startUs, c.endUs)
+                val e = (c.startUs + (cue.endUs - c.inUs) / c.speed).toLong().coerceIn(c.startUs, c.endUs)
+                if (e - s < MIN_CLIP_US) null else Triple(s, e, cue)
+            }
+            if (timed.isEmpty()) { tell("No speech or music found"); return@launch }
+            placeCaptions(clipId, timed)
+        }
+    }
+
+    /** The size new captions get ([Caption.SIZES], normal by default). */
+    var captionSize by mutableStateOf(getApplication<Application>().getSharedPreferences("captions", 0).getInt("size", 2))
+        private set
+
+    fun chooseCaptionSize(i: Int) {
+        captionSize = i.coerceIn(0, 4)
+        getApplication<Application>().getSharedPreferences("captions", 0).edit().putInt("size", captionSize).apply()
+    }
+
+    /** Whether the project has captions already (so their size can be changed too). */
+    val hasCaptions: Boolean get() = tracks.any { t -> t.captions && t.clips.isNotEmpty() }
+
+    /** Every caption in the project at [captionSize] (one undo step). */
+    fun applyCaptionSizeToAll() {
+        if (!hasCaptions) return
+        commit(tracks.map { t -> if (!t.captions || t.id in lockedTracks) t else t.copy(clips = t.clips.map { c -> c.caption?.let { cap -> c.copy(caption = cap.copy(size = captionSize)) } ?: c }) })
+        tell("Captions resized")
+    }
+
+    // ---- texts (captions and titles) ------------------------------------------------------------------
+
+    /** The text being styled in the text panel (its clip id), and which tab of it is open. */
+    var textPanelFor by mutableStateOf<Long?>(null)
+    var textTab by mutableIntStateOf(0)
+
+    fun openText(clipId: Long, tab: Int = 0) { pause(); selectedClipId = clipId; textTab = tab; textPanelFor = clipId }
+
+    /** The selected clip's text, or null. */
+    fun captionOf(clipId: Long?): Caption? = clipId?.let(::locate)?.clip?.caption
+
+    /** Starts a change to a text that may take many steps (a slider, a drag): it is one undo step, ended by [textEditEnd]. */
+    fun textEditStart() = canvasEditStart()
+    fun textEditEnd() = canvasEditEnd()
+
+    /**
+     * Changes the text of clip [clipId] by [f] (between [textEditStart] and [textEditEnd]: live, one undo step; else
+     * one step of its own). [lane]: every text on its lane the same way (a whole set of captions).
+     */
+    fun styleText(clipId: Long, lane: Boolean = false, f: (Caption) -> Caption) {
+        val l = locate(clipId) ?: return
+        if (l.trackId in lockedTracks || l.clip.caption == null) return
+        val ts = tracks.map { t ->
+            if (t.id != l.trackId) t
+            else t.copy(clips = t.clips.map { c -> if ((c.id == clipId || lane) && c.caption != null) c.copy(caption = f(c.caption)) else c })
+        }
+        if (canvasBefore != null) apply(ts) else commit(ts)
+    }
+
+    /**
+     * A text's animation being shown in the preview (the clip and µs into it), without moving the playhead: picked in
+     * the text panel, it plays once over the picture as it is.
+     */
+    var textDemo by mutableStateOf<Pair<Long, Long>?>(null)
+        private set
+    private var textDemoJob: kotlinx.coroutines.Job? = null
+
+    fun previewTextAnim(clipId: Long, out: Boolean) {
+        val c = locate(clipId)?.clip ?: return
+        val cap = c.caption ?: return
+        val dur = c.durationUs
+        val span = kotlin.math.min(if (out) cap.outUs else cap.inUs, dur / 2) + 300_000L
+        val from = if (out) (dur - span).coerceAtLeast(0L) else 0L
+        textDemoJob?.cancel()
+        textDemoJob = viewModelScope.launch {
+            val t0 = System.nanoTime()
+            while (true) {
+                val t = from + (System.nanoTime() - t0) / 1000L
+                if (t > from + span) break
+                textDemo = clipId to t.coerceAtMost(dur - 1)
+                kotlinx.coroutines.delay(16)
+            }
+            // Holds the end for a moment, then shows the text as it is at the playhead again.
+            kotlinx.coroutines.delay(250)
+            textDemo = null
+        }
+    }
+
+    /** How long a text added by hand lasts at first. */
+    val textUs = 3_000_000L
+
+    /** Adds [cap] as a text at the playhead: on the top text lane where it is free there, else on a new one at the top. */
+    fun addText(cap: Caption) {
+        val at = playheadUs
+        val list = tracks.toMutableList()
+        val free = list.lastOrNull { t -> t.captions && t.id !in lockedTracks && t.id !in hiddenTracks && t.clips.none { it.startUs < at + textUs && it.endUs > at } }
+        val clip = Clip(nextClipId++, CAPTION_ASSET, 0L, textUs, at, caption = cap)
+        if (free != null) list[list.indexOf(free)] = free.copy(clips = free.clips + clip)
+        else list.add(list.indexOfLast { it.video } + 1, Track(nextTrackId++, true, listOf(clip), nextName(true, list), captions = true))
+        commit(list)
+        mediaBoxOpen = false
+        openText(clip.id, 0)
+    }
+
+    /** A text from the media box is dragged over lane [laneKey] (null: outside the timeline), its left edge at [timeUs]. */
+    fun hoverText(laneKey: Int?, timeUs: Long) {
+        if (laneKey == null) { clearDrop(); return }
+        val lane = tracks.firstOrNull { it.id == laneKey }
+        val target = if (lane != null && lane.captions && lane.id !in lockedTracks) lane.id else NEW_VIDEO
+        drop = slot(target, timeUs, textUs, null)
+    }
+
+    /** Drops the dragged text [cap] where [hoverText] showed. */
+    fun dropText(cap: Caption) {
+        val d = drop ?: return
+        clearDrop()
+        confirmTick++
+        val clip = Clip(nextClipId++, CAPTION_ASSET, 0L, textUs, d.startUs, caption = cap)
+        val list = pushed(tracks, d, null).toMutableList()
+        val i = list.indexOfFirst { it.id == d.trackId }
+        if (i >= 0) list[i] = list[i].copy(clips = list[i].clips + clip.copy(startUs = freeStart(list[i].clips, d.startUs, textUs)))
+        else list.add(list.indexOfLast { it.video } + 1, Track(nextTrackId++, true, listOf(clip), nextName(true, list), captions = true))
+        commit(list)
+        selectedClipId = clip.id
+    }
+
+    /**
+     * The text on the picture under [p] (preview pixels of a [w] × [h] canvas), the highest one first: its clip, or
+     * null. For touching texts on the preview.
+     */
+    fun textAt(p: androidx.compose.ui.geometry.Offset, w: Float, h: Float): Clip? {
+        val area = CaptionRender.videoRect(tracks, assets, hiddenTracks, playheadUs, w, h, meta.scaling == "Fill")
+        for (t in tracks.asReversed()) {
+            if (!t.captions || t.id in hiddenTracks) continue
+            val c = t.clipAt(playheadUs) ?: continue
+            val cap = c.caption ?: continue
+            val b = CaptionRender.bounds(cap, area) ?: continue
+            // Undo its turn, so a turned text is touched where it shows.
+            val r = Math.toRadians(-cap.rot.toDouble())
+            val dx = p.x - b.centerX(); val dy = p.y - b.centerY()
+            val lx = (dx * kotlin.math.cos(r) - dy * kotlin.math.sin(r)).toFloat() + b.centerX()
+            val ly = (dx * kotlin.math.sin(r) + dy * kotlin.math.cos(r)).toFloat() + b.centerY()
+            if (b.contains(lx, ly)) return c
+        }
+        return null
+    }
+
+    fun cancelCaptions() { captionStop = true; Captioner.cancel() }
+
+    /** Lays the captions on a caption layer: speech first, then lyrics, then music, each where the others leave room. */
+    private fun placeCaptions(clipId: Long?, cues: List<Triple<Long, Long, Cue>>) {
+        val src = clipId?.let(::locate)
+        var list = tracks.toMutableList()
+        // The layer: for one clip, the caption layer right above its lane where it is free over the clip; else a new one.
+        val newLane = { at: Int -> Track(nextTrackId++, true, emptyList(), nextName(true, list), captions = true).also { list.add(at, it) } }
+        var lane: Track = if (src != null) {
+            val i = list.indexOfFirst { it.id == src.trackId }
+            val next = list.getOrNull(i + 1)
+            val free = next != null && next.captions && next.id !in lockedTracks && next.clips.none { it.startUs < src.clip.endUs && it.endUs > src.clip.startUs }
+            if (free) next!! else newLane(i + 1)
+        } else newLane(list.size)
+        val placed = ArrayList(lane.clips)
+        val order = cues.sortedWith(compareBy({ it.third.kind }, { it.first }))
+        for ((s0, e0, cue) in order) {
+            var s = s0; var e = e0
+            // Around what is there already: trimmed to the free part, or left out when too little is free.
+            for (o in placed) {
+                if (o.startUs < e && o.endUs > s) {
+                    if (o.startUs <= s) s = o.endUs else e = o.startUs
+                }
+            }
+            if (e - s < 400_000) continue
+            placed += Clip(nextClipId++, CAPTION_ASSET, 0L, e - s, s, caption = Caption(cue.text, cue.kind, if (s == s0) cue.tintFrom else -1, captionSize))
+        }
+        val made = placed.size - lane.clips.size
+        if (made <= 0) { tell("No room for the captions"); return }
+        lane = lane.copy(clips = placed.sortedBy { it.startUs })
+        list = list.map { if (it.id == lane.id) lane else it }.toMutableList()
+        commit(list)
+        tell("$made captions on ${lane.name}")
+    }
+
+    /** The caption whose words are being edited (null: none). */
+    var captionEditFor by mutableStateOf<Long?>(null)
+
+    // The models: which are here (bumped when one arrives or goes), and downloads in progress by model id (0..1).
+    var modelsTick by mutableStateOf(0)
+        private set
+    var modelDownloads by mutableStateOf<Map<String, Float>>(emptyMap())
+        private set
+    /** Why a model's last download failed, by model id, in words (cleared when it is tried again). */
+    var modelErrors by mutableStateOf<Map<String, String>>(emptyMap())
+        private set
+
+    private fun downloadError(e: Throwable, host: String): String = when (e) {
+        is java.net.UnknownHostException -> "Can't reach $host. Check the connection (or its DNS), or add the file from storage."
+        is java.net.SocketTimeoutException -> "The connection timed out. Try again; the download resumes where it stopped."
+        is java.net.ConnectException, is java.net.NoRouteToHostException -> "No connection to $host. Try again when online."
+        is javax.net.ssl.SSLException -> "The secure connection to $host failed. Try again on another network."
+        else -> e.message ?: "The download failed. Try again."
+    }
+    private val downloadStops = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicBoolean>()
+
+    fun downloadModel(spec: CaptionModels.Spec) {
+        if (spec.id in modelDownloads) { downloadStops[spec.id]?.set(true); return }
+        val app = getApplication<Application>()
+        val stop = java.util.concurrent.atomic.AtomicBoolean(false)
+        downloadStops[spec.id] = stop
+        modelDownloads = modelDownloads + (spec.id to 0f)
+        modelErrors = modelErrors - spec.id
+        viewModelScope.launch {
+            val r = withContext(Dispatchers.IO) {
+                CaptionModels.download(app, spec, { p -> main.post { if (spec.id in modelDownloads) modelDownloads = modelDownloads + (spec.id to p) } }, { stop.get() })
+            }
+            modelDownloads = modelDownloads - spec.id
+            downloadStops.remove(spec.id)
+            val speech = spec === CaptionModels.WHISPER_BEST || spec === CaptionModels.WHISPER_FAST
+            if (r.isSuccess && speech) {
+                CaptionModels.choose(app, spec.id)
+                if (CaptionModels.vad(app) == null) withContext(Dispatchers.IO) { CaptionModels.download(app, CaptionModels.VAD, {}, { stop.get() }) }
+            }
+            r.onFailure { if (!stop.get()) modelErrors = modelErrors + (spec.id to downloadError(it, android.net.Uri.parse(spec.url).host ?: "the server")) }
+            modelsTick++
+        }
+    }
+
+    /** Adds a model from storage: a Whisper model of one's own ([target] null), or one of the listed GGUF models. */
+    fun importModel(uri: android.net.Uri, target: CaptionModels.Spec?) {
+        val app = getApplication<Application>()
+        viewModelScope.launch {
+            val r = withContext(Dispatchers.IO) { CaptionModels.import(app, uri, target) }
+            r.onSuccess { tell("${target?.title ?: "Your Whisper model"} is ready") }.onFailure { tell(it.message ?: "Couldn't add the model") }
+            modelsTick++
+        }
+    }
+
+    fun chooseWhisper(id: String) { CaptionModels.choose(getApplication(), id); modelsTick++ }
+
+    fun deleteModel(spec: CaptionModels.Spec?) {
+        val app = getApplication<Application>()
+        if (spec == null) java.io.File(CaptionModels.dir(app), CaptionModels.WHISPER_OWN_FILE).delete() else CaptionModels.delete(app, spec)
+        modelsTick++
+    }
+
+    /** Changes the words of caption clip [clipId]. */
+    fun setCaptionText(clipId: Long, text: String) {
+        val l = locate(clipId) ?: return
+        if (l.clip.caption == null || l.trackId in lockedTracks) return
+        // A two-speaker caption keeps its second line grey: from wherever the line break now is.
+        commit(withClip(clipId) { listOf(it.copy(caption = it.caption?.let { cap ->
+            cap.copy(text = text, tintFrom = if (cap.tintFrom > 0 && '\n' in text) text.indexOf('\n') + 1 else -1)
+        })) })
+    }
+
+    /** What captioning would cover: the clips with sound and their total length. */
+    fun captionSources(clipId: Long?): Pair<Int, Long> = soundClips(clipId).let { l -> l.size to l.sumOf { it.second.durationUs } }
 
     // ---- the trim page ---------------------------------------------------------------
 
@@ -3388,7 +3802,9 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     fun moveDrag(deltaUs: Long, laneKey: Int?) {
         val l = moveOrig ?: return
         val video = tracks.first { it.id == l.trackId }.video
-        val target = if (laneKey == null) l.trackId else targetLane(video, laneKey, l.clip.id)
+        // A caption stays on caption layers: its own, or another one it is dragged over.
+        val target = if (l.clip.isCaption) tracks.firstOrNull { it.id == laneKey && it.captions && it.id !in lockedTracks }?.id ?: l.trackId
+            else if (laneKey == null) l.trackId else targetLane(video, laneKey, l.clip.id)
         drop = slot(target, l.clip.startUs + deltaUs, l.clip.durationUs, l.clip.id)
     }
 

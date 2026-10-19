@@ -23,8 +23,8 @@ android {
         applicationId = "com.graden.editor"
         minSdk = 29
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.2.1-beta"
+        versionCode = 4
+        versionName = "0.3.0-beta"
         // MotionCam RAW decoding is native, on every phone; the software encoders only on 64-bit ARM.
         ndk { abiFilters += if (softenc) listOf("arm64-v8a") else listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
         externalNativeBuild {
@@ -55,7 +55,7 @@ android {
         getByName("release") {
             isMinifyEnabled = true
             isShrinkResources = true
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfigs.findByName("release")?.let { signingConfig = it }
         }
         // Optimised like a release build (R8, not debuggable) but signed with the debug key, so it installs over the
@@ -66,7 +66,7 @@ android {
             isMinifyEnabled = true
             isProfileable = true
             matchingFallbacks += listOf("release")
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
     buildFeatures { compose = true }

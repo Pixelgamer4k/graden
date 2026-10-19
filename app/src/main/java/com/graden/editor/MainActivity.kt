@@ -16,6 +16,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge(SystemBarStyle.dark(Color.TRANSPARENT), SystemBarStyle.dark(Color.TRANSPARENT))
         super.onCreate(savedInstanceState)
+        TextFonts.assets = applicationContext.assets
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         // Ask for the panel's highest refresh rate so the timeline scrolls at 90/120 Hz where available.
         @Suppress("DEPRECATION") val display = windowManager.defaultDisplay

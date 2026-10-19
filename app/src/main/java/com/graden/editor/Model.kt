@@ -34,7 +34,14 @@ data class MediaAsset(
     val fullRange: Boolean = false,
     /** An HDR file's curve as the file says: HLG (else PQ). Read at import, so it is known before anything is drawn. */
     val hlg: Boolean = false,
+    /** For a RAW recording: the full develop options ([DevelopOptions.toJson]); null: just [rawHalf] and [rawShading]. */
+    val rawDev: String? = null,
+    /** The file's size (bytes) and when it was made (ms since 1970), for sorting the media box; 0 unknown. */
+    val bytes: Long = 0L,
+    val dateMs: Long = 0L,
 ) {
+    val isGif: Boolean get() = mime == "image/gif"
+    val developOptions: DevelopOptions get() = DevelopOptions.of(rawDev, rawHalf, rawShading)
     val isReversed: Boolean get() = reverseOf >= 0
     val isRaw: Boolean get() = raw != null
     /** Audio-only files have no picture size. */
@@ -89,7 +96,10 @@ data class Clip(
     val cs: String? = null,
     /** Optical stabilisation, made on the Stabilize page; null: none. */
     val stab: Stab? = null,
+    /** A caption ([assetId] is then [CAPTION_ASSET]): its text, on a caption layer. */
+    val caption: Caption? = null,
 ) {
+    val isCaption: Boolean get() = caption != null
     /** How long the clip lasts on the timeline. */
     val durationUs: Long get() = ((outUs - inUs) / speed).toLong()
     /** How much of the source it uses. */
@@ -104,12 +114,103 @@ data class Clip(
  * One lane. Track id 0 is V0, the base video layer, which always exists. [name] ("V1", "A2"…) is
  * given when the lane is created and stays with it wherever it is moved. Clips never overlap.
  */
-data class Track(val id: Int, val video: Boolean, val clips: List<Clip>, val name: String = if (id == 0) "V0" else "") {
+/** A text layer ([captions]) is a visual lane of texts (captions and titles) only, drawn in its place among the others. */
+data class Track(val id: Int, val video: Boolean, val clips: List<Clip>, val name: String = if (id == 0) "V0" else "", val captions: Boolean = false) {
+    /** A lane of pictures (video, not captions). */
+    val pictures: Boolean get() = video && !captions
     val endUs: Long get() = clips.maxOfOrNull { it.endUs } ?: 0L
     fun clipAt(us: Long): Clip? = clips.firstOrNull { us >= it.startUs && us < it.endUs }
 }
 
 const val MIN_CLIP_US = 100_000L
+
+/**
+ * One caption, in source time ([startUs]..[endUs] of the file), with its kind, who says it ([speaker], -1 unknown) and,
+ * for two people in quick succession, where the second one's line starts in [text] ([tintFrom], -1 none).
+ */
+class Cue(val startUs: Long, val endUs: Long, val text: String, val kind: Int, val speaker: Int = -1, val tintFrom: Int = -1) {
+    companion object { const val SPEECH = 0; const val LYRICS = 1; const val MUSIC = 2 }
+}
+
+/** The asset id a caption clip carries: it has no file. */
+const val CAPTION_ASSET = -1
+
+/**
+ * A text on the picture: a caption made from the sound, or a title, heading or any words added by hand. Captions and
+ * texts are the same thing, on visual layers like any picture. [text]: its words (a line break where it is split);
+ * [kind]: what it says ([Cue] speech, sung lyrics shown with 𝄞, or music alone; [TEXT] for words added by hand).
+ * [tintFrom]: two speakers, from this character on the second one's line (-1: one speaker). [size]: [SIZES] 0..4,
+ * times [scale]. [x], [y]: where its centre is on the video (0..1 of its width and height); NaN: the subtitle place,
+ * centred near the bottom. [rot]: turned, degrees. [look]: font, colours, edge, box. [animIn], [animOut]: how it
+ * arrives and leaves ([TextAnim] ids; "none" by default) and in how long.
+ */
+data class Caption(
+    val text: String,
+    val kind: Int = Cue.SPEECH,
+    val tintFrom: Int = -1,
+    val size: Int = 2,
+    val scale: Float = 1f,
+    val x: Float = Float.NaN,
+    val y: Float = Float.NaN,
+    val rot: Float = 0f,
+    val look: TextLook = TextLook(),
+    val animIn: String = TextAnim.NONE,
+    val animOut: String = TextAnim.NONE,
+    val inUs: Long = 400_000L,
+    val outUs: Long = 400_000L,
+) {
+    val placed: Boolean get() = !x.isNaN() && !y.isNaN()
+    /** Made from the sound (speech, lyrics, music), however it was edited, moved or restyled since; else added by hand.
+     *  An export can write these out as a subtitle file and leave them off the picture. */
+    val fromSound: Boolean get() = kind != TEXT
+    companion object {
+        const val TEXT = 3
+        val SIZES = listOf("Very small", "Small", "Normal", "Large", "Very large")
+        val SCALES = floatArrayOf(0.72f, 0.86f, 1f, 1.18f, 1.38f)
+    }
+}
+
+/**
+ * How a text looks. Colours are ARGB; widths and sizes are fractions of the text's size, so a look is the same at any
+ * size. [font]: a [TextFonts] id; [weight] 100..900. [stroke]: edge width (0 none); [shadow]: shadow softness (0 none);
+ * [box]: a box behind each line (alpha 0: none) with corners [boxRound]. [align]: 0 left, 1 centre, 2 right.
+ * [letter]: extra space between letters (em); [line]: line height. [caps]: all capitals. [decor]: a line or frame
+ * drawn with it ([DECOR_*]) in [decorColor]. [sub]: lines after the first at this size, in [subColor] (a subtitle
+ * under a title; 1: the same).
+ */
+data class TextLook(
+    val font: String = "inter",
+    val weight: Int = 600,
+    val italic: Boolean = false,
+    val color: Int = 0xFFFFFFFF.toInt(),
+    val stroke: Float = 0.13f,
+    val strokeColor: Int = 0xD7000000.toInt(),
+    val shadow: Float = 0.10f,
+    val shadowColor: Int = 0x96000000.toInt(),
+    val box: Int = 0,
+    val boxRound: Float = 0.22f,
+    val align: Int = 1,
+    val letter: Float = 0f,
+    val line: Float = 1.08f,
+    val caps: Boolean = false,
+    val decor: Int = DECOR_NONE,
+    val decorColor: Int = 0xFFFFFFFF.toInt(),
+    val sub: Float = 1f,
+    val subColor: Int = 0xFFB4B8C2.toInt(),
+    val opacity: Float = 1f,
+) {
+    companion object {
+        const val DECOR_NONE = 0
+        /** A bar under the text. */
+        const val DECOR_UNDERLINE = 1
+        /** Thin lines above and below. */
+        const val DECOR_RULES = 2
+        /** A thin frame around it. */
+        const val DECOR_FRAME = 3
+        /** A bar at its left, as on a lower third. */
+        const val DECOR_SIDEBAR = 4
+    }
+}
 
 fun timecode(us: Long, fps: Float): String {
     val f = fps.toInt().coerceAtLeast(1).let { if (fps - it > 0.5f) it + 1 else it }

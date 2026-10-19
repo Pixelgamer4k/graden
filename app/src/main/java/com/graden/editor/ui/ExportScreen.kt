@@ -90,12 +90,12 @@ import com.graden.editor.export.VideoCodec
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
-private val CardBg = Color(0xFF16171D)
-private val CardLine = Color(0xFF23252D)
-private val Field = Color(0xFF20222A)
-private val Ink = Color(0xFFE9EAEE)
-private val Sub = Color(0xFF8C8F9B)
-private val Faint = Color(0xFF5D606B)
+private val CardBg = Kit.Group
+private val CardLine = Kit.Hair
+private val Field = Kit.Raised
+private val Ink = Kit.Text
+private val Sub = Kit.Dim
+private val Faint = Kit.Faint
 private val Good = Color(0xFF4CD787)
 private val Blue = Color(0xFF6FA0FF)
 private val Dark = Color(0xFF15161C)
@@ -168,27 +168,42 @@ fun ExportScreen(vm: EditorViewModel) {
         ExportJob.reset()
         vm.exportOpen = false
     }
-    Box(Modifier.fillMaxSize().background(Palette.Bg).systemBarsPadding().pointerInput(Unit) { detectTapGestures { } }) {
+    Box(Modifier.fillMaxSize().background(Kit.Bg).systemBarsPadding().pointerInput(Unit) { detectTapGestures { } }) {
         if (ExportJob.phase != ExportJob.Phase.IDLE) {
             ExportProgress(vm)
             return@Box
         }
+        val problem = problem(s, enc)
+        val br = s.videoBitrate(meta.fps, enc)
+        val bytes = ((br.toDouble() + if (s.audio) s.audioBitrate else 0) * vm.totalUs / 1e6 / 8).toLong()
+        val outSpace = com.graden.editor.ColorSpaces.output(s.output)
         Column(Modifier.fillMaxSize()) {
-            // Header.
-            Row(Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(40.dp).clip(CircleShape).clickable { vm.exportOpen = false }, contentAlignment = Alignment.Center) {
-                    Icon(Lucide.X, "Close", tint = Ink, modifier = Modifier.size(20.dp))
-                }
-                Column(Modifier.weight(1f).padding(start = 6.dp)) {
-                    Text("Export", color = Ink, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-                    Text("${meta.name} · ${vm.tc(vm.totalUs)}", color = Sub, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-            }
+            KHeader("Export", "${meta.name} · ${vm.tc(vm.totalUs)}", onClose = { vm.exportOpen = false })
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-                // Presets.
-                SectionTitle("Presets", Modifier.padding(start = 16.dp))
+                // What will be written, at a glance.
+                KGroup {
+                    Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(64.dp), contentAlignment = Alignment.Center) {
+                            val a = (s.width.toFloat() / s.height.coerceAtLeast(1)).coerceIn(0.3f, 3.5f)
+                            val bw = if (a >= 1f) 58f else 58f * a
+                            val bh = if (a >= 1f) 58f / a else 58f
+                            Box(Modifier.size(bw.dp, bh.dp).clip(RoundedCornerShape(6.dp)).background(Brush.linearGradient(listOf(Color(0xFF3A2A1C), Color(0xFF1E1F26))))
+                                .border(1.5.dp, Kit.Accent, RoundedCornerShape(6.dp)))
+                        }
+                        Spacer(Modifier.width(14.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("${shortRes(s.width, s.height)} · ${fpsText(meta.fps)} fps", color = Kit.Text, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                            Text("${s.width} × ${s.height} · ${s.codec.label}" + (if (s.bitDepth == 10) " · 10-bit" else "") + (if (outSpace.hdr) " · HDR" else ""),
+                                color = Kit.Dim, fontSize = 13.sp, maxLines = 1)
+                            Text(if (s.quality == QualityMode.CONSTANT) "Size depends on the picture" else "About ${sizeText(bytes)} · ${s.container.ext.uppercase()}",
+                                color = Kit.Faint, fontSize = 12.sp, maxLines = 1)
+                        }
+                    }
+                }
+
+                KSection("Presets")
                 Row(
-                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp),
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
                     for (p in ExportPresets.builtIn) {
@@ -211,76 +226,12 @@ fun ExportScreen(vm: EditorViewModel) {
                     AddPresetCard { naming = true }
                 }
 
-                Card("File") {
-                    RowItem("Name") {
-                        BasicTextField(
-                            s.fileName, { v -> change { it.copy(fileName = v.replace(Regex("[\\\\/:*?\"<>|]"), "_")) } }, singleLine = true,
-                            textStyle = TextStyle(color = Ink, fontSize = 15.sp, textAlign = TextAlign.End), cursorBrush = SolidColor(Palette.Accent),
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                    }
-                    Divider()
-                    RowItem("Format") { Segments(Container.entries.map { if (it == Container.MOV) "MOV" else "MP4" }, Container.entries.indexOf(s.container)) { i -> change { it.copy(container = Container.entries[i]) } } }
-                    Divider()
-                    RowItem("Location") { ValueText("Movies / Graden") }
-                }
-
-                Card("Video") {
-                    RowItem("Codec") {
-                        Segments(VideoCodec.entries.map { it.label }, VideoCodec.entries.indexOf(s.codec)) { i ->
-                            val c = VideoCodec.entries[i]
-                            change { it.copy(codec = c, encoder = encoderFor(c), profile = 0) }
-                        }
-                    }
-                    Divider()
-                    val list = encoders.filter { it.codec == s.codec }
-                    Expandable("Encoder", {
-                        if (enc != null) Row(verticalAlignment = Alignment.CenterVertically) {
-                            Badge(if (enc.hardware) "HW" else "SW", if (enc.hardware) Good else Blue)
-                            Spacer(Modifier.width(8.dp))
-                            ValueText(enc.label.substringAfter("· "))
-                        } else ValueText("None", Palette.Danger)
-                    }) {
-                        if (list.isEmpty()) Text("This device has no ${s.codec.label} encoder.", color = Palette.Danger, fontSize = 13.sp, modifier = Modifier.padding(vertical = 8.dp))
-                        for (e in list) EncoderOption(e, e.name == enc?.name, e.supports(s.width, s.height, meta.fps)) {
-                            change {
-                                it.copy(
-                                    encoder = e.name, profile = 0, bitDepth = if (e.tenBit) it.bitDepth else 8,
-                                    quality = if (it.quality == QualityMode.CONSTANT && !e.supportsCq) QualityMode.AUTO_BEST else it.quality,
-                                    cq = if (e.soft) (if (it.cq in 0..51) it.cq else 18) else (e.qualityRange?.let { r -> it.cq.coerceIn(r.first, r.last) } ?: it.cq),
-                                )
-                            }
-                        }
-                    }
-                    if (enc?.tenBit == true) {
-                        Divider()
-                        RowItem("Bit depth") {
-                            Segments(listOf("8-bit", "10-bit"), if (s.bitDepth == 10) 1 else 0) { i -> change { it.copy(bitDepth = if (i == 1) 10 else 8, profile = 0) } }
-                        }
-                    }
-                    if (enc?.soft == true) {
-                        Divider()
-                        Column(Modifier.padding(vertical = 12.dp)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("Speed", color = Sub, fontSize = 14.sp, modifier = Modifier.weight(1f))
-                                Text(s.speedPreset, color = Ink, fontSize = 14.sp, fontFamily = MonoFont)
-                            }
-                            val speeds = listOf("ultrafast", "veryfast", "fast", "medium", "slow", "veryslow")
-                            Row(Modifier.padding(top = 10.dp).horizontalScroll(rememberScrollState())) {
-                                Segments(listOf("Fastest", "Very fast", "Fast", "Medium", "Slow", "Best"), speeds.indexOf(s.speedPreset).coerceAtLeast(0)) { i -> change { it.copy(speedPreset = speeds[i]) } }
-                            }
-                            Hint("Slower presets make smaller files at the same quality; the phone works harder")
-                        }
-                    }
-                    Divider()
+                KSection("Video")
+                KGroup {
                     val sizes = resolutionChoices(meta.width, meta.height)
                     val sizeName = sizes.firstOrNull { it.second == (s.width to s.height) }?.first ?: "Custom"
-                    Expandable("Resolution", {
-                        ValueText("${s.width} × ${s.height}", mono = true)
-                        Spacer(Modifier.width(8.dp))
-                        Badge(sizeName, Sub)
-                    }) {
-                        BoxWithConstraints {
+                    Expandable("Resolution", { KValue("$sizeName · ${s.width}×${s.height}") }) {
+                        BoxWithConstraints(Modifier.padding(horizontal = 16.dp)) {
                             val cols = 3
                             val gap = 8.dp
                             val w = (maxWidth - gap * (cols - 1)) / cols
@@ -295,53 +246,23 @@ fun ExportScreen(vm: EditorViewModel) {
                                 }
                             }
                         }
-                        Row(Modifier.padding(top = 12.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Text("Custom", color = Sub, fontSize = 13.sp, modifier = Modifier.width(64.dp))
+                        Row(Modifier.padding(start = 16.dp, end = 16.dp, top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Custom", color = Kit.Dim, fontSize = 13.sp, modifier = Modifier.width(64.dp))
                             NumberBox(s.width, Modifier.weight(1f)) { v -> change { it.copy(width = (v / 2 * 2).coerceIn(16, 16384)) } }
-                            Text("×", color = Sub, fontSize = 15.sp, modifier = Modifier.padding(horizontal = 10.dp))
+                            Text("×", color = Kit.Dim, fontSize = 15.sp, modifier = Modifier.padding(horizontal = 10.dp))
                             NumberBox(s.height, Modifier.weight(1f)) { v -> change { it.copy(height = (v / 2 * 2).coerceIn(16, 16384)) } }
                         }
                     }
-                    Divider()
-                    // Output colour space. HDR is offered only where this encoder can write 10-bit (and HDR10 metadata).
-                    val outSpace = com.graden.editor.ColorSpaces.output(s.output)
-                    val outs = com.graden.editor.ColorSpaces.outputs.filter {
-                        !it.hdr || hdrEncoderFor(s.codec, it) != null
-                    }
-                    Expandable("Colour", {
-                        ValueText(outSpace.name.replace(" Gamma ", " γ"))
-                        if (outSpace.hdr) { Spacer(Modifier.width(8.dp)); Badge("HDR", Palette.Accent) }
-                    }) {
-                        for (o in outs) ColourOption(o.name, o.note, o == outSpace, o.hdr) {
-                            hdrNote = null
-                            change { it.copy(output = o.name, bitDepth = if (o.hdr) 10 else it.bitDepth, profile = 0, encoder = (if (o.hdr) hdrEncoderFor(it.codec, o) else null) ?: it.encoder) }
-                        }
-                        hdrNote?.let { Hint(it) }
-                        if (hdrNote == null && com.graden.editor.ColorSpaces.outputs.any { it.hdr && it !in outs }) Hint(
-                            if (encoders.none { it.codec == s.codec && it.tenBit }) "HDR needs 10-bit encoding, which this phone's ${s.codec.label} encoder does not have" +
-                                (if (s.codec == VideoCodec.H264 && encoders.any { it.codec == VideoCodec.H265 && it.tenBit }) "; H.265 has it" else "")
-                            else "HDR10 needs an encoder that writes HDR10 metadata; this phone has none for ${s.codec.label}",
-                        )
-                        if (outSpace.hdr && !com.graden.editor.ColorSpaces.working(meta.workingSpace).log) Hint(
-                            "The project is graded in an SDR working space, so highlights are rolled off. For full HDR, set the working space to DaVinci Wide Gamut or ACEScct in project settings.",
-                        )
-                    }
-                    Divider()
-                    RowItem("Frame rate") {
-                        Icon(Lucide.Lock, null, tint = Faint, modifier = Modifier.size(14.dp))
-                        Spacer(Modifier.width(6.dp))
-                        ValueText("${fpsText(meta.fps)} fps", mono = true)
-                    }
-                    Divider()
+                    KDivider()
                     val modes = QualityMode.entries.filter { it != QualityMode.CONSTANT || enc?.supportsCq == true }
-                    Column(Modifier.padding(vertical = 12.dp)) {
+                    Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("Quality", color = Sub, fontSize = 14.sp, modifier = Modifier.weight(1f))
-                            Segments(modes.map { if (it == QualityMode.AUTO_BEST) "Best" else if (it == QualityMode.RESTRICT) "Bitrate" else "Constant" }, modes.indexOf(s.quality).coerceAtLeast(0)) { i ->
+                            Text("Quality", color = Kit.Text, fontSize = 15.sp, modifier = Modifier.weight(1f))
+                            KSegmented(modes.map { if (it == QualityMode.AUTO_BEST) "Best" else if (it == QualityMode.RESTRICT) "Bitrate" else "Constant" },
+                                modes.indexOf(s.quality).coerceAtLeast(0), Modifier.width(if (modes.size == 3) 230.dp else 160.dp)) { i ->
                                 change { it.copy(quality = modes[i], bitrate = if (modes[i] == QualityMode.RESTRICT && it.quality != QualityMode.RESTRICT) it.videoBitrate(meta.fps, enc) else it.bitrate) }
                             }
                         }
-                        val br = s.videoBitrate(meta.fps, enc)
                         when (s.quality) {
                             QualityMode.AUTO_BEST -> Hint(
                                 (if (s.sourceFloor > ExportSettings.autoBest(s.codec, s.width, s.height, meta.fps))
@@ -355,7 +276,7 @@ fun ExportScreen(vm: EditorViewModel) {
                                     ValueSlider((s.bitrate / 1_000_000).coerceIn(1, max), 1, max, Modifier.weight(1f)) { v -> change { it.copy(bitrate = v * 1_000_000) } }
                                     Spacer(Modifier.width(12.dp))
                                     NumberBox(s.bitrate / 1_000_000, Modifier.width(72.dp)) { v -> change { it.copy(bitrate = v.coerceIn(1, max) * 1_000_000) } }
-                                    Text(" Mbps", color = Sub, fontSize = 13.sp)
+                                    Text(" Mbps", color = Kit.Dim, fontSize = 13.sp)
                                 }
                                 Hint("Up to $max Mbps on this encoder")
                             }
@@ -371,85 +292,152 @@ fun ExportScreen(vm: EditorViewModel) {
                             }
                         }
                     }
-                }
-
-                Card("Advanced", collapsible = true) {
-                    if (s.quality != QualityMode.CONSTANT) {
-                        val rates = RateMode.entries.filter { (it == RateMode.VBR && enc?.supportsVbr != false) || (it == RateMode.CBR && enc?.supportsCbr != false) }
-                        RowItem("Rate control") { Segments(rates.map { if (it == RateMode.VBR) "VBR" else "CBR" }, rates.indexOf(s.rateMode).coerceAtLeast(0)) { i -> change { it.copy(rateMode = rates[i]) } } }
-                        Divider()
-                    }
-                    val profiles = enc?.profiles.orEmpty().filter { it.tenBit == (s.bitDepth == 10) }
-                    RowItem("Profile") {
-                        Segments(listOf("Auto") + profiles.map { it.label }, if (s.profile == 0) 0 else profiles.indexOfFirst { it.value == s.profile } + 1) { i ->
-                            change { it.copy(profile = if (i == 0) 0 else profiles[i - 1].value) }
+                    KDivider()
+                    KRow("Codec") {
+                        KSegmented(VideoCodec.entries.map { it.label }, VideoCodec.entries.indexOf(s.codec), Modifier.width((VideoCodec.entries.size * 70).dp)) { i ->
+                            val c = VideoCodec.entries[i]
+                            change { it.copy(codec = c, encoder = encoderFor(c), profile = 0) }
                         }
                     }
-                    Divider()
-                    RowItem("Keyframes") {
-                        if (s.keyframeEvery > 0) {
-                            NumberBox(s.keyframeEvery, Modifier.width(64.dp)) { v -> change { it.copy(keyframeEvery = v.coerceIn(1, 1000)) } }
-                            Text(" fr  ", color = Sub, fontSize = 13.sp)
-                        }
-                        Segments(listOf("Auto", "Every"), if (s.keyframeEvery == 0) 0 else 1) { i -> change { it.copy(keyframeEvery = if (i == 0) 0 else meta.fps.roundToInt().coerceAtLeast(1)) } }
+                    KDivider()
+                    KRow("Frame rate", "Set by the project") {
+                        Icon(Lucide.Lock, null, tint = Kit.Faint, modifier = Modifier.size(14.dp))
+                        Spacer(Modifier.width(6.dp))
+                        KValue("${fpsText(meta.fps)} fps")
                     }
-                    Divider()
-                    RowItem("Working space") { ValueText(com.graden.editor.ColorSpaces.working(meta.workingSpace).name) }
                 }
 
-                Card("Audio") {
-                    RowItem("Export audio") { Toggle(s.audio) { v -> change { it.copy(audio = v) } } }
+                KSection("Audio")
+                KGroup {
+                    KRow("Include sound") { KToggle(s.audio) { v -> change { it.copy(audio = v) } } }
                     AnimatedVisibility(s.audio, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                         Column {
-                            Divider()
-                            RowItem("Codec") { ValueText("AAC · 48 kHz · Stereo") }
-                            Divider()
+                            KDivider()
                             val rates = listOf(128_000, 192_000, 256_000, 320_000)
-                            RowItem("Bitrate") { Segments(rates.map { "${it / 1000}" }, rates.indexOf(s.audioBitrate).coerceAtLeast(0)) { i -> change { it.copy(audioBitrate = rates[i]) } } }
-                            Divider()
-                            RowItem("Normalise", "To %.0f LUFS · EBU R128".format(s.loudnessTarget)) { Toggle(s.normalizeLoudness) { v -> change { it.copy(normalizeLoudness = v) } } }
+                            KRow("Bitrate", "AAC · 48 kHz · stereo") {
+                                KSegmented(rates.map { "${it / 1000}" }, rates.indexOf(s.audioBitrate).coerceAtLeast(0), Modifier.width(200.dp)) { i -> change { it.copy(audioBitrate = rates[i]) } }
+                            }
+                            KDivider()
+                            KRow("Even out loudness", "To %.0f LUFS, as the platforms measure it".format(s.loudnessTarget)) { KToggle(s.normalizeLoudness) { v -> change { it.copy(normalizeLoudness = v) } } }
                         }
                     }
+                }
+
+                KSection("File")
+                KGroup {
+                    KRow("Name") {
+                        BasicTextField(
+                            s.fileName, { v -> change { it.copy(fileName = v.replace(Regex("[\\\\/:*?\"<>|]"), "_")) } }, singleLine = true,
+                            textStyle = TextStyle(color = Kit.Text, fontSize = 15.sp, textAlign = TextAlign.End), cursorBrush = SolidColor(Kit.Accent),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    KDivider()
+                    KRow("Format") {
+                        KSegmented(Container.entries.map { if (it == Container.MOV) "MOV" else "MP4" }, Container.entries.indexOf(s.container), Modifier.width(140.dp)) { i ->
+                            change { it.copy(container = Container.entries[i]) }
+                        }
+                    }
+                    KDivider()
+                    KRow("Saved to") { KValue("Movies / Graden") }
+                }
+
+                KSection("Advanced")
+                KFold("Encoder and colour", "${enc?.label?.substringAfter("· ") ?: "No encoder"} · ${s.bitDepth}-bit · ${outSpace.name.replace(" Gamma ", " γ")}") {
+                    val list = encoders.filter { it.codec == s.codec }
+                    FoldTitle("Encoder")
+                    if (list.isEmpty()) Text("This device has no ${s.codec.label} encoder.", color = Kit.Bad, fontSize = 13.sp, modifier = Modifier.padding(16.dp))
+                    for (e in list) EncoderOption(e, e.name == enc?.name, e.supports(s.width, s.height, meta.fps)) {
+                        change {
+                            it.copy(
+                                encoder = e.name, profile = 0, bitDepth = if (e.tenBit) it.bitDepth else 8,
+                                quality = if (it.quality == QualityMode.CONSTANT && !e.supportsCq) QualityMode.AUTO_BEST else it.quality,
+                                cq = if (e.soft) (if (it.cq in 0..51) it.cq else 18) else (e.qualityRange?.let { r -> it.cq.coerceIn(r.first, r.last) } ?: it.cq),
+                            )
+                        }
+                    }
+                    if (enc?.tenBit == true) {
+                        KDivider(0.dp)
+                        KRow("Bit depth") {
+                            KSegmented(listOf("8-bit", "10-bit"), if (s.bitDepth == 10) 1 else 0, Modifier.width(150.dp)) { i -> change { it.copy(bitDepth = if (i == 1) 10 else 8, profile = 0) } }
+                        }
+                    }
+                    if (enc?.soft == true) {
+                        KDivider(0.dp)
+                        Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("Speed", color = Kit.Text, fontSize = 15.sp, modifier = Modifier.weight(1f))
+                                Text(s.speedPreset, color = Kit.Dim, fontSize = 14.sp, fontFamily = MonoFont)
+                            }
+                            val speeds = listOf("ultrafast", "veryfast", "fast", "medium", "slow", "veryslow")
+                            Row(Modifier.padding(top = 10.dp).horizontalScroll(rememberScrollState())) {
+                                Segments(listOf("Fastest", "Very fast", "Fast", "Medium", "Slow", "Best"), speeds.indexOf(s.speedPreset).coerceAtLeast(0)) { i -> change { it.copy(speedPreset = speeds[i]) } }
+                            }
+                            Hint("Slower presets make smaller files at the same quality; the phone works harder")
+                        }
+                    }
+                    // Output colour space. HDR is offered only where this encoder can write 10-bit (and HDR10 metadata).
+                    KDivider(0.dp)
+                    FoldTitle("Colour")
+                    val outs = com.graden.editor.ColorSpaces.outputs.filter { !it.hdr || hdrEncoderFor(s.codec, it) != null }
+                    for (o in outs) KOption(o.name, o.note, o == outSpace, badge = { KBadge(if (o.hdr) "HDR" else "SDR", if (o.hdr) Kit.Accent else Kit.Dim) }) {
+                        hdrNote = null
+                        change { it.copy(output = o.name, bitDepth = if (o.hdr) 10 else it.bitDepth, profile = 0, encoder = (if (o.hdr) hdrEncoderFor(it.codec, o) else null) ?: it.encoder) }
+                    }
+                    Column(Modifier.padding(horizontal = 16.dp)) {
+                        hdrNote?.let { Hint(it) }
+                        if (hdrNote == null && com.graden.editor.ColorSpaces.outputs.any { it.hdr && it !in outs }) Hint(
+                            if (encoders.none { it.codec == s.codec && it.tenBit }) "HDR needs 10-bit encoding, which this phone's ${s.codec.label} encoder does not have" +
+                                (if (s.codec == VideoCodec.H264 && encoders.any { it.codec == VideoCodec.H265 && it.tenBit }) "; H.265 has it" else "")
+                            else "HDR10 needs an encoder that writes HDR10 metadata; this phone has none for ${s.codec.label}",
+                        )
+                        if (outSpace.hdr && !com.graden.editor.ColorSpaces.working(meta.workingSpace).log) Hint(
+                            "The project is graded in an SDR working space, so highlights are rolled off. For full HDR, set the working space to DaVinci Wide Gamut or ACEScct in project settings.",
+                        )
+                    }
+                    KDivider(0.dp)
+                    if (s.quality != QualityMode.CONSTANT) {
+                        val rates = RateMode.entries.filter { (it == RateMode.VBR && enc?.supportsVbr != false) || (it == RateMode.CBR && enc?.supportsCbr != false) }
+                        KRow("Rate control") { KSegmented(rates.map { if (it == RateMode.VBR) "VBR" else "CBR" }, rates.indexOf(s.rateMode).coerceAtLeast(0), Modifier.width(130.dp)) { i -> change { it.copy(rateMode = rates[i]) } } }
+                        KDivider()
+                    }
+                    val profiles = enc?.profiles.orEmpty().filter { it.tenBit == (s.bitDepth == 10) }
+                    Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                        Text("Profile", color = Kit.Text, fontSize = 15.sp)
+                        Row(Modifier.padding(top = 8.dp).horizontalScroll(rememberScrollState())) {
+                            Segments(listOf("Auto") + profiles.map { it.label }, if (s.profile == 0) 0 else profiles.indexOfFirst { it.value == s.profile } + 1) { i ->
+                                change { it.copy(profile = if (i == 0) 0 else profiles[i - 1].value) }
+                            }
+                        }
+                    }
+                    KDivider()
+                    KRow("Keyframes") {
+                        if (s.keyframeEvery > 0) {
+                            NumberBox(s.keyframeEvery, Modifier.width(64.dp)) { v -> change { it.copy(keyframeEvery = v.coerceIn(1, 1000)) } }
+                            Text(" fr  ", color = Kit.Dim, fontSize = 13.sp)
+                        }
+                        KSegmented(listOf("Auto", "Every"), if (s.keyframeEvery == 0) 0 else 1, Modifier.width(130.dp)) { i -> change { it.copy(keyframeEvery = if (i == 0) 0 else meta.fps.roundToInt().coerceAtLeast(1)) } }
+                    }
+                    KDivider()
+                    KRow("Working space", "Set in project settings") { KValue(com.graden.editor.ColorSpaces.working(meta.workingSpace).name) }
                 }
                 Spacer(Modifier.height(24.dp))
             }
-            // What will be written, and Render.
-            val problem = problem(s, enc)
-            Column(Modifier.fillMaxWidth().background(Color(0xFF111217))) {
-                Box(Modifier.fillMaxWidth().height(1.dp).background(CardLine))
-                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        if (problem != null) Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Lucide.Alert, null, tint = Palette.Danger, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text(problem, color = Palette.Danger, fontSize = 12.sp, maxLines = 3, lineHeight = 15.sp)
-                        } else {
-                            val br = s.videoBitrate(meta.fps, enc)
-                            val bytes = ((br.toDouble() + if (s.audio) s.audioBitrate else 0) * vm.totalUs / 1e6 / 8).toLong()
-                            Text(
-                                "${s.codec.label} · ${s.width}×${s.height} · ${fpsText(meta.fps)} fps" + if (s.bitDepth == 10) " · 10-bit" else "",
-                                color = Ink, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1,
-                            )
-                            Text(
-                                (if (enc?.soft == true) "${enc.name} · " else "") +
-                                    (if (s.quality == QualityMode.CONSTANT) (if (enc?.soft == true) "CRF ${s.cq}" else "Constant quality") else "%.0f Mbps · ≈ %s".format(br / 1e6, sizeText(bytes))) +
-                                    " · ${s.container.ext.uppercase()}",
-                                color = Sub, fontSize = 12.sp, maxLines = 1,
-                            )
-                        }
-                    }
-                    Spacer(Modifier.width(12.dp))
-                    val ok = problem == null && enc != null
-                    Box(
-                        Modifier.height(48.dp).clip(RoundedCornerShape(14.dp))
-                            .background(if (ok) Brush.verticalGradient(listOf(Color(0xFFF59A45), Palette.Accent)) else SolidColor(Field))
-                            .clickable(enabled = ok) {
-                                if (Build.VERSION.SDK_INT >= 33) notifyAsk.launch(Manifest.permission.POST_NOTIFICATIONS)
-                                vm.pause()
-                                ExportJob.start(context, vm.exportProject(s.output), s, enc!!)
-                            }.padding(horizontal = 26.dp),
-                        contentAlignment = Alignment.Center,
-                    ) { Text("Render", color = if (ok) Dark else Faint, fontSize = 16.sp, fontWeight = FontWeight.Bold) }
+            // The action, with what it will write, or why it can't.
+            Column(Modifier.fillMaxWidth().background(Kit.Bg).padding(horizontal = 16.dp, vertical = 10.dp)) {
+                if (problem != null) Row(Modifier.padding(bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Lucide.Alert, null, tint = Kit.Bad, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(problem, color = Kit.Bad, fontSize = 12.sp, maxLines = 3, lineHeight = 15.sp)
+                }
+                val ok = problem == null && enc != null
+                KPrimary(
+                    "Export", enabled = ok,
+                    sub = "${s.codec.label} · ${s.width}×${s.height}" + if (s.quality == QualityMode.CONSTANT) (if (enc?.soft == true) " · CRF ${s.cq}" else " · constant quality") else " · %.0f Mbps · ≈ %s".format(br / 1e6, sizeText(bytes)),
+                ) {
+                    if (Build.VERSION.SDK_INT >= 33) notifyAsk.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    vm.pause()
+                    ExportJob.start(context, vm.exportProject(s.output), s, enc!!)
                 }
             }
         }
@@ -460,6 +448,11 @@ fun ExportScreen(vm: EditorViewModel) {
             naming = false
         }
     }
+}
+
+@Composable
+private fun FoldTitle(t: String) {
+    Text(t.uppercase(), color = Kit.Dim, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 1.sp, modifier = Modifier.padding(start = 16.dp, top = 14.dp, bottom = 2.dp))
 }
 
 /** Why the current settings cannot be rendered on this device, or null if they can. */
@@ -520,110 +513,110 @@ private fun ExportProgress(vm: EditorViewModel) {
     }
     val elapsed = ((if (ExportJob.running) now else endedAt) - ExportJob.startedAt).coerceAtLeast(0) / 1000
     val progress by animateFloatAsState(ExportJob.progress.coerceIn(0f, 1f), label = "progress")
-    val aspect = ((s?.width ?: 16).toFloat() / (s?.height ?: 9)).coerceIn(0.5f, 2.4f)
+    val aspect = ((s?.width ?: 16).toFloat() / (s?.height ?: 9)).coerceIn(0.3f, 3.5f)
 
-    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-        Row(Modifier.fillMaxWidth().height(56.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text(
-                    when (phase) {
-                        ExportJob.Phase.DONE -> "Export complete"
-                        ExportJob.Phase.FAILED -> "Export failed"
-                        ExportJob.Phase.CANCELLED -> "Export cancelled"
-                        else -> "Exporting"
-                    },
-                    color = Ink, fontSize = 18.sp, fontWeight = FontWeight.SemiBold,
-                )
-                Text("${s?.fileName ?: ""}.${s?.container?.ext ?: ""}", color = Sub, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-        }
-        // The frame being rendered (the last one, when finished).
-        Box(
-            Modifier.fillMaxWidth().aspectRatio(aspect).clip(RoundedCornerShape(16.dp)).background(Color.Black).border(1.dp, CardLine, RoundedCornerShape(16.dp)),
-            contentAlignment = Alignment.Center,
-        ) {
-            ExportJob.preview?.let { Image(it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
-                ?: Text(if (phase == ExportJob.Phase.AUDIO) "Mixing sound…" else "", color = Sub, fontSize = 13.sp)
-            if (phase == ExportJob.Phase.VIDEO && ExportJob.framesDone > 0) Text(
-                vm.tc((ExportJob.framesDone / ExportJob.fps * 1e6).toLong()), color = Ink, fontSize = 12.sp, fontFamily = MonoFont,
-                modifier = Modifier.align(Alignment.BottomStart).padding(10.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xB3000000)).padding(horizontal = 7.dp, vertical = 3.dp),
-            )
-            if (phase == ExportJob.Phase.DONE) Box(
-                Modifier.size(64.dp).clip(CircleShape).background(Color(0xCC15161C)), contentAlignment = Alignment.Center,
-            ) { Icon(Lucide.Check, null, tint = Good, modifier = Modifier.size(34.dp)) }
-        }
-        Spacer(Modifier.height(18.dp))
-        Steps(phase)
-        Spacer(Modifier.height(18.dp))
-
-        when (phase) {
-            ExportJob.Phase.DONE -> {
-                Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(CardBg).border(1.dp, CardLine, RoundedCornerShape(14.dp)).padding(16.dp)) {
-                    Text(ExportJob.resultName, color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "${sizeText(ExportJob.resultBytes)} · ${s?.codec?.label} · ${s?.width}×${s?.height} · ${fpsText(ExportJob.fps)} fps",
-                        color = Sub, fontSize = 13.sp,
-                    )
-                    Text("Movies / Graden · rendered in ${clock(elapsed)}", color = Faint, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp))
-                }
-            }
-            ExportJob.Phase.FAILED, ExportJob.Phase.CANCELLED -> {
-                if (phase == ExportJob.Phase.FAILED) Row(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0x22E5484D)).padding(14.dp), verticalAlignment = Alignment.Top,
+    Column(Modifier.fillMaxSize()) {
+        KHeader(
+            when (phase) {
+                ExportJob.Phase.DONE -> "Export complete"
+                ExportJob.Phase.FAILED -> "Export failed"
+                ExportJob.Phase.CANCELLED -> "Export cancelled"
+                else -> "Exporting"
+            },
+            "${s?.fileName ?: ""}.${s?.container?.ext ?: ""}",
+        )
+        // Everything but the buttons scrolls if it must; the picture never takes more than its share of the height,
+        // so a tall (9:16) export leaves the progress in view.
+        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+            val maxH = maxHeight * 0.38f
+            val maxW = maxWidth - 32.dp
+            val boxW = if (maxW / aspect > maxH) maxH * aspect else maxW
+            val boxH = boxW / aspect
+            Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Box(
+                    Modifier.padding(top = 4.dp).size(boxW, boxH).clip(RoundedCornerShape(18.dp)).background(Color.Black).border(1.dp, Kit.Hair, RoundedCornerShape(18.dp)),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Icon(Lucide.Alert, null, tint = Palette.Danger, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(10.dp))
-                    Text(ExportJob.error ?: "Something went wrong", color = Ink, fontSize = 13.sp, lineHeight = 18.sp)
+                    ExportJob.preview?.let { Image(it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
+                        ?: Text(if (phase == ExportJob.Phase.AUDIO) "Mixing sound…" else "", color = Kit.Dim, fontSize = 13.sp)
+                    if (phase == ExportJob.Phase.VIDEO && ExportJob.framesDone > 0) Text(
+                        vm.tc((ExportJob.framesDone / ExportJob.fps * 1e6).toLong()), color = Ink, fontSize = 12.sp, fontFamily = MonoFont,
+                        modifier = Modifier.align(Alignment.BottomStart).padding(10.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xB3000000)).padding(horizontal = 7.dp, vertical = 3.dp),
+                    )
+                    if (phase == ExportJob.Phase.DONE) Box(
+                        Modifier.size(64.dp).clip(CircleShape).background(Color(0xCC15161C)), contentAlignment = Alignment.Center,
+                    ) { Icon(Lucide.Check, null, tint = Good, modifier = Modifier.size(34.dp)) }
                 }
-                else Text("Nothing was saved.", color = Sub, fontSize = 13.sp)
-            }
-            else -> {
-                Row(verticalAlignment = Alignment.Bottom) {
-                    Text("%d%%".format((progress * 100).toInt()), color = Ink, fontSize = 34.sp, fontWeight = FontWeight.SemiBold, fontFamily = MonoFont)
-                    Spacer(Modifier.weight(1f))
-                    if (phase == ExportJob.Phase.VIDEO && ExportJob.etaSec >= 0) Text("${clock(ExportJob.etaSec.toLong())} left", color = Sub, fontSize = 14.sp, modifier = Modifier.padding(bottom = 6.dp))
-                }
-                Spacer(Modifier.height(8.dp))
-                Box(Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(50)).background(Field)) {
-                    Box(Modifier.fillMaxWidth(progress).height(6.dp).clip(RoundedCornerShape(50)).background(Brush.horizontalGradient(listOf(Color(0xFFF59A45), Palette.Accent))))
-                }
-                Spacer(Modifier.height(16.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Stat("Elapsed", clock(elapsed), Modifier.weight(1f))
-                    Stat("Speed", if (ExportJob.speed > 0f) "%.1f fps".format(ExportJob.speed) else "–", Modifier.weight(1f))
-                    Stat("Frames", if (ExportJob.framesTotal > 0) "${ExportJob.framesDone}/${ExportJob.framesTotal}" else "–", Modifier.weight(1f))
-                }
-                // Stabilisation: how long it took to prepare, and how fast the stabilised frames render.
-                if (ExportJob.stabClips > 0) {
-                    Spacer(Modifier.height(10.dp))
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Stat("Stabilise prep", if (ExportJob.stabPrepMs < 1000) "${ExportJob.stabPrepMs} ms" else "%.1f s".format(ExportJob.stabPrepMs / 1000f), Modifier.weight(1f))
-                        Stat("Stabilised render", if (ExportJob.stabFps > 0f) "%.1f fps".format(ExportJob.stabFps) else "–", Modifier.weight(1f))
-                        Stat("Stabilised", "${ExportJob.stabFrames} fr", Modifier.weight(1f))
+                Spacer(Modifier.height(20.dp))
+                Steps(phase)
+                Spacer(Modifier.height(18.dp))
+                when (phase) {
+                    ExportJob.Phase.DONE -> {
+                        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Kit.Group).padding(16.dp)) {
+                            Text(ExportJob.resultName, color = Ink, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Spacer(Modifier.height(4.dp))
+                            Text("${sizeText(ExportJob.resultBytes)} · ${s?.codec?.label} · ${s?.width}×${s?.height} · ${fpsText(ExportJob.fps)} fps", color = Sub, fontSize = 13.sp)
+                            Text("Movies / Graden · made in ${clock(elapsed)}", color = Faint, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp))
+                        }
+                    }
+                    ExportJob.Phase.FAILED, ExportJob.Phase.CANCELLED -> {
+                        if (phase == ExportJob.Phase.FAILED) Row(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Color(0x22E5484D)).padding(14.dp), verticalAlignment = Alignment.Top,
+                        ) {
+                            Icon(Lucide.Alert, null, tint = Kit.Bad, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(10.dp))
+                            Text(ExportJob.error ?: "Something went wrong", color = Ink, fontSize = 13.sp, lineHeight = 18.sp)
+                        }
+                        else Text("Nothing was saved.", color = Sub, fontSize = 13.sp)
+                    }
+                    else -> {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
+                            Text("%d%%".format((progress * 100).toInt()), color = Ink, fontSize = 40.sp, fontWeight = FontWeight.Bold, letterSpacing = (-1).sp)
+                            Spacer(Modifier.weight(1f))
+                            if (phase == ExportJob.Phase.VIDEO && ExportJob.etaSec >= 0) Text("${clock(ExportJob.etaSec.toLong())} left", color = Sub, fontSize = 14.sp, modifier = Modifier.padding(bottom = 8.dp))
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Box(Modifier.fillMaxWidth().height(8.dp).clip(CircleShape).background(Kit.Raised)) {
+                            Box(Modifier.fillMaxWidth(progress).height(8.dp).clip(CircleShape).background(Kit.Primary))
+                        }
+                        Spacer(Modifier.height(16.dp))
+                        Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Kit.Group).padding(vertical = 12.dp)) {
+                            Stat("Elapsed", clock(elapsed), Modifier.weight(1f))
+                            Stat("Speed", if (ExportJob.speed > 0f) "%.1f fps".format(ExportJob.speed) else "–", Modifier.weight(1f))
+                            Stat("Frames", if (ExportJob.framesTotal > 0) "${ExportJob.framesDone}/${ExportJob.framesTotal}" else "–", Modifier.weight(1f))
+                        }
+                        // Stabilisation: how long it took to prepare, and how fast the stabilised frames render.
+                        if (ExportJob.stabClips > 0) {
+                            Spacer(Modifier.height(10.dp))
+                            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Kit.Group).padding(vertical = 12.dp)) {
+                                Stat("Stabilise prep", if (ExportJob.stabPrepMs < 1000) "${ExportJob.stabPrepMs} ms" else "%.1f s".format(ExportJob.stabPrepMs / 1000f), Modifier.weight(1f))
+                                Stat("Stabilised", if (ExportJob.stabFps > 0f) "%.1f fps".format(ExportJob.stabFps) else "–", Modifier.weight(1f))
+                                Stat("Frames", "${ExportJob.stabFrames}", Modifier.weight(1f))
+                            }
+                        }
+                        if (ExportJob.speed > 0f) Text(
+                            "%.2f× real time · %s".format(ExportJob.speed / ExportJob.fps, s?.let { "${it.codec.label} · ${it.width}×${it.height}" } ?: ""),
+                            color = Faint, fontSize = 12.sp, modifier = Modifier.padding(top = 10.dp),
+                        )
                     }
                 }
-                if (ExportJob.speed > 0f) Text(
-                    "%.2f× real time · %s".format(ExportJob.speed / ExportJob.fps, s?.let { "${it.codec.label} · ${it.width}×${it.height}" } ?: ""),
-                    color = Faint, fontSize = 12.sp, modifier = Modifier.padding(top = 10.dp),
-                )
+                Spacer(Modifier.height(16.dp))
             }
         }
-        Spacer(Modifier.weight(1f))
-        Row(Modifier.fillMaxWidth().padding(bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             if (ExportJob.running) {
-                WideButton(if (cancelArmed) "Tap again to cancel" else "Cancel", if (cancelArmed) ButtonKind.Danger else ButtonKind.Plain, Modifier.weight(1f)) {
+                KSecondary(if (cancelArmed) "Tap again to cancel" else "Cancel", Modifier.weight(1f), danger = cancelArmed) {
                     if (cancelArmed) ExportJob.cancel() else cancelArmed = true
                 }
             } else if (phase == ExportJob.Phase.DONE) {
-                WideButton("Play", ButtonKind.Plain, Modifier.weight(1f), Lucide.Play) {
+                KSecondary("Play", Modifier.weight(1f), Lucide.Play) {
                     ExportJob.result?.let { u ->
                         runCatching {
                             context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(u, ExportJob.settings?.container?.mime ?: "video/*").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
                         }
                     }
                 }
-                WideButton("Share", ButtonKind.Plain, Modifier.weight(1f), Lucide.Share) {
+                KSecondary("Share", Modifier.weight(1f), Lucide.Share) {
                     ExportJob.result?.let { u ->
                         runCatching {
                             context.startActivity(
@@ -632,12 +625,12 @@ private fun ExportProgress(vm: EditorViewModel) {
                         }
                     }
                 }
-                WideButton("Done", ButtonKind.Primary, Modifier.weight(1f)) {
+                KPrimary("Done", Modifier.weight(1f)) {
                     ExportJob.reset()
                     vm.exportOpen = false
                 }
             } else {
-                WideButton("Back to settings", ButtonKind.Primary, Modifier.weight(1f)) { ExportJob.reset() }
+                KPrimary("Back to settings", Modifier.weight(1f)) { ExportJob.reset() }
             }
         }
     }
@@ -673,9 +666,9 @@ private fun Steps(phase: ExportJob.Phase) {
 
 @Composable
 private fun Stat(label: String, value: String, modifier: Modifier) {
-    Column(modifier.clip(RoundedCornerShape(12.dp)).background(CardBg).border(1.dp, CardLine, RoundedCornerShape(12.dp)).padding(horizontal = 12.dp, vertical = 10.dp)) {
-        Text(label, color = Sub, fontSize = 11.sp)
-        Text(value, color = Ink, fontSize = 15.sp, fontFamily = MonoFont, fontWeight = FontWeight.Medium, maxLines = 1)
+    Column(modifier.padding(horizontal = 14.dp), horizontalAlignment = Alignment.Start) {
+        Text(label, color = Sub, fontSize = 11.5.sp, maxLines = 1)
+        Text(value, color = Ink, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
     }
 }
 
@@ -747,8 +740,8 @@ private fun RowItem(label: String, note: String? = null, value: @Composable () -
 private fun Expandable(label: String, value: @Composable () -> Unit, content: @Composable ColumnScope.() -> Unit) {
     var open by remember { mutableStateOf(false) }
     val turn by animateFloatAsState(if (open) 90f else 0f, label = "chev")
-    Row(Modifier.fillMaxWidth().heightIn(min = 54.dp).clickable { open = !open }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(label, color = Sub, fontSize = 14.sp, modifier = Modifier.padding(end = 12.dp))
+    Row(Modifier.fillMaxWidth().heightIn(min = 54.dp).clickable { open = !open }.padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = Ink, fontSize = 15.sp, modifier = Modifier.padding(end = 12.dp))
         Row(Modifier.weight(1f), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) { value() }
         Icon(Lucide.ChevronRight, null, tint = Faint, modifier = Modifier.padding(start = 8.dp).size(16.dp).rotate(turn))
     }
@@ -871,7 +864,7 @@ private fun ColourOption(name: String, note: String, on: Boolean, hdr: Boolean, 
 @Composable
 private fun EncoderOption(e: EncoderInfo, on: Boolean, fits: Boolean, onClick: () -> Unit) {
     Row(
-        Modifier.fillMaxWidth().padding(top = 8.dp).clip(RoundedCornerShape(12.dp)).background(if (on) Color(0xFF2B2016) else Field)
+        Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp).clip(RoundedCornerShape(12.dp)).background(if (on) Color(0xFF2B2016) else Field)
             .border(1.dp, if (on) Palette.Accent else Color.Transparent, RoundedCornerShape(12.dp)).clickable(onClick = onClick).padding(12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

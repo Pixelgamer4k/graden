@@ -1,0 +1,54 @@
+diff --git a/include/audiocpp.h b/include/audiocpp.h
+index d13e6f9..5b9384c 100644
+--- a/include/audiocpp.h
++++ b/include/audiocpp.h
+@@ -408,6 +408,12 @@ AUDIOCPP_API audiocpp_status audiocpp_result_text(const audiocpp_result * result
+                                                   const char ** out_text,
+                                                   const char ** out_language);
+ 
++/* Graden: a family's structured output (audio classification scores, ...) as
++ * JSON {"schema":..., "data":...}. AUDIOCPP_ERR_NOT_AVAILABLE when there is
++ * none. Borrowed until this thread's next call. */
++AUDIOCPP_API audiocpp_status audiocpp_result_custom_json(const audiocpp_result * result,
++                                                         const char ** out_json);
++
+ AUDIOCPP_API size_t          audiocpp_result_segment_count(const audiocpp_result * result);
+ AUDIOCPP_API audiocpp_status audiocpp_result_segment(const audiocpp_result * result,
+                                                      size_t index,
+diff --git a/src/capi/audiocpp.cpp b/src/capi/audiocpp.cpp
+index 1e09831..d53ff58 100644
+--- a/src/capi/audiocpp.cpp
++++ b/src/capi/audiocpp.cpp
+@@ -21,6 +21,7 @@
+ #include "engine/framework/runtime/model.h"
+ #include "engine/framework/runtime/registry.h"
+ #include "engine/framework/runtime/session.h"
++#include "engine/framework/io/json.h"
+ 
+ #include <cstddef>
+ #include <cstdint>
+@@ -955,6 +956,24 @@ audiocpp_status audiocpp_result_text(const audiocpp_result * result,
+     return AUDIOCPP_OK;
+ }
+ 
++audiocpp_status audiocpp_result_custom_json(const audiocpp_result * result, const char ** out_json) {
++    if (result == nullptr) {
++        return fail(AUDIOCPP_ERR_INVALID_ARGUMENT, "result must be non-null");
++    }
++    if (!result->result.custom_schema_output.has_value()) {
++        return fail(AUDIOCPP_ERR_NOT_AVAILABLE, "result carries no custom schema output");
++    }
++    try {
++        thread_local std::string json;
++        json = "{\"schema\":" + engine::io::json::stringify_string(result->result.custom_schema_output->schema) +
++               ",\"data\":" + engine::io::json::stringify(result->result.custom_schema_output->data) + "}";
++        if (out_json != nullptr) *out_json = json.c_str();
++        return AUDIOCPP_OK;
++    } catch (const std::exception & e) {
++        return fail(AUDIOCPP_ERR_RUNTIME, e.what());
++    }
++}
++
+ size_t audiocpp_result_segment_count(const audiocpp_result * result) {
+     return result != nullptr ? result->result.speech_segments.size() : 0;
+ }

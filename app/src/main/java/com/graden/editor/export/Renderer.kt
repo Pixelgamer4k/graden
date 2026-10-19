@@ -426,6 +426,8 @@ class Compositor(private val context: Context, private val project: ExportProjec
     private val looks = com.graden.editor.GradeTextures()
     private var copyProg = 0
     private var fillProg = 0
+    /** Captions: the caption picture drawn over the frame, taken from Rec.709 into the delivery space as solid colours are. */
+    private var captionProg = 0
     private val quad: FloatBuffer = ByteBuffer.allocateDirect(32).order(ByteOrder.nativeOrder()).asFloatBuffer().apply { put(floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)); position(0) }
 
     /** Canvas inside the output (the same unless the output's shape differs from the project's: then it is fitted). */
@@ -599,6 +601,9 @@ class Compositor(private val context: Context, private val project: ExportProjec
         packProg = link(COPY_VERTEX, PACK_FRAGMENT)
         fillProg = link(COPY_VERTEX, "precision highp float;\nuniform vec4 uColor;\n" + com.graden.editor.ColorSpaces.GLSL + com.graden.editor.ColorPipe.GLSL +
             "\nvoid main() { gl_FragColor = vec4(clamp(xform(uColor.rgb, uXf[2], uXf[3], uXfY[1], uFinM), 0.0, 1.0), 1.0); }\n")
+        captionProg = link(COPY_VERTEX, "precision highp float;\nvarying vec2 vUv;\nuniform sampler2D uSrc;\n" + com.graden.editor.ColorSpaces.GLSL + com.graden.editor.ColorPipe.GLSL +
+            "\nvoid main() { vec4 t = texture2D(uSrc, vec2(vUv.x, 1.0 - vUv.y)); if (t.a <= 0.0) { gl_FragColor = vec4(0.0); return; }" +
+            " vec3 c = clamp(xform(t.rgb / t.a, uXf[2], uXf[3], uXfY[1], uFinM), 0.0, 1.0); gl_FragColor = vec4(c * t.a, t.a); }\n")
         return true
     }
 
@@ -614,10 +619,14 @@ class Compositor(private val context: Context, private val project: ExportProjec
         val t0 = System.nanoTime()
         val used = HashSet<Long>()
         val pics = ArrayList<Pair<Int?, List<Pic>>>()
+        // Bottom to top: each lane's pictures, or (a text lane) its text, in the order they are drawn.
+        val stack = ArrayList<Pair<Track, Pair<Int?, List<Pic>>?>>()
         for (t in project.tracks) {
             if (!t.video || t.id in project.hidden) continue
+            if (t.captions) { stack += t to null; continue }
             val lp = lanePictures(project, t, us)
             pics += lp
+            stack += t to lp
             for (p in lp.second) used += p.clip.id
         }
         // Every lane's decoder moves to its frame at once, each on its own thread; then the frames are taken on this one.
@@ -664,9 +673,10 @@ class Compositor(private val context: Context, private val project: ExportProjec
         GLES20.glScissor(canvas[0], outH - canvas[1] - canvas[3], canvas[2], canvas[3])
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
-        for ((backdrop, list) in pics) {
-            backdrop?.let { fill(it) }
-            for (p in list) drawPicture(p, us)
+        for ((t, lp) in stack) {
+            if (lp == null) { drawTexts(t, us); continue }
+            lp.first?.let { fill(it) }
+            for (p in lp.second) drawPicture(p, us)
         }
         GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
         GLES20.glDisable(GLES20.GL_BLEND)
@@ -806,6 +816,44 @@ class Compositor(private val context: Context, private val project: ExportProjec
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(packProg, "uSrc"), 0)
         drawQuad(packProg)
+    }
+
+    /** The captions showing at [us] (every caption layer, bottom one first), over the picture, blended. */
+    /** A text lane's texture and what it shows, so a text that isn't changing is drawn once, not every frame. */
+    private class TextTex(var tex: Int = 0, var key: String? = null, var bmp: android.graphics.Bitmap? = null)
+    private val textTex = HashMap<Int, TextTex>()
+
+    /** The text of lane [t] at [us], over what is under it, with its animation. */
+    private fun drawTexts(t: Track, us: Long) {
+        val clip = t.clipAt(us) ?: return
+        val cap = clip.caption?.takeIf { it.text.isNotBlank() } ?: return
+        val cw = canvas[2]; val ch = canvas[3]
+        val area = com.graden.editor.CaptionRender.videoRect(project.tracks, project.assets, project.hidden, us, cw.toFloat(), ch.toFloat(), project.meta.scaling == "Fill")
+        val into = us - clip.startUs
+        val moving = com.graden.editor.TextAnim.moving(cap, into, clip.durationUs)
+        val key = cap.hashCode().toString() + "@" + area.toShortString() + (if (moving) "#$into" else "")
+        val tt = textTex.getOrPut(t.id) { TextTex() }
+        if (key != tt.key || tt.tex == 0) {
+            // One picture per lane, cleared and drawn again, so an animating text doesn't make a new one every frame.
+            val bmp = tt.bmp?.takeIf { it.width == cw && it.height == ch } ?: android.graphics.Bitmap.createBitmap(cw, ch, android.graphics.Bitmap.Config.ARGB_8888).also { tt.bmp?.recycle(); tt.bmp = it }
+            bmp.eraseColor(0)
+            com.graden.editor.CaptionRender.draw(android.graphics.Canvas(bmp), cap, area, into, clip.durationUs)
+            if (tt.tex == 0) tt.tex = IntArray(1).also { GLES20.glGenTextures(1, it, 0) }[0]
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tt.tex)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+            tt.key = key
+        }
+        GLES20.glViewport(canvas[0], outH - canvas[1] - ch, cw, ch)
+        GLES20.glUseProgram(captionProg)
+        com.graden.editor.ColorPipe.set(captionProg, project.fillPipe ?: noPipe)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tt.tex)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(captionProg, "uSrc"), 0)
+        drawQuad(captionProg)
     }
 
     private fun fill(color: Int) {
@@ -1040,6 +1088,8 @@ class Compositor(private val context: Context, private val project: ExportProjec
     }
 
     fun release() {
+        textTex.values.forEach { it.bmp?.recycle() }
+        textTex.clear()
         extras.values.forEach { it.release() }
         extras.clear()
         pool.shutdownNow()

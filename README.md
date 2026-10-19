@@ -20,6 +20,27 @@
 
 ## Highlights
 
+**New in 0.3: captions and text**
+- **Auto captions** made on the phone with Whisper (Small or Large v3 Turbo, 99 languages): sentence by sentence, timed
+  to the word, laid out like YouTube and Netflix subtitles, on a layer of their own; for the whole project or one clip
+- **Speakers**: an optional model (NVIDIA Nemotron 3 Diarization) gives each person their own captions, and stacks quick
+  replies as two lines
+- **Music and lyrics**: an optional sound classifier (CED) marks sung lines with 𝄞 and music alone as 𝄞
+- Models are downloaded inside the app from their official sources (checked against their checksums) or added from
+  storage; nothing is uploaded
+- **Text and titles**: 28 built-in fonts (including Hindi and Bengali), colour, outline, shadow, background box,
+  decorations, spacing, and **14 in and out animations**; drag a text on the picture to move it, pinch to resize,
+  twist to turn
+- Ready-made text styles (titles, lower thirds, social, script and more) in the media box, to tap or drag in
+- Captions stay marked as captions however much they are edited, ready for exporting them separately later
+
+**A redesigned media box, project setup and export**
+- Media sorted into All, Video, Text, Images, GIFs, Audio and MCRAW, ordered newest first (or by name, size or
+  length), with the files of your other projects there to use too
+- New project: shape, size and frame rate up front; colour spaces, bit depth, sample rate and loudness under
+  Advanced (Rec.709 by default)
+- Export: a summary of what will be written, presets, then video, audio and file; encoder and colour under Advanced
+
 **Editing**
 - As many picture and sound lanes as you need, tested with **8 layers of 4K footage and 1,800 clips** on one timeline
 - Smooth scrubbing, playback and pinch-zoom on long projects, with filmstrip thumbnails on every clip
@@ -76,9 +97,9 @@
 |:-:|:-:|:-:|:-:|
 | <img src="docs/screenshots/edit.png" width="200"> | <img src="docs/screenshots/color1.png" width="200"> | <img src="docs/screenshots/color2.png" width="200"> | <img src="docs/screenshots/color3.png" width="200"> |
 
-| Export settings | Resolution |
-|:-:|:-:|
-| <img src="docs/screenshots/export1.png" width="200"> | <img src="docs/screenshots/export2.png" width="200"> |
+| Auto captions | New project | Export |
+|:-:|:-:|:-:|
+| <img src="docs/screenshots/captions.png" width="200"> | <img src="docs/screenshots/newproject.png" width="200"> | <img src="docs/screenshots/export3.png" width="200"> |
 
 ## Tested on real devices
 
@@ -88,7 +109,7 @@ hardware encoder. The results and the fixes they led to are in [docs/TESTING.md]
 
 ## Install
 
-1. Download **`Graden-0.2.1-beta.apk`** from the [latest release](https://github.com/Pixelgamer4k/graden/releases).
+1. Download **`Graden-0.3.0-beta.apk`** from the [latest release](https://github.com/Pixelgamer4k/graden/releases).
 2. Open it on your phone and allow installing from this source when Android asks.
 
 Needs **Android 10 or newer**. A recent phone with a capable chip gives the best experience with 4K footage.
@@ -101,13 +122,16 @@ This beta exists to collect feedback, so every report helps:
 - 💡 **Ideas**: [suggest a feature](https://github.com/Pixelgamer4k/graden/issues/new?template=feature_request.yml)
 - 💬 **Questions and general thoughts**: [Discussions](https://github.com/Pixelgamer4k/graden/discussions)
 
-## Known limitations in 0.2
+## Known limitations in 0.3
 
 - Exporting many layers of 4K footage is slow: rendering is done at full quality, frame by frame
 - 10-bit and HDR export depend on the phone's encoder; where it cannot, the export screen says so
 - The colour wheels follow Resolve's manual but are not yet measured against Resolve the way the colour space
   transform is
-- 0.2.1 is signed with the same key as 0.1 and 0.2, so it installs over them and keeps your projects
+- 0.3.0 is signed with the same key as earlier betas, so it installs over them and keeps your projects
+- Captions need a 64-bit ARM phone; speaker and music detection need one from about 2019 on (ARMv8.2)
+- GIFs are shown as still pictures for now
+- Captions are drawn into the video; exporting them as a separate subtitle file is planned
 - Software encoders (x264 / x265) are built in but switched off in this beta (see below)
 - Projects and media are stored inside the app; uninstalling removes them
 
@@ -142,7 +166,10 @@ and set `SOFTWARE_ENCODERS = true` in `app/src/main/java/com/graden/editor/expor
 Kotlin · Jetpack Compose · AndroidX Media3 · OpenGL ES · MediaCodec ·
 [OpenCV](https://opencv.org/) (Apache-2.0) · the [MotionCam](https://github.com/mirsadm/motioncam-decoder) decoder
 (Apache-2.0) · [nlohmann/json](https://github.com/nlohmann/json) and [SIMDe](https://github.com/simd-everywhere/simde)
-(MIT), and optionally
+(MIT) · [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT) with OpenAI's Whisper models and Silero VAD (MIT) ·
+[audio.cpp](https://github.com/0xShug0/audio.cpp) (Apache-2.0) running NVIDIA Nemotron 3 Diarization (OpenMDW-1.1) and
+CED (Apache-2.0); its library is built by `tools/audiocpp/build.sh` · fonts from [Google Fonts](https://fonts.google.com/)
+under the SIL Open Font License or Apache-2.0 (licences in `app/src/main/assets/fonts/licenses`), and optionally
 [x264](https://www.videolan.org/developers/x264.html) and [x265](https://www.x265.org/).
 
 Footage in the screenshots is from [Pexels](https://www.pexels.com/), used under the Pexels license.

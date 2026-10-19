@@ -96,6 +96,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.PlayerView
 import com.graden.editor.DeviceProfiler
@@ -197,6 +198,8 @@ fun EditorScreen(vm: EditorViewModel) {
     }
 
     var dragAsset by remember { mutableStateOf<MediaAsset?>(null) }
+    // A text being dragged from the media box's Text section.
+    var dragText by remember { mutableStateOf<com.graden.editor.Caption?>(null) }
     var dragPos by remember { mutableStateOf(Offset.Zero) }
     var timelineBounds by remember { mutableStateOf(Rect.Zero) }
     var settingsOpen by remember { mutableStateOf(false) }
@@ -210,29 +213,30 @@ fun EditorScreen(vm: EditorViewModel) {
     }
 
     /** Tells the timeline which lane and time the dragged media item is over. */
-    fun hover(a: MediaAsset) {
+    fun hover() {
+        val a = dragAsset
         if (timelineBounds.contains(dragPos) && vm.pxPerSec > 0f) {
             val lanes = layoutLanes(timelineBounds.height, density, vm.tracks, 0, vm.laneScale)
             val lane = laneKeyAt(dragPos.y - timelineBounds.top + vm.laneScroll, lanes, with(density) { 3.dp.toPx() })
-            vm.hoverDrop(a, lane, vm.playheadUs + ((dragPos.x - timelineBounds.center.x) / vm.pxPerSec * 1e6f).toLong())
-        } else vm.hoverDrop(a, null, 0L)
+            val at = vm.playheadUs + ((dragPos.x - timelineBounds.center.x) / vm.pxPerSec * 1e6f).toLong()
+            if (a != null) vm.hoverDrop(a, lane, at) else if (dragText != null) vm.hoverText(lane, at)
+        } else if (a != null) vm.hoverDrop(a, null, 0L) else vm.hoverText(null, 0L)
     }
 
     // Holding a dragged item near the left or right end of the timeline scrolls it: slowly at first, fast at the very edge.
-    val draggingMedia = dragAsset != null
+    val draggingMedia = dragAsset != null || dragText != null
     LaunchedEffect(draggingMedia) {
         if (!draggingMedia) return@LaunchedEffect
         var last = 0L
         while (true) withFrameNanos { now ->
-            val a = dragAsset
-            if (a != null && last != 0L && timelineBounds.contains(dragPos) && vm.pxPerSec > 0f) {
+            if ((dragAsset != null || dragText != null) && last != 0L && timelineBounds.contains(dragPos) && vm.pxPerSec > 0f) {
                 val dp = density.density
                 val speed = edgeScrollSpeed(dragPos.x, timelineBounds.left + 46 * dp, timelineBounds.right, 64 * dp, dp)
-                if (speed != 0f && vm.panBy((speed * (now - last) / 1e9f / vm.pxPerSec * 1e6f).toLong())) hover(a)
+                if (speed != 0f && vm.panBy((speed * (now - last) / 1e9f / vm.pxPerSec * 1e6f).toLong())) hover()
                 // Near the top or bottom of the lanes, they scroll too, so a lane out of view can be reached.
                 val before = vm.laneScroll
                 vm.scrollLanesBy(edgeScrollSpeed(dragPos.y, timelineBounds.top + 34 * dp, timelineBounds.bottom, 36 * dp, dp) * 0.35f * (now - last) / 1e9f)
-                if (vm.laneScroll != before) hover(a)
+                if (vm.laneScroll != before) hover()
             }
             last = now
         }
@@ -259,31 +263,52 @@ fun EditorScreen(vm: EditorViewModel) {
         if (vm.cropSession != null) CropPage(vm, soon)
         if (vm.soundClipId != null) SoundPage(vm, soon)
         if (vm.exportOpen) ExportScreen(vm)
+        CaptionSheet(vm)
+        CaptionEditDialog(vm)
+        TextPanel(vm)
         ProjectSheet(settingsOpen, vm.meta, onClose = { settingsOpen = false }, onDone = {
             settingsOpen = false
             vm.updateMeta(it)
         }, modifier = Modifier.align(Alignment.BottomCenter))
         MediaWindow(
-            vm, dragging = dragAsset != null, onImport = import,
+            vm, dragging = dragAsset != null || dragText != null, onImport = import,
             onDragStart = { a, pos ->
                 dragAsset = a
                 dragPos = pos
                 vm.mediaBoxOpen = false
             },
+            onTextDragStart = { cap, pos ->
+                dragText = cap
+                dragPos = pos
+                vm.mediaBoxOpen = false
+            },
             onDrag = { d ->
                 dragPos += d
-                dragAsset?.let { hover(it) }
+                hover()
             },
             onDragEnd = {
-                dragAsset?.let { vm.dropAsset(it) }
+                // A file from another project joins this one as it is dropped.
+                dragAsset?.let { a -> if (vm.drop != null) vm.dropAsset(if (vm.assets[a.id]?.uri == a.uri) a else vm.adopt(a)) }
+                dragText?.let { if (vm.drop != null) vm.dropText(it) }
                 vm.clearDrop()
                 vm.settle()
                 dragAsset = null
+                dragText = null
             },
         )
         ImportWindow(vm)
         // The item being dragged out of the media window stays centred under the fingertip, above
         // everything else, and shrinks once it is over a place it can be dropped.
+        dragText?.let { cap ->
+            val lift = remember { Animatable(0.6f) }
+            LaunchedEffect(Unit) { lift.animateTo(1f, spring(0.55f, 500f)) }
+            val over by animateFloatAsState(if (vm.drop != null) 0.62f else 1f, spring(0.7f, 500f), label = "drag text")
+            Box(
+                Modifier.offset { IntOffset((dragPos.x - 74.dp.toPx()).roundToInt(), (dragPos.y - 42.dp.toPx()).roundToInt()) }.size(148.dp, 84.dp)
+                    .graphicsLayer { scaleX = lift.value * over; scaleY = lift.value * over; alpha = 0.94f; shadowElevation = 16.dp.toPx(); shape = RoundedCornerShape(10.dp); clip = true }
+                    .border(1.5.dp, Color.White, RoundedCornerShape(10.dp))
+            ) { TextTile(cap, Modifier.fillMaxSize()) }
+        }
         dragAsset?.let { a ->
             val w = 120.dp
             val h = 68.dp
@@ -412,6 +437,7 @@ private fun HostBar(vm: EditorViewModel, soon: (String) -> Unit, onClose: () -> 
             val busy = vm.importQueue.any { !it.failed } || vm.assets.values.any { !vm.statusOf(it).ready }
             if (busy) Box(Modifier.align(Alignment.TopEnd).padding(7.dp).size(6.dp).clip(CircleShape).background(Palette.Accent))
         }
+        BarIcon(Lucide.Captions, "Auto captions", tint = if (vm.captionRun != null) Palette.Accent else Palette.Text) { vm.pause(); vm.openCaptions(null) }
         BarIcon(Lucide.Info, "Clip details", tint = if (vm.infoOpen) Palette.Accent else Palette.Text) { vm.infoOpen = !vm.infoOpen }
         SaveButton(vm)
         BarIcon(Lucide.Upload, "Export") {
@@ -489,7 +515,13 @@ private fun Preview(vm: EditorViewModel) {
         // Layers are composited bottom-up: V0 first, each higher layer over it, so the highest layer with a
         // clip is what shows. Each lane has two players that leapfrog across its cuts. Normally only the
         // active one is visible; during a transition both are, each shaped by its half of the transition.
-        for (t in vm.tracks) if (t.video) key(t.id) { LaneLayers(vm, t) }
+        // Text lanes in their place among the pictures. Those above the top picture's lane are drawn after its
+        // full-quality frame (below), so they stay over it.
+        val topLane by remember { derivedStateOf { vm.topClip?.let { c -> vm.tracks.indexOfFirst { t -> t.clips.any { it.id == c.id } } } ?: -1 } }
+        for ((i, t) in vm.tracks.withIndex()) {
+            if (t.pictures) key(t.id) { LaneLayers(vm, t) }
+            else if (t.captions && i < topLane) key(t.id) { TextLayer(vm, t) }
+        }
         // At rest, the original file's frame covers the proxy the lanes are showing.
         val top by remember { derivedStateOf { vm.topClip } }
         val topAsset = top?.let { vm.assets[it.assetId] }
@@ -538,6 +570,8 @@ private fun Preview(vm: EditorViewModel) {
                 it.setStab(vm.stabFor(top)) { ns -> ns / 1000L }
             },
         )
+        // Texts over the top picture, drawn as the export draws them (same size against the frame).
+        for ((i, t) in vm.tracks.withIndex()) if (t.captions && i > topLane) key(t.id) { TextLayer(vm, t) }
         // The picture being graded feeds the scopes.
         val scopeKey by remember { derivedStateOf { vm.scopeKey() } }
         SideEffect { GradeGl.scopeTag = scopeKey }
@@ -696,6 +730,25 @@ private fun WipeLine(vm: EditorViewModel) {
  * frame at rest. A composable of its own, so what changes on one lane (a cut, a transition) recomposes only that lane.
  */
 @OptIn(UnstableApi::class)
+/** The captions showing at the playhead, over the canvas. */
+/** Lane [t]'s text at the playhead, with its animation, drawn as the export draws it. */
+@Composable
+private fun TextLayer(vm: EditorViewModel, t: com.graden.editor.Track) {
+    val hidden by remember(t.id) { derivedStateOf { t.id in vm.hiddenTracks } }
+    if (hidden) return
+    androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
+        // Read while drawing: playback redraws this layer, without recomposing the preview.
+        val us = vm.playheadUs
+        val lane = vm.tracks.firstOrNull { it.id == t.id } ?: return@Canvas
+        val clip = lane.clipAt(us) ?: return@Canvas
+        val cap = clip.caption?.takeIf { it.text.isNotBlank() } ?: return@Canvas
+        val area = com.graden.editor.CaptionRender.videoRect(vm.tracks, vm.assets, vm.hiddenTracks, us, size.width, size.height, vm.meta.scaling == "Fill")
+        // An animation being tried out in the text panel plays here, at its own time.
+        val demo = vm.textDemo?.takeIf { it.first == clip.id }?.second
+        drawIntoCanvas { c -> com.graden.editor.CaptionRender.draw(c.nativeCanvas, cap, area, demo ?: (us - clip.startUs), clip.durationUs) }
+    }
+}
+
 @Composable
 private fun LaneLayers(vm: EditorViewModel, t: com.graden.editor.Track) {
         val lp = vm.layer(t.id)
@@ -1052,6 +1105,19 @@ private fun Tools(vm: EditorViewModel, soon: (String) -> Unit) {
             Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 6.dp, vertical = 4.dp),
             horizontalArrangement = Arrangement.spacedBy(2.dp),
         ) {
+            if (kind == Selection.CAPTION) {
+                // A text (caption or title): its words, font, look and animation; split, delete and copy; its length by
+                // its handles on the timeline, its place on the picture by dragging it there.
+                Tool(Lucide.TypeT, "Edit", tinted = true) { vm.selectedClipId?.let { vm.openText(it, 0) } }
+                Tool(Lucide.FontAa, "Font", tinted = true) { vm.selectedClipId?.let { vm.openText(it, 1) } }
+                Tool(Lucide.Palette, "Style", tinted = true) { vm.selectedClipId?.let { vm.openText(it, 2) } }
+                Tool(Lucide.AnimIn, "Animate", tinted = true) { vm.selectedClipId?.let { vm.openText(it, 3) } }
+                val canSplit by remember { derivedStateOf { vm.canSplit } }
+                Tool(Lucide.Split, "Split", enabled = canSplit) { vm.split() }
+                Tool(Lucide.Trash, "Delete", color = Palette.Danger) { vm.deleteSelected() }
+                Tool(Lucide.Copy, "Duplicate") { vm.duplicateSelected() }
+                return@Row
+            }
             // Trim opens the trim page; a picture has no length of its own to trim, so it just shows its handles.
             Tool(Lucide.Scissors, "Trim") { if (!vm.openTrim()) vm.selectAtPlayhead() }
             val canSplit by remember { derivedStateOf { vm.canSplit } }
@@ -1066,6 +1132,7 @@ private fun Tools(vm: EditorViewModel, soon: (String) -> Unit) {
                 Tool(Lucide.AnimOut, "Out") { vm.selectedClipId?.let { vm.openFx(it, EditorViewModel.FxSlot.OUT) } }
             }
             if (sound) Tool(Lucide.AudioLines, "Sound", tinted = true) { vm.openSound() }
+            if (sound) Tool(Lucide.Captions, "Captions", tinted = true) { vm.pause(); vm.openCaptions(vm.selectedClipId) }
             // A video's sound copied out onto its own lane; the video keeps its sound until muted on its Sound page.
             if (kind == Selection.VIDEO) Tool(Lucide.Volume, "Extract") { vm.extractSound() }
             if (kind != Selection.PICTURE) Tool(Lucide.Gauge, "Speed") { vm.openTrim(bySpeed = true) }

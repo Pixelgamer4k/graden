@@ -287,18 +287,24 @@ vec3 rawDev(vec3 v) {
     vec3 cam = (exp2(v * 14.0) - 1.0) / 4096.0;
     vec3 gain = uRaw[3].xyz;
     vec3 wb = cam * gain;
-    // Highlights. The white level is where the sensor clips (1.0: the recording's own white level). Past it a
-    // channel's value is unknown, and white balance would turn the clipped part magenta or cyan; so near the clip the
-    // picture is taken to a white no channel can exceed (the clip of the channel with the smallest gain), and the
-    // recovery amount brings back the brightness the unclipped channels still hold, keeping that white's colour.
-    float wl = clamp(uRaw[7].z > 0.0 ? uRaw[7].z : 1.0, 0.25, 1.0);
-    float near = smoothstep(0.92, 1.0, max(cam.r, max(cam.g, cam.b)) / wl);
-    if (near > 0.0) {
-        vec3 yw = vec3(0.2126, 0.7152, 0.0722);
-        vec3 clipped = min(wb, vec3(wl * min(gain.r, min(gain.g, gain.b))));
-        float yc = max(dot(clipped, yw), 1e-6);
-        vec3 rebuilt = clipped * max(dot(wb, yw) / yc, 1.0);
-        wb = mix(wb, mix(clipped, rebuilt, uRaw[3].w), near);
+    // Highlights. The white level is where the sensor clips (1.0: the recording's own). Past it a channel's value is
+    // unknown, and white balance would turn the clipped part magenta or cyan. Recovery 0 clips to the white no
+    // channel can exceed (the clip of the channel with the smallest gain). Recovery 1 rebuilds: each clipped channel
+    // rises towards the brightest channel, gradually, by how far that one has gone past the safe white, so colour and
+    // detail stay where only some channels clipped, a fully clipped area becomes white as bright as the sensor
+    // allows (about a stop more), a light that is really red or blue stays so, and brightness only ever rises with
+    // the light (no bands). In between, a blend.
+    float wl = clamp(uRaw[7].z > 0.0 ? uRaw[7].z : 1.0, 0.25, 2.0);
+    float cmax = max(cam.r, max(cam.g, cam.b)) / wl;
+    if (cmax > 0.88) {
+        float Ws = wl * min(gain.r, min(gain.g, gain.b));
+        float Rm = wl * max(gain.r, max(gain.g, gain.b));
+        float m = max(wb.r, max(wb.g, wb.b));
+        vec3 t = smoothstep(vec3(0.88), vec3(1.0), cam / wl);
+        float d = smoothstep(Ws, max(Rm, Ws * 1.01), m);
+        vec3 rec = wb + t * d * max(vec3(m) - wb, vec3(0.0));
+        vec3 clip = mix(wb, vec3(Ws), smoothstep(0.92, 1.0, cmax));
+        wb = mix(clip, rec, clamp(uRaw[3].w, 0.0, 1.0));
     }
     // Black level: taken off after white balance, the same on every channel, so the shadows stay neutral (taken off
     // the camera channels before the gains, it tinted them green or pink); not clipped at zero (that lifts the noise).

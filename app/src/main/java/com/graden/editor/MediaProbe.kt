@@ -149,4 +149,25 @@ object MediaProbe {
         }
         return uri.lastPathSegment ?: "Clip"
     }
+
+    /**
+     * The file's size in bytes and when it was made or last changed (ms since 1970), for sorting the media box: 0 where
+     * the phone doesn't say.
+     */
+    fun fileInfo(context: Context, uri: Uri): Pair<Long, Long> {
+        if (uri.scheme == "file") return java.io.File(uri.path ?: "").let { it.length() to it.lastModified() }
+        var size = 0L; var date = 0L
+        runCatching {
+            context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                if (!c.moveToFirst()) return@use
+                fun col(n: String) = c.getColumnIndex(n).takeIf { it >= 0 && !c.isNull(it) }
+                col(OpenableColumns.SIZE)?.let { size = c.getLong(it) }
+                // A picture or video says when it was taken; documents when they last changed (ms); the media store in seconds.
+                date = col("datetaken")?.let { c.getLong(it) }?.takeIf { it > 0 }
+                    ?: col(android.provider.DocumentsContract.Document.COLUMN_LAST_MODIFIED)?.let { c.getLong(it) }?.takeIf { it > 0 }
+                    ?: col("date_modified")?.let { c.getLong(it) * 1000L } ?: 0L
+            }
+        }
+        return size to date
+    }
 }

@@ -201,22 +201,19 @@ private fun ago(t: Long): String {
     }
 }
 
-private val Scalings = listOf("Fit", "Fill", "Centre")
-private val ScalingNotes = mapOf(
-    "Fit" to "Whole picture shown. Pinch and drag a clip on the canvas to place it yourself",
-    "Fill" to "Canvas filled; edges of the picture cropped",
-    "Centre" to "Shown at its own pixel size, not scaled",
-)
 private val SampleRates = listOf(44_100 to "44.1 kHz", 48_000 to "48 kHz", 96_000 to "96 kHz")
-private val Loudness = listOf<Pair<Float?, String>>(null to "Off", -14f to "−14 LUFS · YouTube, Spotify", -16f to "−16 · Apple", -23f to "−23 · Broadcast (EBU)")
+private val Loudness = listOf<Pair<Float?, String>>(null to "Off", -14f to "−14 LUFS", -16f to "−16 LUFS", -23f to "−23 LUFS")
+private val LoudnessNotes = listOf("The mix is left as it is", "YouTube, Spotify, TikTok, Instagram", "Apple Music, podcasts", "Broadcast TV (EBU R128)")
 
 /**
- * Project settings, chosen before a project starts and changeable later from the editor (tap the
- * project's name). [initial] fills it from an existing project; null starts a new one.
+ * Project settings, chosen before a project starts and changeable later from the editor (tap the project's name).
+ * [initial] fills it from an existing project; null starts a new one. What everyone chooses (name, shape, size, frame
+ * rate) comes first; colour and sound, which most people leave as they are (Rec.709, 48 kHz, −14 LUFS), are folded
+ * under Advanced. Clips of another shape always fit the canvas whole; they can be placed and sized by hand on it.
  */
 @Composable
 fun ProjectSheet(open: Boolean, initial: ProjectMeta?, onClose: () -> Unit, onDone: (ProjectMeta) -> Unit, modifier: Modifier) {
-    if (open) Box(Modifier.fillMaxSize().background(Color(0x99000000)).pointerInput(Unit) { detectTapGestures { onClose() } })
+    if (open) Box(Modifier.fillMaxSize().background(Color(0xA6000000)).pointerInput(Unit) { detectTapGestures { onClose() } })
     AnimatedVisibility(open, modifier, enter = slideInVertically { it } + fadeIn(), exit = slideOutVertically { it } + fadeOut()) {
         val start = remember(open) { initial }
         val startPreset = remember(open) {
@@ -235,12 +232,11 @@ fun ProjectSheet(open: Boolean, initial: ProjectMeta?, onClose: () -> Unit, onDo
         var customW by remember(open) { mutableStateOf((start?.width ?: 1920).toString()) }
         var customH by remember(open) { mutableStateOf((start?.height ?: 1080).toString()) }
         var customFps by remember(open) { mutableStateOf(start?.fps?.takeIf { it !in Rates }?.toString() ?: "") }
-        var scaling by remember(open) { mutableStateOf(start?.scaling ?: "Fit") }
         var bitDepth by remember(open) { mutableStateOf(start?.bitDepth ?: 8) }
         var sampleRate by remember(open) { mutableStateOf(start?.sampleRate ?: 48_000) }
         var loudness by remember(open) { mutableStateOf(if (start == null) -14f else start.loudness) }
         val placeholder = remember(open) { start?.name ?: ProjectMeta.defaultName() }
-        val shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
+        val shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
         val isCustom = preset === CustomPreset
         // A typed size is kept within what phones can decode, and made even, as video encoders need.
         val cw = (customW.toIntOrNull() ?: 0).coerceIn(16, 8192) / 2 * 2
@@ -249,138 +245,142 @@ fun ProjectSheet(open: Boolean, initial: ProjectMeta?, onClose: () -> Unit, onDo
         val rate = typedFps ?: fps
         val base = ProjectMeta(
             name, start?.created ?: 0L, preset.name, preset.w.coerceAtLeast(1), preset.h.coerceAtLeast(1), side, rate, color,
-            scaling = scaling, bitDepth = bitDepth, sampleRate = sampleRate, loudness = loudness, startTcSec = 0, workingSpace = working, masterNits = nits,
+            scaling = "Fit", bitDepth = bitDepth, sampleRate = sampleRate, loudness = loudness, startTcSec = 0, workingSpace = working, masterNits = nits,
         )
         val meta = if (isCustom) ProjectMeta.custom(base, cw, ch) else base
+        val summary = "${meta.width} × ${meta.height}  ·  ${meta.ratioLabel}  ·  ${meta.fpsLabel} fps"
         Column(
-            Modifier.fillMaxWidth().fillMaxHeight(0.92f).clip(shape).background(Color(0xFF16171D)).border(1.dp, Palette.Line, shape)
+            Modifier.fillMaxWidth().fillMaxHeight(0.94f).clip(shape).background(Kit.Sheet).border(1.dp, Kit.Hair, shape)
                 .pointerInput(Unit) { detectTapGestures { } }.navigationBarsPadding().imePadding()
         ) {
-            Row(Modifier.padding(start = 20.dp, end = 20.dp, top = 14.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(if (start == null) "New project" else "Project settings", color = Palette.Text, fontSize = 19.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                Icon(Lucide.X, "Cancel", tint = Palette.TextDim, modifier = Modifier.size(36.dp).clip(CircleShape).clickable(onClick = onClose).padding(7.dp))
-            }
-            Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(bottom = 10.dp)) {
-                Heading("Name")
-                Row(
-                    Modifier.padding(horizontal = 20.dp).fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Palette.Surface)
-                        .border(1.dp, Palette.Line, RoundedCornerShape(12.dp)).padding(horizontal = 14.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Box(Modifier.weight(1f)) {
-                        if (name.isEmpty()) Text(placeholder, color = Palette.TextDim, fontSize = 15.sp)
-                        BasicTextField(
-                            name, { name = it.take(ProjectMeta.MAX_NAME) }, singleLine = true,
-                            textStyle = TextStyle(color = Palette.Text, fontSize = 15.sp), cursorBrush = SolidColor(Palette.Accent),
-                            modifier = Modifier.fillMaxWidth(),
-                        )
+            KGrabber()
+            KHeader(if (start == null) "New project" else "Project settings", summary, onClose)
+            Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(bottom = 16.dp)) {
+                // The name, large, as the project's title.
+                KGroup {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 15.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.weight(1f)) {
+                            if (name.isEmpty()) Text(placeholder, color = Kit.Faint, fontSize = 18.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+                            BasicTextField(
+                                name, { name = it.take(ProjectMeta.MAX_NAME) }, singleLine = true,
+                                textStyle = TextStyle(color = Kit.Text, fontSize = 18.sp, fontWeight = FontWeight.Medium), cursorBrush = SolidColor(Kit.Accent),
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                        Text("${name.length}/${ProjectMeta.MAX_NAME}", color = Kit.Faint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                     }
-                    Text("${name.length}/${ProjectMeta.MAX_NAME}", color = Palette.TextDim, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                 }
 
-                Heading("Canvas")
-                Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                KSection("Canvas")
+                Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     for (p in Presets + CustomPreset) {
                         val on = p === preset
                         Column(
-                            Modifier.width(92.dp).clip(RoundedCornerShape(12.dp)).background(if (on) Color(0xFF2A1F15) else Palette.Surface)
-                                .border(if (on) 1.5.dp else 1.dp, if (on) Palette.Accent else Palette.Line, RoundedCornerShape(12.dp))
-                                .clickable { preset = p }.padding(vertical = 10.dp),
+                            Modifier.width(96.dp).clip(RoundedCornerShape(16.dp)).background(if (on) Kit.AccentSoft else Kit.Group)
+                                .border(if (on) 1.5.dp else 1.dp, if (on) Kit.Accent else Color.Transparent, RoundedCornerShape(16.dp))
+                                .clickable { preset = p }.padding(top = 12.dp, bottom = 10.dp),
                             horizontalAlignment = Alignment.CenterHorizontally,
                         ) {
                             // The shape itself, drawn to scale.
-                            Box(Modifier.size(52.dp), contentAlignment = Alignment.Center) {
+                            Box(Modifier.size(54.dp), contentAlignment = Alignment.Center) {
                                 val a = if (p === CustomPreset) (cw.toFloat() / ch).coerceIn(0.2f, 5f) else p.w.toFloat() / p.h
-                                val bw = if (a >= 1f) 46f else 46f * a
-                                val bh = if (a >= 1f) 46f / a else 46f
+                                val bw = if (a >= 1f) 48f else 48f * a
+                                val bh = if (a >= 1f) 48f / a else 48f
                                 Box(
-                                    Modifier.size(bw.dp, bh.dp).clip(RoundedCornerShape(4.dp))
-                                        .border(1.5.dp, if (on) Palette.Accent else Palette.TextDim, RoundedCornerShape(4.dp))
+                                    Modifier.size(bw.dp, bh.dp).clip(RoundedCornerShape(5.dp))
+                                        .background(if (on) Kit.Accent.copy(alpha = 0.22f) else Color(0x10FFFFFF))
+                                        .border(1.5.dp, if (on) Kit.Accent else Kit.Dim, RoundedCornerShape(5.dp))
                                 )
                             }
-                            Text(
-                                if (p === CustomPreset) "W × H" else "${p.w}:${p.h}", color = if (on) Palette.Accent else Palette.Text,
-                                fontSize = 13.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace,
-                            )
-                            Text(p.name, color = Palette.Text, fontSize = 11.sp, maxLines = 1)
-                            Text(p.use, color = Palette.TextDim, fontSize = 9.sp, maxLines = 1)
+                            Spacer(Modifier.height(6.dp))
+                            Text(if (p === CustomPreset) "Custom" else "${p.w}:${p.h}", color = if (on) Kit.Accent else Kit.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                            Text(if (p === CustomPreset) "Any size" else p.name, color = Kit.Dim, fontSize = 11.sp, maxLines = 1)
+                            Text(p.use, color = Kit.Faint, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 4.dp))
                         }
                     }
                 }
 
-                Heading("Resolution")
-                if (isCustom) Row(Modifier.padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
-                    NumberField(customW, "Width") { customW = it }
-                    Text("×", color = Palette.TextDim, fontSize = 16.sp, modifier = Modifier.padding(horizontal = 10.dp))
-                    NumberField(customH, "Height") { customH = it }
-                } else Chips(Resolutions.map { it.second }, Resolutions.indexOfFirst { it.first == side }) { side = Resolutions[it].first }
-                Note("${meta.width} × ${meta.height}  ·  ${meta.ratioLabel}", mono = true)
+                KSection("Resolution")
+                if (isCustom) KGroup {
+                    Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Size", color = Kit.Text, fontSize = 15.sp, modifier = Modifier.weight(1f))
+                        NumberField(customW, "Width") { customW = it }
+                        Text("×", color = Kit.Dim, fontSize = 16.sp, modifier = Modifier.padding(horizontal = 10.dp))
+                        NumberField(customH, "Height") { customH = it }
+                    }
+                } else KChips(Resolutions.map { it.second }, Resolutions.indexOfFirst { it.first == side }) { side = Resolutions[it].first }
 
-                Heading("Clips that are a different shape")
-                Chips(Scalings, Scalings.indexOf(scaling)) { scaling = Scalings[it] }
-                Note(ScalingNotes[scaling] ?: "")
-
-                Heading("Frame rate")
-                Chips(
+                KSection("Frame rate")
+                KChips(
                     Rates.map { if (it % 1f == 0f) "${it.toInt()}" else "%.3f".format(it).trimEnd('0') },
                     if (typedFps != null) -1 else Rates.indexOf(fps),
                 ) {
                     fps = Rates[it]
                     customFps = ""
                 }
-                Row(Modifier.padding(start = 20.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.padding(start = 20.dp, top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                     NumberField(customFps, "Other", decimals = true) { customFps = it }
                     val bad = customFps.isNotEmpty() && typedFps == null
-                    Text(if (bad) "1 to 240" else "fps", color = if (bad) Palette.Danger else Palette.TextDim, fontSize = 12.sp, modifier = Modifier.padding(start = 8.dp))
+                    Text(if (bad) "1 to 240" else "fps", color = if (bad) Kit.Bad else Kit.Dim, fontSize = 12.sp, modifier = Modifier.padding(start = 8.dp))
                 }
 
-                Heading("Output colour space")
-                for ((group, spaces) in SpaceGroups) {
-                    Text(group, color = Palette.TextDim.copy(alpha = 0.7f), fontSize = 10.sp, letterSpacing = 1.sp, modifier = Modifier.padding(start = 22.dp, top = 4.dp, bottom = 4.dp))
-                    Chips(spaces.map { it.name }, spaces.indexOfFirst { it.name == color }) {
-                        color = spaces[it].name
+                KSection("Advanced")
+                val loudIdx = Loudness.indexOfFirst { it.first == loudness }.coerceAtLeast(0)
+                KFold(
+                    "Colour and sound",
+                    "${color.replace(" Gamma ", " γ")} · ${bitDepth}-bit · ${SampleRates.firstOrNull { it.first == sampleRate }?.second ?: ""} · ${Loudness[loudIdx].second}",
+                ) {
+                    FoldLabel("Output colour space")
+                    for (sp in AllSpaces) KOption(sp.name, sp.note, sp.name == color, badge = {
+                        val hdr = ProjectMeta.isHdr(sp.name)
+                        KBadge(if (hdr) "HDR" else "SDR", if (hdr) Kit.Accent else Kit.Dim)
+                    }) {
+                        color = sp.name
                         // HDR needs more than 8 bits per channel, or smooth gradients band.
                         if (ProjectMeta.isHdr(color)) bitDepth = 10
                     }
-                    Spacer(Modifier.height(6.dp))
+                    if (ProjectMeta.isHdr(color)) {
+                        FoldLabel("HDR mastering brightness")
+                        KChips(MasterNits.map { "$it nits" }, MasterNits.indexOf(nits)) { nits = MasterNits[it] }
+                        FoldNote("The brightest the picture is graded for. 1000 nits suits most HDR phones and streaming.")
+                    }
+                    FoldLabel("Timeline colour space")
+                    for (w in WorkingSpaces) KOption(w, com.graden.editor.ColorSpaces.working(w).note, w == working) { working = w }
+                    FoldNote(
+                        "Where grading happens. A wider space keeps more colour from each camera; export converts to the output space." +
+                            if (ProjectMeta.isHdr(color) && !com.graden.editor.ColorSpaces.working(working).log) " For HDR output, DaVinci Wide Gamut or ACEScct keeps the highlights." else "",
+                    )
+                    KDivider(0.dp)
+                    KRow("Bit depth", if (bitDepth == 8 && ProjectMeta.isHdr(color)) "HDR at 8-bit will band; 10-bit is recommended" else null) {
+                        KSegmented(listOf("8-bit", "10-bit"), if (bitDepth == 10) 1 else 0, Modifier.width(150.dp)) { bitDepth = if (it == 1) 10 else 8 }
+                    }
+                    KDivider()
+                    KRow("Sample rate") {
+                        KSegmented(SampleRates.map { it.second }, SampleRates.indexOfFirst { it.first == sampleRate }, Modifier.width(210.dp)) { sampleRate = SampleRates[it].first }
+                    }
+                    KDivider(0.dp)
+                    FoldLabel("Loudness target")
+                    for ((i, l) in Loudness.withIndex()) KOption(l.second, LoudnessNotes[i], l.first == loudness) { loudness = l.first }
+                    FoldNote("Export brings the mix to this level, as the platforms measure it.")
+                    Spacer(Modifier.height(12.dp))
                 }
-                Note(AllSpaces.firstOrNull { it.name == color }?.note ?: "")
-                if (ProjectMeta.isHdr(color)) {
-                    Heading("HDR mastering brightness")
-                    Chips(MasterNits.map { "$it nits" }, MasterNits.indexOf(nits)) { nits = MasterNits[it] }
-                    Note("The brightest the picture is graded for. 1000 nits suits most HDR phones and streaming.")
-                }
-
-                Heading("Timeline colour space")
-                Chips(WorkingSpaces, WorkingSpaces.indexOf(working)) { working = WorkingSpaces[it] }
-                Note(
-                    com.graden.editor.ColorSpaces.working(working).note +
-                        if (ProjectMeta.isHdr(color) && !com.graden.editor.ColorSpaces.working(working).log) ". For HDR output, DaVinci Wide Gamut or ACEScct keeps the highlights." else "",
-                )
-                Note("Where grading happens. A wider space keeps more colour from each camera; export converts to the output space.")
-
-                Heading("Bit depth")
-                Chips(listOf("8-bit", "10-bit"), if (bitDepth == 10) 1 else 0) { bitDepth = if (it == 1) 10 else 8 }
-                Note(if (bitDepth == 8 && ProjectMeta.isHdr(color)) "HDR at 8-bit will band; 10-bit is recommended." else "How export will write the picture.")
-
-                Heading("Audio sample rate")
-                Chips(SampleRates.map { it.second }, SampleRates.indexOfFirst { it.first == sampleRate }) { sampleRate = SampleRates[it].first }
-                Heading("Loudness target")
-                Chips(Loudness.map { it.second }, Loudness.indexOfFirst { it.first == loudness }) { loudness = Loudness[it].first }
-                Note("Export will bring the mix to this level, as the platforms measure it.")
             }
-            Box(
-                Modifier.padding(horizontal = 20.dp, vertical = 10.dp).fillMaxWidth().height(52.dp).clip(RoundedCornerShape(14.dp)).background(Palette.Accent)
-                    .clickable { onDone(meta.copy(name = name.ifBlank { placeholder })) },
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    (if (start == null) "Create" else "Apply") + "  ·  ${meta.ratioLabel}  ·  ${meta.fpsLabel} fps",
-                    color = Color.Black, fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
-                )
+            Box(Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+                KPrimary(if (start == null) "Create project" else "Apply", sub = summary) { onDone(meta.copy(name = name.ifBlank { placeholder })) }
             }
         }
     }
+}
+
+@Composable
+private fun FoldLabel(text: String) {
+    Text(text.uppercase(), color = Kit.Dim, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 1.sp,
+        modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 4.dp))
+}
+
+@Composable
+private fun FoldNote(text: String) {
+    Text(text, color = Kit.Faint, fontSize = 12.sp, lineHeight = 16.sp, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 6.dp))
 }
 
 @Composable
@@ -396,8 +396,8 @@ private fun Note(text: String, mono: Boolean = false) {
 @Composable
 private fun NumberField(value: String, hint: String, decimals: Boolean = false, onChange: (String) -> Unit) {
     Box(
-        Modifier.width(96.dp).clip(RoundedCornerShape(10.dp)).background(Palette.Surface)
-            .border(1.dp, if (value.isNotEmpty()) Palette.Accent.copy(alpha = 0.6f) else Palette.Line, RoundedCornerShape(10.dp))
+        Modifier.width(92.dp).clip(RoundedCornerShape(12.dp)).background(Kit.Raised)
+            .border(1.dp, if (value.isNotEmpty()) Kit.Accent.copy(alpha = 0.6f) else Color.Transparent, RoundedCornerShape(12.dp))
             .padding(horizontal = 12.dp, vertical = 10.dp),
     ) {
         if (value.isEmpty()) Text(hint, color = Palette.TextDim, fontSize = 14.sp)

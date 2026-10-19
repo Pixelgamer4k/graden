@@ -30,6 +30,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Outline
 import androidx.compose.ui.graphics.Path
@@ -120,6 +121,54 @@ fun BoxScope.CanvasOverlay(vm: EditorViewModel) {
                 val down = awaitFirstDown(requireUnconsumed = false)
                 val w = size.width.toFloat()
                 val h = size.height.toFloat()
+                // A text under the finger is moved, resized (pinch) and turned (twist) on the video; tapped, it is
+                // selected, and tapped again, edited.
+                val text = vm.textAt(down.position, w, h)
+                if (text != null) {
+                    val area = com.graden.editor.CaptionRender.videoRect(vm.tracks, vm.assets, vm.hiddenTracks, vm.playheadUs, w, h, fill)
+                    val b0 = text.caption?.let { com.graden.editor.CaptionRender.bounds(it, area) }
+                    var cx = b0?.centerX() ?: area.centerX(); var cy = b0?.centerY() ?: area.centerY()
+                    var rawRot = text.caption?.rot ?: 0f
+                    var started = false
+                    var sx = false; var sy = false; var sr = false
+                    while (true) {
+                        val ev = awaitPointerEvent()
+                        val pressed = ev.changes.count { it.pressed }
+                        if (pressed == 0) break
+                        if (!started) {
+                            val moved = ev.changes.any { (it.position - down.position).getDistance() > viewConfiguration.touchSlop }
+                            if (!moved && pressed < 2) continue
+                            started = true
+                            vm.selectOnCanvas(text.id)
+                            vm.textEditStart()
+                        }
+                        val pan = ev.calculatePan()
+                        cx += pan.x; cy += pan.y
+                        rawRot += if (pressed >= 2) ev.calculateRotation() else 0f
+                        val zoom = if (pressed >= 2) ev.calculateZoom() else 1f
+                        val reach = 8.dp.toPx()
+                        val snapX = abs(cx - area.centerX()) < reach
+                        val snapY = abs(cy - area.centerY()) < reach
+                        val square = (rawRot / 90f).roundToInt() * 90f
+                        val snapR = abs(rawRot - square) < 4f
+                        if ((snapX && !sx) || (snapY && !sy) || (snapR && !sr && rawRot != 0f)) view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                        sx = snapX; sy = snapY; sr = snapR
+                        guideX = if (snapX) area.centerX() else Float.NaN
+                        guideY = if (snapY) area.centerY() else Float.NaN
+                        val nx = if (snapX) area.centerX() else cx
+                        val ny = if (snapY) area.centerY() else cy
+                        val rot = if (snapR) square else rawRot
+                        vm.styleText(text.id) {
+                            it.copy(x = (nx - area.left) / area.width(), y = (ny - area.top) / area.height(), scale = (it.scale * zoom).coerceIn(0.2f, 8f), rot = rot)
+                        }
+                        ev.changes.forEach { it.consume() }
+                    }
+                    guideX = Float.NaN; guideY = Float.NaN
+                    if (started) vm.textEditEnd()
+                    else if (vm.selectedClipId == text.id) vm.openText(text.id, 0)
+                    else vm.selectOnCanvas(text.id)
+                    return@awaitEachGesture
+                }
                 fun contains(c: Clip, p: Offset): Boolean {
                     val local = CanvasGeo.toLocal(p, w, h, c.tf, scaleOf(c))
                     return CanvasGeo.crop(CanvasGeo.base(w, h, aspectOf(c), fill), c.tf).contains(local)
@@ -219,6 +268,9 @@ fun BoxScope.CanvasOverlay(vm: EditorViewModel) {
     ) {
         // Derived: the overlay redraws when the clip under the playhead changes, not on every frame of a scrub.
         val sel by remember { derivedStateOf { if (vm.isPlaying) null else vm.canvasClip()?.clip } }
+        val selText by remember { derivedStateOf {
+            if (vm.isPlaying) null else vm.selectedClipId?.let(vm::locate)?.takeIf { l -> l.clip.caption != null && vm.playheadUs >= l.clip.startUs && vm.playheadUs < l.clip.endUs }?.clip?.caption
+        } }
         Canvas(Modifier.fillMaxSize()) {
             val w = size.width
             val h = size.height
@@ -227,6 +279,18 @@ fun BoxScope.CanvasOverlay(vm: EditorViewModel) {
             val gy = guideY.coerceIn(1f, h - 1f)
             if (!guideX.isNaN()) drawLine(Palette.Accent, Offset(gx, 0f), Offset(gx, h), 1.5.dp.toPx(), pathEffect = dash)
             if (!guideY.isNaN()) drawLine(Palette.Accent, Offset(0f, gy), Offset(w, gy), 1.5.dp.toPx(), pathEffect = dash)
+            // The selected text, framed where it is.
+            selText?.let { cap ->
+                val area = com.graden.editor.CaptionRender.videoRect(vm.tracks, vm.assets, vm.hiddenTracks, vm.playheadUs, w, h, fill)
+                com.graden.editor.CaptionRender.bounds(cap, area)?.let { b ->
+                    rotate(cap.rot, Offset(b.centerX(), b.centerY())) {
+                        drawRoundRect(Color.Black.copy(alpha = 0.35f), Offset(b.left, b.top), Size(b.width(), b.height()),
+                            androidx.compose.ui.geometry.CornerRadius(6.dp.toPx()), style = Stroke(3.dp.toPx()))
+                        drawRoundRect(Palette.Accent, Offset(b.left, b.top), Size(b.width(), b.height()),
+                            androidx.compose.ui.geometry.CornerRadius(6.dp.toPx()), style = Stroke(1.5.dp.toPx(), pathEffect = dash))
+                    }
+                }
+            }
             val c = sel ?: return@Canvas
             val s = scaleOf(c)
             val r = CanvasGeo.crop(CanvasGeo.base(w, h, aspectOf(c), fill), c.tf)

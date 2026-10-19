@@ -91,7 +91,6 @@ object Lucide {
     val Film by lazy {
         icon(rect(3f, 3f, 18f, 18f, 2f), "M7 3 v18", "M3 7.5 h4", "M3 12 h18", "M3 16.5 h4", "M17 3 v18", "M17 7.5 h4", "M17 16.5 h4")
     }
-    val Music by lazy { icon("M9 18 V5 l12 -2 v13", circle(6f, 18f, 3f), circle(18f, 16f, 3f)) }
     val Image by lazy { icon(rect(3f, 3f, 18f, 18f, 2f), circle(9f, 9f, 2f), "M21 15 l-3.09 -3.09 a2 2 0 0 0 -2.82 0 L6 21") }
 
     // Tools
@@ -124,6 +123,17 @@ object Lucide {
     val Horizon by lazy { icon("M2 12 h4", "M18 12 h4", "M12 8 a4 4 0 1 1 0 8 a4 4 0 1 1 0 -8", "M8 12 h8") }
     /** A tripod's lock: camera lock. */
     val Tripod by lazy { icon(rect(7f, 3f, 10f, 7f, 2f), "M12 10 v3", "M12 13 L6 21", "M12 13 L18 21", "M12 13 v8") }
+    val MoreVertical by lazy { icon(circle(12f, 5f, 1f), circle(12f, 12f, 1f), circle(12f, 19f, 1f), filled = true) }
+    val Music by lazy { icon("M9 18 V5 l12 -2 v13", circle(6f, 18f, 3f), circle(18f, 16f, 3f)) }
+    val Users by lazy { icon("M16 21 v-2 a4 4 0 0 0 -4 -4 H6 a4 4 0 0 0 -4 4 v2", circle(9f, 7f, 4f), "M22 21 v-2 a4 4 0 0 0 -3 -3.87", "M16 3.13 a4 4 0 0 1 0 7.75") }
+    val AudioWave by lazy { icon("M2 13 a2 2 0 0 0 2 -2 V7 a2 2 0 0 1 4 0 v13 a2 2 0 0 0 4 0 V4 a2 2 0 0 1 4 0 v13 a2 2 0 0 0 4 0 v-4 a2 2 0 0 1 2 -2") }
+    val Captions by lazy { icon(rect(3f, 5f, 18f, 14f, 2f), "M7 15 h4", "M15 15 h2", "M7 11 h2", "M13 11 h4") }
+    /** Order: arrows up and down. */
+    val ArrowUpDown by lazy { icon("m21 16 -4 4 -4 -4", "M17 20 V4", "m3 8 4 -4 4 4", "M7 4 v16") }
+    /** Font: a big A and a small a. */
+    val FontAa by lazy { icon("M3 19 L8.5 5 L14 19", "M5 14 h7", "M21 19 v-6.5 a3 3 0 0 0 -6 0", "M21 15.5 a3 3 0 1 1 -3 -3") }
+    val TypeT by lazy { icon("M4 7 V4 H20 V7", "M9 20 h6", "M12 4 v16") }
+    val Download by lazy { icon("M21 15 v4 a2 2 0 0 1 -2 2 H5 a2 2 0 0 1 -2 -2 v-4", "M7 10 l5 5 l5 -5", "M12 15 V3") }
     val Activity by lazy { icon("M22 12 h-4 l-3 9 L9 3 l-3 9 H2") }
     /** A gyroscope: the visual gyro stabiliser. */
     val Gyro by lazy { icon("M2 12 a10 4 0 1 0 20 0 a10 4 0 1 0 -20 0", "M12 2 a4 10 0 1 0 0 20 a4 10 0 1 0 0 -20", circle(12f, 12f, 1.6f)) }

@@ -164,10 +164,7 @@ fun StabBody(vm: EditorViewModel, modifier: Modifier) {
             AnimatedVisibility(analysed && progress == null, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
                 Column {
                     Presets(vm, s)
-                    MethodCard(vm, s)
-                    CameraCard(vm, s)
-                    FramingCard(vm, s, track)
-                    AdvancedCard(vm, s, c.stab != null)
+                    AdjustCard(vm, s, c.stab != null)
                     Spacer(Modifier.height(24.dp))
                 }
             }
@@ -638,126 +635,19 @@ private fun StabSlider(vm: EditorViewModel, label: String, value: Float, neutral
     }
 }
 
+/**
+ * The few things worth changing by hand: how smooth, how much may be cropped for it, and a level horizon; then
+ * measuring again or taking the stabilisation off. Everything else is the visual gyro's own (it finds the lens and the
+ * rolling shutter from the footage), or a preset.
+ */
 @Composable
-private fun MethodCard(vm: EditorViewModel, s: Stab) {
+private fun AdjustCard(vm: EditorViewModel, s: Stab, applied: Boolean) {
     val d = Stab()
-    val gyro = s.mode == Stab.GYRO
-    SectionCard("Method", note = METHOD_NOTES[s.mode], changed = s.mode != d.mode || s.focus != d.focus,
-        onReset = { vm.setStabOnce { it.copy(mode = d.mode, focus = d.focus) } }) {
+    val changed = s.smooth != d.smooth || s.cropLess != d.cropLess || s.horizon != d.horizon
+    SectionCard("Adjust", note = if (s.lock) "Tripod: held as still as it can be" else "Smoothness and crop", changed = changed,
+        onReset = { vm.setStabOnce { it.copy(smooth = d.smooth, cropLess = d.cropLess, horizon = d.horizon, lock = false) } }) {
         Column(Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)) {
-            if (Stabilizer.gyroAvailable) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    BigOption(Lucide.Gyro, "Gyro", "The camera's own 3D turn", gyro, Modifier.weight(1f)) { vm.setStabOnce { it.copy(mode = Stab.GYRO) } }
-                    BigOption(Lucide.Planes, "Classic", "2D picture methods", !gyro, Modifier.weight(1f)) { if (gyro) vm.setStabOnce { it.copy(mode = Stab.WARP) } }
-                }
-                Spacer(Modifier.height(10.dp))
-            }
-            AnimatedVisibility(gyro, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
-                Column {
-                    // Near and far move differently when the camera moves (not only turns): which to hold steadiest.
-                    ChoiceRow("Hold steadiest", Stab.FOCUSES, s.focus) { f -> vm.setStabOnce { it.copy(focus = f) } }
-                    Text(FOCUS_NOTES[s.focus.coerceIn(0, 2)], color = Pro.Dim, fontSize = 10.5.sp, modifier = Modifier.padding(start = 4.dp))
-                }
-            }
-            AnimatedVisibility(!gyro, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
-                Choice(Stab.MODES.take(4), s.mode.coerceIn(0, 3)) { m -> vm.setStabOnce { it.copy(mode = m) } }
-            }
-        }
-    }
-}
-
-private val FOCUS_NOTES = listOf(
-    "The scene far away: buildings, the horizon",
-    "The whole picture evenly: best for most shots",
-    "Near things a little more, as Google Photos does; things moving on their own are still left out",
-)
-
-private val METHOD_NOTES = listOf(
-    "Only the camera's position: pans and bumps",
-    "Position, turn and zoom of the whole picture",
-    "Also the tilt and lean of the picture",
-    "Holds every part of the picture still: parallax, jello and lens wobble too",
-    "Measures the camera's real 3D turn, row by row: no wobble, no bending, rolling shutter undone exactly. The best result",
-)
-
-@Composable
-private fun CameraCard(vm: EditorViewModel, s: Stab) {
-    val d = Stab()
-    val changed = s.lock != d.lock || s.smooth != d.smooth || s.strength != d.strength || s.horizon != d.horizon || s.method != d.method
-    SectionCard("Camera", note = if (s.lock) "Held as still as a tripod" else "Smooths the path the camera took", changed = changed,
-        onReset = { vm.setStabOnce { it.copy(lock = d.lock, smooth = d.smooth, strength = d.strength, horizon = d.horizon, method = d.method) } }) {
-        Column(Modifier.padding(horizontal = 12.dp).padding(bottom = 10.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                BigOption(Lucide.Activity, "Smooth", "Keeps the move", !s.lock, Modifier.weight(1f)) { vm.setStabOnce { it.copy(lock = false) } }
-                BigOption(Lucide.Tripod, "Camera lock", "No motion at all", s.lock, Modifier.weight(1f)) { vm.setStabOnce { it.copy(lock = true) } }
-            }
-            Spacer(Modifier.height(10.dp))
-            AnimatedVisibility(!s.lock, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
-                Column {
-                    // Cinematic: Google's L1-optimal path: held shots stay perfectly still, moves are clean glides.
-                    ChoiceRow("Smoothing", Stab.METHODS, s.method) { m -> vm.setStabOnce { it.copy(method = m) } }
-                    Text(if (s.method == Stab.CINEMATIC) "Holds still, glides and eases, like a tripod, dolly or crane" else "Follows the camera's own path, gently softened",
-                        color = Pro.Dim, fontSize = 10.5.sp, modifier = Modifier.padding(start = 4.dp, bottom = 6.dp))
-                    StabSlider(vm, "Smoothness", s.smooth, d.smooth, { st, v -> st.copy(smooth = v) })
-                }
-            }
-            StabSlider(vm, "Strength", s.strength, d.strength, { st, v -> st.copy(strength = v) })
-            Spacer(Modifier.height(6.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Lucide.Horizon, null, tint = if (s.horizon) Palette.Accent else Pro.Dim, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Column(Modifier.weight(1f)) {
-                    Text("Lock horizon", color = Pro.Text, fontSize = 13.sp)
-                    Text("Keeps the picture level all through", color = Pro.Dim, fontSize = 10.5.sp)
-                }
-                ProToggle(if (s.horizon) "On" else "Off", s.horizon) { vm.setStabOnce { it.copy(horizon = !it.horizon) } }
-            }
-        }
-    }
-}
-
-@Composable
-private fun BigOption(icon: ImageVector, title: String, note: String, on: Boolean, modifier: Modifier, onClick: () -> Unit) {
-    val view = LocalView.current
-    val lift by animateFloatAsState(if (on) 1f else 0f, spring(0.6f, 420f), label = "opt")
-    Column(
-        modifier.clip(RoundedCornerShape(14.dp))
-            .background(Brush.verticalGradient(listOf(if (on) Color(0xFF30251A) else Pro.CardHi, if (on) Color(0xFF221B14) else Pro.Card)))
-            .border(1.dp, Palette.Accent.copy(alpha = 0.15f + 0.5f * lift), RoundedCornerShape(14.dp))
-            .clickable { if (!on) view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK); onClick() }
-            .padding(12.dp),
-    ) {
-        Icon(icon, null, tint = if (on) Palette.Accent else Pro.Dim, modifier = Modifier.size(20.dp).graphicsLayer { scaleX = 1f + lift * 0.1f; scaleY = 1f + lift * 0.1f })
-        Spacer(Modifier.height(8.dp))
-        Text(title, color = if (on) Palette.Accent else Pro.Text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-        Text(note, color = Pro.Dim, fontSize = 10.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-    }
-}
-
-@Composable
-private fun FramingCard(vm: EditorViewModel, s: Stab, track: StabTrack?) {
-    val d = Stab()
-    val changed = s.framing != d.framing || s.zoom != d.zoom || s.dynamicZoom != d.dynamicZoom || s.cropLess != d.cropLess
-    SectionCard("Framing", note = FRAMING_NOTES[s.framing], changed = changed,
-        onReset = { vm.setStabOnce { it.copy(framing = d.framing, zoom = d.zoom, dynamicZoom = d.dynamicZoom, cropLess = d.cropLess) } }) {
-        Column(Modifier.padding(horizontal = 12.dp).padding(bottom = 10.dp)) {
-            // The five ways to deal with the edges, each drawn as what it does.
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                for ((i, name) in Stab.FRAMINGS.withIndex()) FramingTile(i, name, s.framing == i, Modifier.weight(1f)) { vm.setStabOnce { it.copy(framing = i) } }
-            }
-            Spacer(Modifier.height(10.dp))
-            AnimatedVisibility(s.framing == Stab.AUTO_ZOOM, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
-                Row(Modifier.padding(bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Dynamic zoom", color = Pro.Text, fontSize = 13.sp)
-                        Text(if (s.dynamicZoom) "Zooms only as much as each moment needs" else "One zoom for the whole clip", color = Pro.Dim, fontSize = 10.5.sp)
-                    }
-                    ProToggle(if (s.dynamicZoom) "On" else "Off", s.dynamicZoom) { vm.setStabOnce { it.copy(dynamicZoom = !it.dynamicZoom) } }
-                }
-            }
-            AnimatedVisibility(s.framing == Stab.FIXED_ZOOM, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
-                StabSlider(vm, "Zoom", s.zoom, d.zoom, { st, v -> st.copy(zoom = v) }, min = 1f, max = 2f)
-            }
+            if (!s.lock) StabSlider(vm, "Smoothness", s.smooth, d.smooth, { st, v -> st.copy(smooth = v, mode = Stab.GYRO) })
             // Premiere's trade-off: hold the picture closer to the frame (less crop), or let it move more (smoother).
             ProSliderRaw(
                 "Crop less  ·  Smooth more", (1f - s.cropLess) * 100f, 0f, 100f, (1f - d.cropLess) * 100f, "%.0f%%",
@@ -768,99 +658,15 @@ private fun FramingCard(vm: EditorViewModel, s: Stab, track: StabTrack?) {
                 onType = null,
                 track = Brush.horizontalGradient(listOf(Color(0xFF3A3D48), Palette.Accent)),
             )
-        }
-    }
-}
-
-private val FRAMING_NOTES = listOf(
-    "Zooms in just enough that no edge ever shows",
-    "Zooms in by a set amount; edges may show",
-    "Fills the edges with the picture mirrored",
-    "Fills the edges by stretching the border",
-    "Leaves the edges black",
-)
-
-/** One way of dealing with the edges, as a little drawing of a moved frame. */
-@Composable
-private fun FramingTile(kind: Int, name: String, on: Boolean, modifier: Modifier, onClick: () -> Unit) {
-    val view = LocalView.current
-    val lift by animateFloatAsState(if (on) 1f else 0f, spring(0.6f, 420f), label = "tile")
-    Column(
-        modifier.clip(RoundedCornerShape(12.dp)).background(if (on) Color(0xFF2A2117) else Pro.Well)
-            .border(1.dp, if (on) Palette.Accent.copy(alpha = 0.6f) else Pro.Line, RoundedCornerShape(12.dp))
-            .clickable { if (!on) view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK); onClick() }
-            .padding(vertical = 8.dp, horizontal = 4.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Canvas(Modifier.fillMaxWidth().height(30.dp)) {
-            val fw = size.width * 0.86f; val fh = size.height
-            val ox = (size.width - fw) / 2f
-            val ink = if (on) Palette.Accent else Pro.Dim
-            val fill = ink.copy(alpha = 0.28f)
-            // The frame, and the picture moved and turned inside it.
-            val sky = Color(0xFF4A5C78).copy(alpha = if (on) 0.9f else 0.6f)
-            when (kind) {
-                0, 1 -> {
-                    val z = if (kind == 0) 1f else 0.92f
-                    drawRect(fill, Offset(ox + fw * (1 - z) / 2f, fh * (1 - z) / 2f), Size(fw * z, fh * z))
-                    drawRect(sky, Offset(ox + fw * (1 - z) / 2f, fh * (1 - z) / 2f), Size(fw * z, fh * z * 0.5f))
-                    if (kind == 1) drawRect(Color.Black, Offset(ox, fh * 0.9f), Size(fw * 0.3f, fh * 0.1f))
-                }
-                2 -> {
-                    drawRect(fill, Offset(ox + fw * 0.12f, 0f), Size(fw * 0.88f, fh))
-                    drawRect(sky, Offset(ox + fw * 0.12f, 0f), Size(fw * 0.88f, fh * 0.5f))
-                    drawRect(fill.copy(alpha = 0.16f), Offset(ox, 0f), Size(fw * 0.12f, fh))
-                    drawRect(sky.copy(alpha = 0.4f), Offset(ox, 0f), Size(fw * 0.12f, fh * 0.5f))
-                }
-                3 -> {
-                    drawRect(fill, Offset(ox + fw * 0.12f, 0f), Size(fw * 0.88f, fh))
-                    drawRect(sky, Offset(ox + fw * 0.12f, 0f), Size(fw * 0.88f, fh * 0.5f))
-                    for (k in 0 until 4) drawLine(ink.copy(alpha = 0.35f), Offset(ox, fh * (0.15f + k * 0.23f)), Offset(ox + fw * 0.12f, fh * (0.15f + k * 0.23f)), 1.dp.toPx())
-                }
-                else -> {
-                    drawRect(Color.Black, Offset(ox, 0f), Size(fw, fh))
-                    drawRect(fill, Offset(ox + fw * 0.12f, fh * 0.08f), Size(fw * 0.88f, fh * 0.92f))
-                    drawRect(sky, Offset(ox + fw * 0.12f, fh * 0.08f), Size(fw * 0.88f, fh * 0.46f))
-                }
-            }
-            drawRoundRect(ink, Offset(ox, 0f), Size(fw, fh), CornerRadius(3.dp.toPx()), style = Stroke(1.2.dp.toPx() + lift * 0.6.dp.toPx()))
-        }
-        Spacer(Modifier.height(5.dp))
-        Text(name, color = if (on) Palette.Accent else Pro.Text, fontSize = 10.sp, fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
-    }
-}
-
-@Composable
-private fun AdvancedCard(vm: EditorViewModel, s: Stab, applied: Boolean) {
-    val d = Stab()
-    val changed = s.rollingShutter != d.rollingShutter || s.detailed != d.detailed
-    SectionCard("Advanced", note = "Rolling shutter, tracking detail", changed = changed, initiallyOpen = false,
-        onReset = { vm.setStabOnce { it.copy(rollingShutter = d.rollingShutter) } }) {
-        Column(Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)) {
-            if (s.mode == Stab.GYRO) {
-                Text("Gyro finds the lens and the sensor's rolling shutter from the footage itself and undoes the jello exactly",
-                    color = Pro.Dim, fontSize = 10.5.sp, modifier = Modifier.padding(start = 4.dp, bottom = 8.dp))
-            } else if (s.mode == Stab.WARP) {
-                Text("Warp takes out rolling-shutter jello by itself", color = Pro.Dim, fontSize = 10.5.sp, modifier = Modifier.padding(start = 4.dp, bottom = 8.dp))
-            } else {
-                StabSlider(vm, "Rolling shutter", s.rollingShutter, d.rollingShutter, { st, v -> st.copy(rollingShutter = v) })
-                Text("Straightens the lean and wobble (jello) phone sensors give fast moves", color = Pro.Dim, fontSize = 10.5.sp, modifier = Modifier.padding(start = 4.dp, bottom = 8.dp))
-            }
-            if (s.mode == Stab.GYRO) {
-                val asset = vm.stabTarget?.let { vm.assets[it.clip.assetId] }
-                AnalysisResolution(vm, asset?.let { maxOf(it.width, it.height) } ?: 0)
-                Text("A new resolution takes effect after Measure again", color = Pro.Faint, fontSize = 10.5.sp, modifier = Modifier.padding(top = 2.dp, bottom = 10.dp))
-            }
+            Spacer(Modifier.height(6.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Lucide.Horizon, null, tint = if (s.horizon) Palette.Accent else Pro.Dim, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
                 Column(Modifier.weight(1f)) {
-                    Text("Detailed analysis", color = Pro.Text, fontSize = 13.sp)
-                    Text("More points, each checked both ways; slower to measure", color = Pro.Dim, fontSize = 10.5.sp)
+                    Text("Lock horizon", color = Pro.Text, fontSize = 13.sp)
+                    Text("Keeps the picture level all through", color = Pro.Dim, fontSize = 10.5.sp)
                 }
-                ProToggle(if (s.detailed) "On" else "Off", s.detailed) {
-                    vm.setStabOnce { it.copy(detailed = !it.detailed) }
-                    // The detailed measurement is made when it is turned on and there is none yet.
-                    vm.analyseStabIfNeeded()
-                }
+                ProToggle(if (s.horizon) "On" else "Off", s.horizon) { vm.setStabOnce { it.copy(horizon = !it.horizon) } }
             }
             Spacer(Modifier.height(12.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {

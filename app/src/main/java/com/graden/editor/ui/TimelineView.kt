@@ -579,6 +579,12 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                     val push = if (track.id == V0 && clip.startUs >= gapAt) gapPx
                     else if (track.id == pushLane.value && clip.id != moving && clip.startUs >= pushFrom.value) (pushUs / usPerPx).toFloat()
                     else 0f
+                    // A text: its words on a coloured bar (caption, lyrics and music, or a text added by hand).
+                    val cap = clip.caption
+                    if (cap != null) {
+                        drawCaptionBlock(g, cap, xOf(clip.startUs) + push, xOf(clip.endUs) - 2.5f * g.dp + push, top + 3 * g.dp, h - 6 * g.dp, clip.id == moving)
+                        continue
+                    }
                     val a = assets[clip.assetId]
                     val peaks = a?.let(vm.waves::get)
                     val alt = audioIndex % 2 == 1
@@ -615,7 +621,7 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                     )
                 }
                 // On every cut of a video lane: a "+" to add a transition, or the transition that is there.
-                if (track.video && moving == null) for (ci in ordered.firstEndingAfter(laneClips, tL) until laneClips.size) {
+                if (track.pictures && moving == null) for (ci in ordered.firstEndingAfter(laneClips, tL) until laneClips.size) {
                     val clip = laneClips[ci]
                     if (clip.startUs > tR + 5_000_000L) break
                     drawAnimMarks(g, clip, xOf(clip.startUs), xOf(clip.endUs) - 2.5f * g.dp, top + 3 * g.dp, h - 6 * g.dp, usPerPx)
@@ -1021,6 +1027,30 @@ private fun DrawScope.drawClipBlock(
  * chevron pointing the way it pulls. It is taller than the lane, casts a soft shadow, and turns
  * orange and widens while it is being dragged.
  */
+private val captionText = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply { color = android.graphics.Color.WHITE }
+
+/** A caption on its layer: a rounded bar with its words, cut off at its end. */
+private fun DrawScope.drawCaptionBlock(g: Geo, cap: com.graden.editor.Caption, x0: Float, x1: Float, top: Float, h: Float, lifted: Boolean) {
+    if (x1 - x0 < 1f) return
+    // Captions from the sound violet (lyrics and music blue); texts added by hand teal, marked T.
+    val base = when (cap.kind) {
+        com.graden.editor.Caption.TEXT -> Color(0xFF1F6F6A)
+        com.graden.editor.Cue.SPEECH -> Color(0xFF5A4797)
+        else -> Color(0xFF2F5E86)
+    }
+    drawRoundRect(if (lifted) base.copy(alpha = 0.7f) else base, Offset(x0, top), Size(x1 - x0, h), CornerRadius(5 * g.dp))
+    drawRoundRect(Color.White.copy(alpha = 0.18f), Offset(x0, top), Size(x1 - x0, h), CornerRadius(5 * g.dp), style = Stroke(1 * g.dp))
+    if (x1 - x0 < 14 * g.dp) return
+    drawIntoCanvas { c ->
+        val nc = c.nativeCanvas
+        captionText.textSize = 11.5f * g.dp
+        nc.save()
+        nc.clipRect(x0 + 5 * g.dp, top, x1 - 4 * g.dp, top + h)
+        nc.drawText((if (cap.kind == com.graden.editor.Caption.TEXT) "T  " else "") + cap.text.replace('\n', ' '), x0 + 6 * g.dp, top + h / 2 + 4 * g.dp, captionText)
+        nc.restore()
+    }
+}
+
 private fun DrawScope.drawTrimHandle(g: Geo, path: Path, left: Boolean, edgeX: Float, top: Float, h: Float, active: Boolean) {
     val w = g.handleW * if (active) 1.25f else 1f
     val out = 4 * g.dp

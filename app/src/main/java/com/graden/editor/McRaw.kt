@@ -174,6 +174,10 @@ class RawCal(j: JSONObject) {
     val aperture = j.optDouble("ap", 0.0)
     val width = j.optInt("w"); val height = j.optInt("h")
     val hasFm = fm1.any { it != 0.0 }
+    /** The levels the recording claims: black per site of the 2 × 2 pattern, and white. */
+    val black = d(j, "black", 4)
+    val white = j.optDouble("white", 1023.0)
+    val cfa = IntArray(4) { j.optJSONArray("cfa")?.optInt(it, 1) ?: intArrayOf(0, 1, 1, 2)[it] }
 
     private fun d(j: JSONObject, k: String, n: Int = 9) = DoubleArray(n) { j.optJSONArray(k)?.optDouble(it) ?: 0.0 }
 }
@@ -212,17 +216,19 @@ data class RawLayer(
     /** The colour space and gamma the clip is decoded into (null: scene-linear Rec.2020, for the colour space layer to take on). */
     val outGamut: String? = null,
     val outGamma: String? = null,
+    /** Colour from the colour matrices alone (the forward matrices ignored), as MotionCam Fuse offers. */
+    val noForward: Boolean = false,
 ) {
     val isDefault get() = this == RawLayer()
     /** The settings actually used: the camera's own, or these. */
-    val effective: RawLayer get() = if (decode == CAMERA) RawLayer(on = on, outGamut = outGamut, outGamma = outGamma) else this
+    val effective: RawLayer get() = if (decode == CAMERA) RawLayer(on = on, outGamut = outGamut, outGamma = outGamma, noForward = noForward) else this
 
     fun toJson(): JSONObject = JSONObject().put("on", on).put("dc", decode).put("wb", wb).put("t", temp.toDouble()).put("ti", tint.toDouble())
         .put("iso", iso.toDouble()).put("e", exposure.toDouble()).put("s", saturation.toDouble()).put("cb", colorBoost.toDouble())
         .put("c", contrast.toDouble()).put("mp", midpoint.toDouble()).put("h", highlights.toDouble()).put("sh", shadows.toDouble())
         .put("hr", highRolloff.toDouble()).put("lr", lowRolloff.toDouble()).put("rec", recovery.toDouble())
         .put("bo", blackOffset.toDouble()).put("ws", whiteScale.toDouble()).put("sp", sharpness.toDouble()).put("md", midDetail.toDouble())
-        .putOpt("og", outGamut).putOpt("oy", outGamma)
+        .putOpt("og", outGamut).putOpt("oy", outGamma).put("nf", noForward)
 
     companion object {
         const val CAMERA = 0; const val CLIP = 1
@@ -235,7 +241,8 @@ data class RawLayer(
             fun f(k: String, d: Double) = it.optDouble(k, d).toFloat()
             RawLayer(it.optBoolean("on", true), it.optInt("dc", CAMERA), it.optInt("wb"), f("t", 5500.0), f("ti", 0.0), f("iso", 0.0), f("e", 0.0),
                 f("s", 1.0), f("cb", 0.0), f("c", 1.0), f("mp", 0.18), f("h", 0.0), f("sh", 0.0), f("hr", 0.0), f("lr", 0.0), f("rec", 0.5),
-                f("bo", 0.0), f("ws", 1.0), f("sp", 0.0), f("md", 0.0), it.optString("og").ifEmpty { null }, it.optString("oy").ifEmpty { null })
+                f("bo", 0.0), f("ws", 1.0), f("sp", 0.0), f("md", 0.0), it.optString("og").ifEmpty { null }, it.optString("oy").ifEmpty { null },
+                it.optBoolean("nf"))
         } ?: RawLayer()
     }
 }
@@ -351,11 +358,11 @@ object RawColor {
      * The develop matrix for camera neutral [n]: camera RGB (white balanced by [gains], see [gains]) to scene-linear
      * Rec.2020, where a neutral camera value of 1 lands on 1.
      */
-    fun cameraTo2020(cal: RawCal, n: DoubleArray): DoubleArray {
+    fun cameraTo2020(cal: RawCal, n: DoubleArray, useFm: Boolean = true): DoubleArray {
         val (t, _) = tempTint(cal, n)
         val w = weight(cal, t)
         val cc = lerp(cal.cc1, cal.cc2, w)
-        val toPcs = if (cal.hasFm) {
+        val toPcs = if (cal.hasFm && useFm) {
             // DNG: ReferenceNeutral = inv(CC)·n; CameraToPCS = FM · diag(1/ReferenceNeutral) · inv(CC).
             val fm = lerp(cal.fm1, cal.fm2, w)
             val ref = mulv(inv(cc), n)
@@ -391,7 +398,7 @@ object RawColor {
         val layer = layer0.effective
         val n = if (layer.wb == RawLayer.AS_SHOT) cal.asShot.map { it.coerceAtLeast(1e-4) }.toDoubleArray().let { doubleArrayOf(it[0] / it[1], 1.0, it[2] / it[1]) }
         else neutral(cal, layer.temp.toDouble(), layer.tint.toDouble())
-        var m = cameraTo2020(cal, n)
+        var m = cameraTo2020(cal, n, !layer.noForward)
         // Decoded into another gamut: its matrix folded in (ColorSpaces.matrix is column-major).
         layer.outGamut?.takeIf { it != "Rec.2020" }?.let { name ->
             val cm = ColorSpaces.matrix(ColorSpaces.gamut("Rec.2020"), ColorSpaces.gamut(name))
@@ -403,7 +410,7 @@ object RawColor {
         // ISO: brightness relative to the ISO it was recorded at.
         val isoGain = if (layer.iso > 0f && cal.iso > 0) layer.iso / cal.iso.toDouble() else 1.0
         out[16] = 1f
-        out[17] = (2.0.pow(layer.exposure + cal.baselineExposure + DEFAULT_EV) * isoGain / layer.whiteScale.coerceAtLeast(0.25f)).toFloat()
+        out[17] = (2.0.pow(layer.exposure + cal.baselineExposure + DEFAULT_EV) * isoGain / layer.whiteScale.coerceIn(0.25f, 2f)).toFloat()
         out[18] = layer.saturation
         out[19] = layer.blackOffset
         out[20] = layer.contrast; out[21] = layer.midpoint; out[22] = layer.highlights; out[23] = layer.shadows
@@ -411,7 +418,7 @@ object RawColor {
         out[27] = layer.outGamma?.let { ColorSpaces.gamma(it).code.toFloat() } ?: -1f
         out[28] = layer.sharpness; out[29] = layer.midDetail
         // Where the sensor clips (highlight recovery works from it), the recording's white being 1.
-        out[30] = layer.whiteScale.coerceIn(0.25f, 1f)
+        out[30] = layer.whiteScale.coerceIn(0.25f, 2f)
         return out
     }
 

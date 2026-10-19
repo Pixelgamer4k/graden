@@ -38,11 +38,12 @@ class ProjectStore(private val dir: File) {
                     .apply { if (a.isReversed) put("revOf", a.reverseOf).put("revIn", a.revInUs).put("revOut", a.revOutUs) }
                     .apply { if (a.fullRange) put("fr", true) }
                     .apply { if (a.hlg) put("hlg", true) }
-                    .apply { if (a.isRaw) put("raw", a.raw).put("rawCal", a.rawCal).put("rawHalf", a.rawHalf).put("rawShade", a.rawShading) }
+                    .apply { if (a.isRaw) put("raw", a.raw).put("rawCal", a.rawCal).put("rawHalf", a.rawHalf).put("rawShade", a.rawShading).putOpt("rawDev", a.rawDev) }
+                    .apply { if (a.bytes > 0) put("bytes", a.bytes); if (a.dateMs > 0) put("date", a.dateMs) }
             )
         })
         root.put("tracks", JSONArray().apply {
-            for (t in tracks) put(JSONObject().put("id", t.id).put("video", t.video).put("name", t.name).put("clips", clipsJson(t.clips)))
+            for (t in tracks) put(JSONObject().put("id", t.id).put("video", t.video).put("name", t.name).put("clips", clipsJson(t.clips)).apply { if (t.captions) put("cap", true) })
         })
         fun ids(set: Set<Int>) = JSONArray().apply { set.forEach { put(it) } }
         root.put(
@@ -71,6 +72,7 @@ class ProjectStore(private val dir: File) {
                 .putOpt("gr", if (c.grade.isIdentity) null else c.grade.toJson())
                 .putOpt("cs", c.cs)
                 .putOpt("stab", c.stab?.toJson())
+                .putOpt("cap", c.caption?.let(::captionJson))
                 .putOpt("snd", if (c.snd.isDefault) null else JSONObject().put("v", c.snd.volume.toDouble()).put("m", c.snd.muted)
                     .put("n", c.snd.normalize).put("fi", c.snd.fadeInUs).put("fo", c.snd.fadeOutUs).put("p", c.snd.pan.toDouble())
                     .put("b", c.snd.bass.toDouble()).put("mi", c.snd.mid.toDouble()).put("t", c.snd.treble.toDouble()).put("pi", c.snd.pitch.toDouble()))
@@ -95,6 +97,7 @@ class ProjectStore(private val dir: File) {
                 Grade.fromJson(o.optJSONObject("gr")),
                 o.optString("cs").ifEmpty { null },
                 Stab.fromJson(o.optJSONObject("stab")),
+                o.optJSONObject("cap")?.let(::readCaption),
             )
         }
 
@@ -126,7 +129,7 @@ class ProjectStore(private val dir: File) {
     }.getOrNull()
 
     private fun tracksJson(tracks: List<Track>) = JSONArray().apply {
-        for (t in tracks) put(JSONObject().put("id", t.id).put("video", t.video).put("name", t.name).put("clips", clipsJson(t.clips)))
+        for (t in tracks) put(JSONObject().put("id", t.id).put("video", t.video).put("name", t.name).put("clips", clipsJson(t.clips)).apply { if (t.captions) put("cap", true) })
     }
 
     /** The undo and redo steps, kept beside the project so they survive closing the app. */
@@ -151,7 +154,7 @@ class ProjectStore(private val dir: File) {
             val a = root.optJSONArray(key) ?: return emptyList()
             return (0 until a.length()).map { i ->
                 val ta = a.getJSONArray(i)
-                (0 until ta.length()).map { ta.getJSONObject(it) }.map { o -> Track(o.getInt("id"), o.getBoolean("video"), readClips(o.getJSONArray("clips")), o.optString("name", "")) }
+                (0 until ta.length()).map { ta.getJSONObject(it) }.map { o -> Track(o.getInt("id"), o.getBoolean("video"), readClips(o.getJSONArray("clips")), o.optString("name", ""), o.optBoolean("cap")) }
             }
         }
         return steps("undo") to steps("redo")
@@ -176,12 +179,13 @@ class ProjectStore(private val dir: File) {
                     o.getBoolean("hasAudio"), o.getBoolean("hdr"), o.getString("mime"), o.optInt("tier", 0),
                     o.optInt("revOf", -1), o.optLong("revIn", 0L), o.optLong("revOut", 0L),
                     o.optString("raw").ifEmpty { null }, o.optString("rawCal").ifEmpty { null }, o.optBoolean("rawHalf"), o.optBoolean("rawShade", true), o.optBoolean("fr"), o.optBoolean("hlg"),
+                    o.optString("rawDev").ifEmpty { null }, o.optLong("bytes"), o.optLong("date"),
                 )
             }
-            fun clips(ca: JSONArray) = readClips(ca).filter { it.assetId in assets }
+            fun clips(ca: JSONArray) = readClips(ca).filter { it.assetId in assets || it.isCaption }
             val ta = root.optJSONArray("tracks") ?: JSONArray()
             val tracks = (0 until ta.length()).map { ta.getJSONObject(it) }
-                .map { o -> Track(o.getInt("id"), o.getBoolean("video"), clips(o.getJSONArray("clips")), o.optString("name", "")) }
+                .map { o -> Track(o.getInt("id"), o.getBoolean("video"), clips(o.getJSONArray("clips")), o.optString("name", ""), o.optBoolean("cap")) }
             // Older projects kept V1 as a gapless list: lay those clips end to end as track 0.
             val legacy = root.optJSONArray("clips")?.let(::clips) ?: emptyList()
             var at = 0L
@@ -205,5 +209,39 @@ class ProjectStore(private val dir: File) {
         } catch (e: Exception) {
             null
         }
+    }
+
+    companion object {
+        /** A text as JSON: only what differs from the defaults, so captions stay small in the project file. */
+        fun captionJson(c: Caption): JSONObject {
+            val d = Caption(""); val o = JSONObject().put("t", c.text).put("k", c.kind).put("tf", c.tintFrom).put("s", c.size)
+            if (c.scale != d.scale) o.put("sc", c.scale.toDouble())
+            if (c.placed) o.put("x", c.x.toDouble()).put("y", c.y.toDouble())
+            if (c.rot != 0f) o.put("r", c.rot.toDouble())
+            if (c.animIn != d.animIn) o.put("ai", c.animIn).put("aiu", c.inUs)
+            if (c.animOut != d.animOut) o.put("ao", c.animOut).put("aou", c.outUs)
+            if (c.look != d.look) o.put("look", lookJson(c.look))
+            return o
+        }
+
+        fun readCaption(o: JSONObject): Caption = Caption(
+            o.optString("t"), o.optInt("k"), o.optInt("tf", -1), o.optInt("s", 2).coerceIn(0, 4),
+            o.optDouble("sc", 1.0).toFloat(), o.optDouble("x", Double.NaN).toFloat(), o.optDouble("y", Double.NaN).toFloat(),
+            o.optDouble("r", 0.0).toFloat(), o.optJSONObject("look")?.let(::readLook) ?: TextLook(),
+            o.optString("ai", TextAnim.NONE), o.optString("ao", TextAnim.NONE), o.optLong("aiu", 400_000L), o.optLong("aou", 400_000L),
+        )
+
+        fun lookJson(l: TextLook): JSONObject = JSONObject().put("f", l.font).put("w", l.weight).put("i", l.italic).put("c", l.color)
+            .put("st", l.stroke.toDouble()).put("sc", l.strokeColor).put("sh", l.shadow.toDouble()).put("shc", l.shadowColor)
+            .put("bx", l.box).put("br", l.boxRound.toDouble()).put("al", l.align).put("ls", l.letter.toDouble()).put("lh", l.line.toDouble())
+            .put("cp", l.caps).put("dc", l.decor).put("dcc", l.decorColor).put("sub", l.sub.toDouble()).put("subc", l.subColor).put("op", l.opacity.toDouble())
+
+        fun readLook(o: JSONObject): TextLook { val d = TextLook(); return TextLook(
+            o.optString("f", d.font), o.optInt("w", d.weight), o.optBoolean("i"), o.optInt("c", d.color),
+            o.optDouble("st", d.stroke.toDouble()).toFloat(), o.optInt("sc", d.strokeColor), o.optDouble("sh", d.shadow.toDouble()).toFloat(), o.optInt("shc", d.shadowColor),
+            o.optInt("bx", d.box), o.optDouble("br", d.boxRound.toDouble()).toFloat(), o.optInt("al", d.align), o.optDouble("ls", 0.0).toFloat(),
+            o.optDouble("lh", d.line.toDouble()).toFloat(), o.optBoolean("cp"), o.optInt("dc", 0), o.optInt("dcc", d.decorColor),
+            o.optDouble("sub", 1.0).toFloat(), o.optInt("subc", d.subColor), o.optDouble("op", 1.0).toFloat(),
+        ) }
     }
 }

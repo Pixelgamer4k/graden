@@ -885,7 +885,7 @@ private fun ColorTransport(vm: EditorViewModel) {
             Btn(Lucide.ChevronsRight, "Forward one frame") { vm.stepFrames(1) }
             Btn(Lucide.SkipForward, "Next clip") { vm.jumpClip(1) }
             // Which clip of the project this is, counting the pictures on every layer in time order.
-            val all = vm.tracks.filter { it.video }.flatMap { it.clips }.sortedBy { it.startUs }
+            val all = vm.tracks.filter { it.pictures }.flatMap { it.clips }.sortedBy { it.startUs }
             val i = vm.gradeTarget?.let { t -> all.indexOfFirst { it.id == t.clip.id } } ?: -1
             Text(
                 if (i >= 0) "${i + 1}/${all.size}" else "–/${all.size}", color = Palette.TextDim, fontSize = sp(12f), fontFamily = Mono,
@@ -1134,10 +1134,10 @@ private fun ColorTimeline(vm: EditorViewModel, height: androidx.compose.ui.unit.
     }
 }
 
-private fun lanes(vm: EditorViewModel) = vm.tracks.filter { it.video }.reversed()
+private fun lanes(vm: EditorViewModel) = vm.tracks.filter { it.pictures }.reversed()
 
 /** Which clips are under the playhead on every picture lane, to feel each cut while scrubbing. */
-private fun cutsUnder(vm: EditorViewModel): List<Long?> = vm.tracks.filter { it.video }.map { it.clipAt(vm.playheadUs)?.id }
+private fun cutsUnder(vm: EditorViewModel): List<Long?> = vm.tracks.filter { it.pictures }.map { it.clipAt(vm.playheadUs)?.id }
 
 /** The clip under [p] in the Color page's timeline, if any. */
 private fun clipAt(vm: EditorViewModel, lanes: List<com.graden.editor.Track>, p: Offset, width: Float, pps: Float, scroll: Float, geo: CtGeo): Long? {
@@ -1162,6 +1162,9 @@ private fun Controls(vm: EditorViewModel, modifier: Modifier) {
     var picking by remember { mutableStateOf(false) }
     Column(modifier.fillMaxWidth().background(Panel)) {
         Box(Modifier.fillMaxWidth().height(1.dp).background(Palette.Line))
+        // MCRAW only for MotionCam RAW clips: another clip under the playhead goes back to the grade.
+        val isRaw = vm.gradeTarget?.clip?.let { vm.assets[it.assetId] }?.isRaw == true
+        if (layer == Layer.RAW && !isRaw) layer = Layer.CORRECTION
         LayerStrip(vm, layer) { layer = it }
         if (layer == Layer.CORRECTION) {
             val g = vm.gradeTarget?.clip?.grade ?: Grade()
