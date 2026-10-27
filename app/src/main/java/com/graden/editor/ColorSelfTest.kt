@@ -43,7 +43,29 @@ void main() {
      * Runs [xf] on this GPU over [pts] (RGB triples), returning the results: for checking the shader against numbers
      * measured from other software (GradenLab's "cst" command against Resolve). Call off the main thread.
      */
-    fun batch(xf: ColorSpaces.Xf, pts: FloatArray): FloatArray {
+    fun batch(xf: ColorSpaces.Xf, pts: FloatArray): FloatArray = runPoints(FRAG.replace("CURVES", ColorSpaces.GLSL), pts) { u ->
+        val b = FloatArray(ColorSpaces.XF_SIZE); xf.pack(b, 0)
+        GLES20.glUniform1f(u("uMode"), 2f)
+        GLES20.glUniform4f(u("uA"), b[0], b[1], b[2], b[3]); GLES20.glUniform4f(u("uB"), b[4], b[5], b[6], b[7])
+        GLES20.glUniformMatrix3fv(u("uM"), 1, false, b, 8)
+        GLES20.glUniform3f(u("uY"), b[17], b[18], b[19])
+    }
+
+    /**
+     * Runs a [grade]'s primaries (the Color Wheels palette: the very code Graden grades with, taken from its shader) on
+     * this GPU over [pts], for checking against Resolve's own LUT of the same grade. Call off the main thread.
+     */
+    fun gradeBatch(grade: Grade, pts: FloatArray): FloatArray {
+        val g = GradeShader.FRAGMENT
+        val body = g.substring(g.indexOf("// ---- correction"), g.indexOf("/** How much a shadow-side zone"))
+        val frag = "precision highp float;\nuniform vec3 uIn;\nuniform vec4 uG[9];\nuniform vec2 uTexel;\nvec2 vUv;\n" + ColorSpaces.GLSL +
+            "const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);\nfloat luma(vec3 c) { return dot(c, LUMA); }\n" +
+            "vec3 raw(vec2 p) { return vec3(0.0); }\nvec3 cst(vec3 c) { return c; }\n" + body +
+            "void main() { gl_FragColor = vec4(primaries(uIn), 1.0); }\n"
+        return runPoints(frag, pts) { u -> GLES20.glUniform4fv(u("uG"), 9, grade.uniforms(), 0) }
+    }
+
+    private fun runPoints(frag: String, pts: FloatArray, setUp: ((String) -> Int) -> Unit): FloatArray {
         val d = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
         val v = IntArray(2); EGL14.eglInitialize(d, v, 0, v, 1)
         val cfg = arrayOfNulls<EGLConfig>(1); val n = IntArray(1)
@@ -59,7 +81,7 @@ void main() {
             }
             val p = GLES20.glCreateProgram()
             GLES20.glAttachShader(p, sh(GLES20.GL_VERTEX_SHADER, VERT))
-            GLES20.glAttachShader(p, sh(GLES20.GL_FRAGMENT_SHADER, FRAG.replace("CURVES", ColorSpaces.GLSL)))
+            GLES20.glAttachShader(p, sh(GLES20.GL_FRAGMENT_SHADER, frag))
             GLES20.glLinkProgram(p)
             GLES20.glUseProgram(p)
             val count = pts.size / 3
@@ -74,11 +96,7 @@ void main() {
             val a = GLES20.glGetAttribLocation(p, "aPos")
             GLES20.glEnableVertexAttribArray(a); GLES20.glVertexAttribPointer(a, 2, GLES20.GL_FLOAT, false, 0, quad)
             fun u(name: String) = GLES20.glGetUniformLocation(p, name)
-            val b = FloatArray(ColorSpaces.XF_SIZE); xf.pack(b, 0)
-            GLES20.glUniform1f(u("uMode"), 2f)
-            GLES20.glUniform4f(u("uA"), b[0], b[1], b[2], b[3]); GLES20.glUniform4f(u("uB"), b[4], b[5], b[6], b[7])
-            GLES20.glUniformMatrix3fv(u("uM"), 1, false, b, 8)
-            GLES20.glUniform3f(u("uY"), b[17], b[18], b[19])
+            setUp(::u)
             SatCompTable.bind(p)
             val inLoc = u("uIn")
             for (i in 0 until count) {

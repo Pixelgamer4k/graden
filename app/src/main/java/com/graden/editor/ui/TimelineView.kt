@@ -1,5 +1,13 @@
 package com.graden.editor.ui
 
+import androidx.compose.runtime.getValue
+
+import androidx.compose.runtime.setValue
+
+import androidx.compose.ui.platform.LocalView
+
+import androidx.compose.ui.draw.shadow
+
 import android.graphics.Paint
 import android.graphics.Typeface
 import androidx.compose.animation.core.Animatable
@@ -769,16 +777,10 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                     color = if (la.lane.video) Palette.VideoLabel else Palette.AudioLabel,
                     fontSize = 13.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
                 )
-                if (id >= 0 && h > 36 * g.dp) Row(Modifier.padding(top = 1.dp)) {
-                    val locked = id in vm.lockedTracks
-                    HeaderIcon(if (locked) Lucide.Lock else Lucide.LockOpen, if (locked) "Unlock track" else "Lock track", locked) { vm.toggleLock(id) }
-                    if (la.lane.video) {
-                        val hidden = id in vm.hiddenTracks
-                        HeaderIcon(if (hidden) Lucide.EyeOff else Lucide.Eye, if (hidden) "Show track" else "Hide track", hidden) { vm.toggleHidden(id) }
-                    } else {
-                        val muted = id in vm.mutedTracks
-                        HeaderIcon(if (muted) Lucide.VolumeX else Lucide.Volume, if (muted) "Unmute track" else "Mute track", muted) { vm.toggleMute(id) }
-                    }
+                if (id >= 0 && h > 30 * g.dp) {
+                    // One easy target per lane: a pill showing what is set (locked, hidden, muted); tapped, it opens
+                    // large switches for all three beside the header. The lane stays the size it is.
+                    LaneControls(vm, id, la.lane.video, if (la.lane.video) vm.laneHasSound(id) else true)
                 }
             }
         }
@@ -786,9 +788,62 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
     }
 }
 
+/** A lane's state at a glance, and the way to its switches. */
 @Composable
-private fun HeaderIcon(icon: ImageVector, label: String, active: Boolean, onClick: () -> Unit) {
-    Icon(icon, label, tint = if (active) Palette.Accent else Palette.TextDim, modifier = Modifier.size(20.dp).clickable(onClick = onClick).padding(3.5.dp))
+private fun LaneControls(vm: EditorViewModel, id: Int, visual: Boolean, sound: Boolean) {
+    val locked = id in vm.lockedTracks
+    val hidden = id in vm.hiddenTracks
+    val muted = id in vm.mutedTracks
+    var open by remember { mutableStateOf(false) }
+    val any = locked || (visual && hidden) || (sound && muted)
+    val shape = RoundedCornerShape(9.dp)
+    Box {
+        Row(
+            Modifier.padding(top = 3.dp).width(38.dp).height(22.dp).clip(shape)
+                .background(if (open) Palette.Accent.copy(alpha = 0.3f) else if (any) Palette.Accent.copy(alpha = 0.16f) else Color(0xFF26272E))
+                .border(1.dp, if (any || open) Palette.Accent.copy(alpha = 0.7f) else Color(0x24FFFFFF), shape)
+                .clickable { open = true },
+            horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (!any) Icon(Lucide.Settings, "Track settings", tint = Palette.TextDim, modifier = Modifier.size(12.dp))
+            else {
+                if (locked) Icon(Lucide.Lock, "Locked", tint = Palette.Accent, modifier = Modifier.size(11.dp))
+                if (visual && hidden) Icon(Lucide.EyeOff, "Hidden", tint = Palette.Accent, modifier = Modifier.size(11.dp))
+                if (sound && muted) Icon(Lucide.VolumeX, "Muted", tint = Palette.Accent, modifier = Modifier.size(11.dp))
+            }
+        }
+        if (open) androidx.compose.ui.window.Popup(
+            alignment = Alignment.TopStart, offset = IntOffset(with(LocalDensity.current) { 44.dp.roundToPx() }, with(LocalDensity.current) { (-18).dp.roundToPx() }),
+            onDismissRequest = { open = false }, properties = androidx.compose.ui.window.PopupProperties(focusable = true),
+        ) {
+            val card = RoundedCornerShape(16.dp)
+            Row(
+                Modifier.shadow(16.dp, card, ambientColor = Color.Black, spotColor = Color.Black).clip(card)
+                    .background(Brush.verticalGradient(listOf(Color(0xFF2A2B33), Color(0xFF1E1F25)))).border(1.dp, Color(0x29FFFFFF), card).padding(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                LaneSwitch(if (locked) Lucide.Lock else Lucide.LockOpen, if (locked) "Locked" else "Lock", locked) { vm.toggleLock(id) }
+                if (visual) LaneSwitch(if (hidden) Lucide.EyeOff else Lucide.Eye, if (hidden) "Hidden" else "Hide", hidden) { vm.toggleHidden(id) }
+                if (sound) LaneSwitch(if (muted) Lucide.VolumeX else Lucide.Volume, if (muted) "Muted" else "Mute", muted) { vm.toggleMute(id) }
+            }
+        }
+    }
+}
+
+/** One big switch in a lane's panel: icon and word, lit when on. */
+@Composable
+private fun LaneSwitch(icon: ImageVector, label: String, on: Boolean, onClick: () -> Unit) {
+    val view = LocalView.current
+    val shape = RoundedCornerShape(12.dp)
+    Column(
+        Modifier.width(66.dp).height(58.dp).clip(shape)
+            .background(if (on) Palette.Accent.copy(alpha = 0.22f) else Color(0xFF34353E)).border(1.dp, if (on) Palette.Accent else Color(0x1AFFFFFF), shape)
+            .clickable { view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK); onClick() },
+        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
+    ) {
+        Icon(icon, label, tint = if (on) Palette.Accent else Palette.Text, modifier = Modifier.size(20.dp))
+        Text(label, color = if (on) Palette.Accent else Palette.TextDim, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 4.dp))
+    }
 }
 
 /**

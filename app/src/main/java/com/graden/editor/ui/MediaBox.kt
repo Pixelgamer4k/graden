@@ -46,6 +46,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
@@ -132,7 +133,8 @@ fun MediaWindow(
                 onClose = { vm.mediaBoxOpen = false },
                 trailing = {
                     Row(
-                        Modifier.padding(end = 8.dp).height(40.dp).clip(CircleShape).background(Kit.Accent).clickable(onClick = onImport).padding(start = 12.dp, end = 16.dp),
+                        Modifier.padding(end = 8.dp).height(40.dp).shadow(8.dp, CircleShape, ambientColor = Kit.Accent, spotColor = Kit.Accent).clip(CircleShape)
+                            .background(Kit.Primary).border(1.dp, Kit.PrimaryRim, CircleShape).clickable(onClick = onImport).padding(start = 12.dp, end = 16.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(Lucide.Plus, null, tint = Kit.Ink, modifier = Modifier.size(18.dp))
@@ -187,7 +189,9 @@ fun MediaWindow(
 }
 
 private val SheetShape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
-private val Tile = Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(14.dp)).background(Color(0xFF0B0B0E))
+private val TileShape = RoundedCornerShape(14.dp)
+private val Tile = Modifier.fillMaxWidth().aspectRatio(1f).shadow(6.dp, TileShape, ambientColor = Color.Black, spotColor = Color.Black)
+    .clip(TileShape).background(Color(0xFF0B0B0E)).border(1.dp, Kit.Rim, TileShape)
 
 @Composable
 private fun Empty(text: String, onImport: (() -> Unit)?) {
@@ -343,9 +347,21 @@ private fun AssetCard(
                 vm.thumbs.version // recompose when the thumbnail arrives
                 vm.thumbs.get(a, 0L, if (from == null) vm.proxies[a.id] else null)?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
             }
-            // What it is, where that isn't plain video, and how long.
+            // A soft fade at the foot, so the labels on it always read.
+            Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().fillMaxHeight(0.42f).background(Brush.verticalGradient(listOf(Color.Transparent, Color(0x99000000)))))
+            // What it is (video, picture, sound), its special kind, and how long.
+            if (!a.isAudio) Box(
+                Modifier.align(Alignment.BottomStart).padding(6.dp).size(20.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xA6000000)),
+                contentAlignment = Alignment.Center,
+            ) { Icon(if (a.isImage && !a.isGif) Lucide.Image else Lucide.Film, null, tint = Color.White, modifier = Modifier.size(12.dp)) }
             val kind = when { a.isRaw -> "RAW"; a.isGif -> "GIF"; a.hdr -> "HDR"; else -> null }
-            kind?.let { Tag(it, Modifier.align(Alignment.TopStart).padding(6.dp)) }
+            kind?.let {
+                val c = when (it) { "RAW" -> Color(0xFFFF6B6B); "GIF" -> Color(0xFFB794F6); else -> Color(0xFFFFC857) }
+                Text(
+                    it, color = Kit.Ink, fontSize = 9.5.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 0.5.sp,
+                    modifier = Modifier.align(Alignment.TopStart).padding(6.dp).clip(RoundedCornerShape(6.dp)).background(c).padding(horizontal = 5.dp, vertical = 1.dp),
+                )
+            }
             if (!a.isImage) Tag(timecode(a.durationUs, a.fps).removePrefix("00:"), Modifier.align(Alignment.BottomEnd).padding(6.dp), mono = true)
             if (status?.percent != null) Box(
                 Modifier.align(Alignment.BottomStart).fillMaxWidth(status.percent / 100f).height(3.dp).background(Kit.Accent)

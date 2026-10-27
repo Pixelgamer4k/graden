@@ -12,10 +12,17 @@ import java.nio.ByteOrder
  * output gamut, and differs slightly between Rec.709, Rec.2020 and P3 outputs. So for each of those, and each face of
  * the colour cube where one channel is largest (scaled to 1), the result was rendered on a 192 × 192 grid of the other
  * two channels (−3 … 1). Stored as half floats: rows (gamut × 3 + face) × 192 + second channel, columns the first.
+ * One more row holds Resolve's "Simple" tone curve (measured, the same for every source): scene light in, by its
+ * DaVinci Intermediate code from −0.2 to 1 across the row, to SDR light out. Then 21 rows of Resolve's contrast
+ * S-curve (Contrast 1.00 to 2.00 by 0.05, measured): one side of the curve, from the end (0) to the pivot (1). Then
+ * 21 rows of Resolve's Color Boost (−100 to 100 by 10, measured): a colour's chroma (max − min channel, 0 to 1 across
+ * the row) to its chroma after. Last, Resolve's Saturation Preserving tone mapping's easing to grey above SDR white
+ * (measured: it depends on the scene luminance alone), by ln(Y) / ln(128) across the row.
  */
 object SatCompTable {
     const val N = 192
-    private const val ROWS = 3 * 3 * N
+    /** The gamut tables, the Simple curve, the contrast curves, the Color Boost curves, then Saturation Preserving's. */
+    const val ROWS = 3 * 3 * N + 1 + 21 + 21 + 1
     /** Texture unit 10: 0–8 are the grade's own, 9 the stabiliser's mesh. */
     private const val UNIT = 10
     private val data: ByteBuffer? by lazy {

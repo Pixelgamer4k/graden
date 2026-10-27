@@ -53,6 +53,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
@@ -102,93 +104,233 @@ private val WorkingSpaces = com.graden.editor.ColorSpaces.working.map { it.name 
 private val MasterNits = listOf(400, 600, 1000, 2000, 4000)
 
 /**
- * The first screen: projects, newest first, and a large button to start a new one. Tap a project
- * to open it; hold it to delete it.
+ * The first screen: projects, newest first, and a large button to start a new one. Tap a project to open it; hold it
+ * for what can be done with it (rename, duplicate, delete…).
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun Dashboard(vm: EditorViewModel) {
     var creating by remember { mutableStateOf(false) }
-    var deleting by remember { mutableStateOf<ProjectSummary?>(null) }
+    var acting by remember { mutableStateOf<ProjectSummary?>(null) }
+    androidx.compose.runtime.LaunchedEffect(vm.askNewProject) { if (vm.askNewProject) { creating = true; vm.askNewProject = false } }
     Box(Modifier.fillMaxSize().background(Palette.Bg)) {
+        // A faint warm glow behind the top of the page.
+        Box(Modifier.fillMaxWidth().height(320.dp).background(androidx.compose.ui.graphics.Brush.verticalGradient(listOf(Color(0x1FF0872B), Color.Transparent))))
         LazyVerticalGrid(
             GridCells.Fixed(2), Modifier.fillMaxSize().systemBarsPadding(),
-            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 24.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp), verticalArrangement = Arrangement.spacedBy(14.dp),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 28.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp), verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             item(span = { GridItemSpan(2) }) {
                 Column {
-                    Text("Graden", color = Palette.Text, fontSize = 26.sp, fontWeight = FontWeight.Bold)
-                    Text("Your projects", color = Palette.TextDim, fontSize = 13.sp)
-                    Spacer(Modifier.height(16.dp))
-                    // The way in: a wide, warm button that is hard to miss.
-                    Row(
-                        Modifier.fillMaxWidth().height(96.dp).clip(RoundedCornerShape(18.dp))
-                            .background(androidx.compose.ui.graphics.Brush.horizontalGradient(listOf(Color(0xFFF0872B), Color(0xFFD9681C))))
-                            .clickable { creating = true }.padding(horizontal = 20.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Box(Modifier.size(48.dp).clip(CircleShape).background(Color(0x33000000)), contentAlignment = Alignment.Center) {
-                            Icon(Lucide.Plus, null, tint = Color.White, modifier = Modifier.size(26.dp))
-                        }
-                        Spacer(Modifier.width(16.dp))
-                        Column {
-                            Text("New project", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-                            Text("Choose the canvas, frame rate and colour space", color = Color(0xE6FFFFFF), fontSize = 12.sp)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            Modifier.size(38.dp).shadow(8.dp, RoundedCornerShape(11.dp), ambientColor = Kit.Accent, spotColor = Kit.Accent)
+                                .clip(RoundedCornerShape(11.dp)).background(Kit.Primary).border(1.dp, Kit.PrimaryRim, RoundedCornerShape(11.dp)),
+                            contentAlignment = Alignment.Center,
+                        ) { Icon(Lucide.Film, null, tint = Kit.Ink, modifier = Modifier.size(20.dp)) }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("Graden", color = Palette.Text, fontSize = 24.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.4).sp)
+                            val n = vm.projectList.size
+                            Text(if (n == 0) "Your projects" else "$n project${if (n == 1) "" else "s"}", color = Palette.TextDim, fontSize = 13.sp)
                         }
                     }
-                    Spacer(Modifier.height(18.dp))
-                    if (vm.projectList.isNotEmpty()) Text("Recent", color = Palette.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                    else Text("No projects yet. Start one above.", color = Palette.TextDim, fontSize = 13.sp)
+                    Spacer(Modifier.height(20.dp))
+                    NewProjectCard { creating = true }
+                    Spacer(Modifier.height(24.dp))
+                    if (vm.projectList.isNotEmpty()) Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Recent", color = Palette.Text, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                        Text("Hold a project for more", color = Kit.Faint, fontSize = 12.sp)
+                    } else Column(Modifier.fillMaxWidth().padding(top = 30.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Box(Modifier.size(64.dp).clip(CircleShape).background(Kit.GroupFill).border(1.dp, Kit.Rim, CircleShape), contentAlignment = Alignment.Center) {
+                            Icon(Lucide.Film, null, tint = Kit.Dim, modifier = Modifier.size(26.dp))
+                        }
+                        Text("No projects yet", color = Kit.Text, fontSize = 15.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(top = 14.dp))
+                        Text("Start one above: your edits will appear here", color = Kit.Dim, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp))
+                    }
                 }
             }
             items(vm.projectList, key = { it.id }) { p ->
-                Column(Modifier.combinedClickable(onClick = { vm.openProject(p.id) }, onLongClick = { deleting = p })) {
-                    Box(
-                        Modifier.fillMaxWidth().aspectRatio(16f / 10f).clip(RoundedCornerShape(12.dp)).background(Color(0xFF07080A))
-                            .border(1.dp, Palette.Line, RoundedCornerShape(12.dp)),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        // The card shows the project's own canvas shape, with its first picture in it.
-                        val a = p.meta.aspect
-                        Box(Modifier.fillMaxHeight(0.82f).aspectRatio(a.coerceIn(0.3f, 3.5f), matchHeightConstraintsFirst = a < 1.6f).clip(RoundedCornerShape(4.dp)).background(Color.Black)) {
-                            p.cover?.let { cover ->
-                                vm.thumbs.version
-                                vm.thumbs.get(cover, 0L)?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
-                            }
-                        }
-                        Text(
-                            p.meta.ratioLabel, color = Palette.Text, fontSize = 10.sp, fontFamily = FontFamily.Monospace,
-                            modifier = Modifier.align(Alignment.TopStart).padding(6.dp).clip(RoundedCornerShape(4.dp)).background(Color(0xB3000000)).padding(horizontal = 5.dp, vertical = 1.dp),
-                        )
-                        Text(
-                            timecode(p.durationUs, p.meta.fps), color = Palette.Text, fontSize = 10.sp, fontFamily = FontFamily.Monospace,
-                            modifier = Modifier.align(Alignment.BottomEnd).padding(6.dp).clip(RoundedCornerShape(4.dp)).background(Color(0xB3000000)).padding(horizontal = 5.dp, vertical = 1.dp),
-                        )
-                    }
-                    Text(p.meta.name, color = Palette.Text, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 6.dp))
-                    Text(
-                        "${ago(p.modified)} · ${p.clips} clip${if (p.clips == 1) "" else "s"} · ${p.meta.fpsLabel} fps",
-                        color = Palette.TextDim, fontSize = 11.sp, maxLines = 1,
-                    )
-                }
+                ProjectCard(vm, p, onOpen = { vm.openProject(p.id) }, onHold = { acting = p })
             }
         }
         ProjectSheet(creating, null, onClose = { creating = false }, onDone = {
             creating = false
             vm.createProject(it)
         }, modifier = Modifier.align(Alignment.BottomCenter))
-        deleting?.let { p ->
-            AlertDialog(
-                onDismissRequest = { deleting = null },
-                containerColor = Palette.Surface,
-                title = { Text("Delete \"${p.meta.name}\"?", color = Palette.Text) },
-                text = { Text("The project and its edit are removed. Your media files stay on the phone.", color = Palette.TextDim) },
-                confirmButton = { TextButton({ vm.deleteProject(p.id); deleting = null }) { Text("Delete", color = Palette.Danger) } },
-                dismissButton = { TextButton({ deleting = null }) { Text("Keep", color = Palette.Text) } },
-            )
+        ProjectActions(vm, acting, Modifier.align(Alignment.BottomCenter)) { acting = null }
+    }
+}
+
+/** The way in: wide and warm, with the shapes a project can take drawn into it. */
+@Composable
+private fun NewProjectCard(onClick: () -> Unit) {
+    val shape = RoundedCornerShape(22.dp)
+    Box(
+        Modifier.fillMaxWidth().height(118.dp).shadow(18.dp, shape, ambientColor = Kit.Accent, spotColor = Kit.Accent)
+            .clip(shape).background(Kit.Primary).border(1.dp, Kit.PrimaryRim, shape).clickable(onClick = onClick),
+    ) {
+        // Light across the top, like a lit edge.
+        Box(Modifier.fillMaxWidth().fillMaxHeight(0.5f).background(androidx.compose.ui.graphics.Brush.verticalGradient(listOf(Color(0x33FFFFFF), Color.Transparent))))
+        Row(Modifier.fillMaxSize().padding(start = 20.dp, end = 18.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier.size(52.dp).clip(CircleShape).background(Color(0x2E000000)).border(1.dp, Color(0x40FFFFFF), CircleShape),
+                contentAlignment = Alignment.Center,
+            ) { Icon(Lucide.Plus, null, tint = Color.White, modifier = Modifier.size(26.dp)) }
+            Spacer(Modifier.width(16.dp))
+            Column(Modifier.weight(1f)) {
+                Text("New project", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.3).sp)
+                Text("Pick a shape, size and frame rate", color = Color(0xD9FFFFFF), fontSize = 13.sp, maxLines = 2)
+            }
+            Icon(Lucide.ChevronRight, null, tint = Color(0xCCFFFFFF), modifier = Modifier.size(22.dp))
         }
     }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ProjectCard(vm: EditorViewModel, p: ProjectSummary, onOpen: () -> Unit, onHold: () -> Unit) {
+    val view = androidx.compose.ui.platform.LocalView.current
+    val shape = RoundedCornerShape(16.dp)
+    Column(Modifier.clip(RoundedCornerShape(18.dp)).combinedClickable(onClick = onOpen, onLongClick = {
+        view.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS); onHold()
+    }).padding(bottom = 4.dp)) {
+        Box(
+            Modifier.fillMaxWidth().aspectRatio(16f / 10f).shadow(10.dp, shape, ambientColor = Color.Black, spotColor = Color.Black)
+                .clip(shape).background(Color(0xFF07080A)).border(1.dp, Kit.Rim, shape),
+            contentAlignment = Alignment.Center,
+        ) {
+            ProjectCover(vm, p, Modifier.fillMaxHeight(0.82f))
+            Text(
+                p.meta.ratioLabel, color = Palette.Text, fontSize = 10.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.align(Alignment.TopStart).padding(7.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xB3000000)).padding(horizontal = 6.dp, vertical = 2.dp),
+            )
+            Text(
+                timecode(p.durationUs, p.meta.fps), color = Palette.Text, fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+                modifier = Modifier.align(Alignment.BottomEnd).padding(7.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xB3000000)).padding(horizontal = 6.dp, vertical = 2.dp),
+            )
+        }
+        Text(p.meta.name, color = Palette.Text, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 8.dp, start = 2.dp))
+        Text(
+            "${ago(p.modified)} · ${p.clips} clip${if (p.clips == 1) "" else "s"} · ${p.meta.fpsLabel} fps",
+            color = Palette.TextDim, fontSize = 11.sp, maxLines = 1, modifier = Modifier.padding(start = 2.dp),
+        )
+    }
+}
+
+/** The project's canvas, its own shape, with its first picture in it. */
+@Composable
+private fun ProjectCover(vm: EditorViewModel, p: ProjectSummary, modifier: Modifier) {
+    val a = p.meta.aspect
+    Box(modifier.aspectRatio(a.coerceIn(0.3f, 3.5f), matchHeightConstraintsFirst = a < 1.6f).clip(RoundedCornerShape(4.dp)).background(Color.Black)) {
+        p.cover?.let { cover ->
+            vm.thumbs.version
+            vm.thumbs.get(cover, 0L)?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
+        }
+    }
+}
+
+/**
+ * What can be done with a project, from holding it: open, rename, duplicate, show the exported videos, delete. Delete
+ * asks once more in place, so nothing goes by a stray tap.
+ */
+@Composable
+private fun ProjectActions(vm: EditorViewModel, p: ProjectSummary?, modifier: Modifier, onClose: () -> Unit) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var shown by remember { mutableStateOf<ProjectSummary?>(null) }
+    if (p != null) shown = p
+    if (p != null) Box(Modifier.fillMaxSize().background(Color(0xA6000000)).pointerInput(Unit) { detectTapGestures { onClose() } })
+    AnimatedVisibility(p != null, modifier, enter = slideInVertically { it } + fadeIn(), exit = slideOutVertically { it } + fadeOut()) {
+        val pr = shown ?: return@AnimatedVisibility
+        var renaming by remember(pr.id) { mutableStateOf(false) }
+        var newName by remember(pr.id) { mutableStateOf(pr.meta.name) }
+        var confirm by remember(pr.id) { mutableStateOf(false) }
+        val shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
+        Column(
+            Modifier.fillMaxWidth().clip(shape).background(Kit.Sheet).border(1.dp, Kit.Hair, shape)
+                .pointerInput(Unit) { detectTapGestures { } }.navigationBarsPadding().imePadding().padding(bottom = 12.dp)
+        ) {
+            KGrabber()
+            // The project itself, so it is clear which one this is about.
+            Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 12.dp, top = 14.dp, bottom = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier.width(96.dp).aspectRatio(16f / 10f).shadow(6.dp, RoundedCornerShape(12.dp)).clip(RoundedCornerShape(12.dp))
+                        .background(Color(0xFF07080A)).border(1.dp, Kit.Rim, RoundedCornerShape(12.dp)),
+                    contentAlignment = Alignment.Center,
+                ) { ProjectCover(vm, pr, Modifier.fillMaxHeight(0.8f)) }
+                Spacer(Modifier.width(14.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(pr.meta.name, color = Kit.Text, fontSize = 17.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text("${pr.meta.width} × ${pr.meta.height} · ${pr.meta.fpsLabel} fps", color = Kit.Dim, fontSize = 12.5.sp, maxLines = 1)
+                    Text("${timecode(pr.durationUs, pr.meta.fps)} · edited ${ago(pr.modified)}", color = Kit.Faint, fontSize = 12.sp, maxLines = 1)
+                }
+                KIconButton(Lucide.X, "Close", onClose)
+            }
+            if (renaming) {
+                KGroup {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        BasicTextField(
+                            newName, { newName = it.take(ProjectMeta.MAX_NAME) }, singleLine = true,
+                            textStyle = TextStyle(color = Kit.Text, fontSize = 17.sp, fontWeight = FontWeight.Medium), cursorBrush = SolidColor(Kit.Accent),
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text("${newName.length}/${ProjectMeta.MAX_NAME}", color = Kit.Faint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                    }
+                }
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    KSecondary("Cancel", Modifier.weight(1f)) { renaming = false; newName = pr.meta.name }
+                    KPrimary("Rename", Modifier.weight(1f), enabled = newName.isNotBlank()) { vm.renameProjectById(pr.id, newName); onClose() }
+                }
+            } else {
+                KGroup {
+                    KRow("Open", icon = Lucide.Play, onClick = { onClose(); vm.openProject(pr.id) }, chevron = true)
+                    KDivider(58.dp)
+                    KRow("Rename", icon = Lucide.Pencil, onClick = { renaming = true })
+                    KDivider(58.dp)
+                    KRow("Duplicate", "A full copy: edit, grades and all", icon = Lucide.Copy, onClick = { vm.duplicateProject(pr.id); onClose() })
+                }
+                Spacer(Modifier.height(10.dp))
+                KGroup {
+                    KRow("Show exports in Files", "Movies / Graden", icon = Lucide.Folder, onClick = {
+                        onClose()
+                        openExportsFolder(context)
+                    }, chevron = true)
+                }
+                Spacer(Modifier.height(10.dp))
+                KGroup {
+                    Row(
+                        Modifier.fillMaxWidth().heightIn(min = 56.dp).background(if (confirm) Kit.Bad.copy(alpha = 0.16f) else Color.Transparent)
+                            .clickable { if (confirm) { vm.deleteProject(pr.id); onClose() } else confirm = true }.padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(Modifier.size(30.dp).clip(RoundedCornerShape(8.dp)).background(Kit.Bad.copy(alpha = 0.18f)), contentAlignment = Alignment.Center) {
+                            Icon(Lucide.Trash, null, tint = Kit.Bad, modifier = Modifier.size(16.dp))
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(if (confirm) "Tap again to delete" else "Delete project", color = Kit.Bad, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                            Text(if (confirm) "This can't be undone" else "Your media files stay on the phone", color = Kit.Dim, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Opens Movies/Graden, where exports are saved, in the phone's file manager (or its Downloads-style browser). */
+private fun openExportsFolder(context: android.content.Context) {
+    val doc = android.net.Uri.parse("content://com.android.externalstorage.documents/document/primary%3AMovies%2FGraden")
+    val tries = listOf(
+        android.content.Intent(android.content.Intent.ACTION_VIEW).setDataAndType(doc, android.provider.DocumentsContract.Document.MIME_TYPE_DIR),
+        android.content.Intent(android.content.Intent.ACTION_VIEW).setDataAndType(doc, "resource/folder"),
+        android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT_TREE).putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI, doc),
+    )
+    for (i in tries) {
+        if (runCatching { context.startActivity(i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)) }.isSuccess) return
+    }
+    android.widget.Toast.makeText(context, "Exports are in Movies / Graden", android.widget.Toast.LENGTH_LONG).show()
 }
 
 private fun ago(t: Long): String {
@@ -271,13 +413,18 @@ fun ProjectSheet(open: Boolean, initial: ProjectMeta?, onClose: () -> Unit, onDo
                     }
                 }
 
+                // What is being made, drawn to its shape, updating as it is chosen.
+                CanvasPreview(meta, bitDepth)
+
                 KSection("Canvas")
                 Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     for (p in Presets + CustomPreset) {
                         val on = p === preset
                         Column(
-                            Modifier.width(96.dp).clip(RoundedCornerShape(16.dp)).background(if (on) Kit.AccentSoft else Kit.Group)
-                                .border(if (on) 1.5.dp else 1.dp, if (on) Kit.Accent else Color.Transparent, RoundedCornerShape(16.dp))
+                            Modifier.padding(vertical = 4.dp).width(96.dp)
+                                .shadow(if (on) 10.dp else 3.dp, RoundedCornerShape(16.dp), ambientColor = if (on) Kit.Accent else Color.Black, spotColor = if (on) Kit.Accent else Color.Black)
+                                .clip(RoundedCornerShape(16.dp)).background(if (on) SolidColor(Color(0xFF2A2017)) else Kit.GroupFill)
+                                .border(if (on) 1.5.dp else 1.dp, if (on) Kit.Accent else Kit.Hair, RoundedCornerShape(16.dp))
                                 .clickable { preset = p }.padding(top = 12.dp, bottom = 10.dp),
                             horizontalAlignment = Alignment.CenterHorizontally,
                         ) {
@@ -324,11 +471,26 @@ fun ProjectSheet(open: Boolean, initial: ProjectMeta?, onClose: () -> Unit, onDo
                     Text(if (bad) "1 to 240" else "fps", color = if (bad) Kit.Bad else Kit.Dim, fontSize = 12.sp, modifier = Modifier.padding(start = 8.dp))
                 }
 
+                // How smooth colour gradients can be: worth choosing up front, so it is not folded away.
+                KSection("Quality")
+                KGroup {
+                    KRow(
+                        "Bit depth",
+                        when {
+                            bitDepth == 8 && ProjectMeta.isHdr(color) -> "HDR at 8-bit will band; 10-bit is recommended"
+                            bitDepth == 10 -> "Smoother skies and gradients, more room to grade"
+                            else -> "Smallest files, plays everywhere"
+                        },
+                    ) {
+                        KSegmented(listOf("8-bit", "10-bit"), if (bitDepth == 10) 1 else 0, Modifier.width(150.dp)) { bitDepth = if (it == 1) 10 else 8 }
+                    }
+                }
+
                 KSection("Advanced")
                 val loudIdx = Loudness.indexOfFirst { it.first == loudness }.coerceAtLeast(0)
                 KFold(
                     "Colour and sound",
-                    "${color.replace(" Gamma ", " γ")} · ${bitDepth}-bit · ${SampleRates.firstOrNull { it.first == sampleRate }?.second ?: ""} · ${Loudness[loudIdx].second}",
+                    "${color.replace(" Gamma ", " γ")} · ${SampleRates.firstOrNull { it.first == sampleRate }?.second ?: ""} · ${Loudness[loudIdx].second}",
                 ) {
                     FoldLabel("Output colour space")
                     for (sp in AllSpaces) KOption(sp.name, sp.note, sp.name == color, badge = {
@@ -351,10 +513,6 @@ fun ProjectSheet(open: Boolean, initial: ProjectMeta?, onClose: () -> Unit, onDo
                             if (ProjectMeta.isHdr(color) && !com.graden.editor.ColorSpaces.working(working).log) " For HDR output, DaVinci Wide Gamut or ACEScct keeps the highlights." else "",
                     )
                     KDivider(0.dp)
-                    KRow("Bit depth", if (bitDepth == 8 && ProjectMeta.isHdr(color)) "HDR at 8-bit will band; 10-bit is recommended" else null) {
-                        KSegmented(listOf("8-bit", "10-bit"), if (bitDepth == 10) 1 else 0, Modifier.width(150.dp)) { bitDepth = if (it == 1) 10 else 8 }
-                    }
-                    KDivider()
                     KRow("Sample rate") {
                         KSegmented(SampleRates.map { it.second }, SampleRates.indexOfFirst { it.first == sampleRate }, Modifier.width(210.dp)) { sampleRate = SampleRates[it].first }
                     }
@@ -368,6 +526,37 @@ fun ProjectSheet(open: Boolean, initial: ProjectMeta?, onClose: () -> Unit, onDo
             Box(Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
                 KPrimary(if (start == null) "Create project" else "Apply", sub = summary) { onDone(meta.copy(name = name.ifBlank { placeholder })) }
             }
+        }
+    }
+}
+
+/** The canvas being made, to its shape, with its size, frame rate and depth under it. */
+@Composable
+private fun CanvasPreview(meta: ProjectMeta, bitDepth: Int) {
+    val shape = RoundedCornerShape(20.dp)
+    Box(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp).height(150.dp)
+            .shadow(8.dp, shape, ambientColor = Color.Black, spotColor = Color.Black).clip(shape)
+            .background(androidx.compose.ui.graphics.Brush.radialGradient(listOf(Color(0xFF262019), Color(0xFF121317)), radius = 700f))
+            .border(1.dp, Kit.Rim, shape),
+        contentAlignment = Alignment.Center,
+    ) {
+        val a = (meta.width.toFloat() / meta.height.coerceAtLeast(1)).coerceIn(0.2f, 5f)
+        val bw = if (a >= 1.6f) 170f else 96f * a
+        val bh = bw / a
+        val anim by androidx.compose.animation.core.animateDpAsState(bw.dp, androidx.compose.animation.core.spring(0.8f, 500f), label = "w")
+        val animH by androidx.compose.animation.core.animateDpAsState(bh.dp, androidx.compose.animation.core.spring(0.8f, 500f), label = "h")
+        Box(
+            Modifier.padding(bottom = 26.dp).size(anim, animH).shadow(12.dp, RoundedCornerShape(6.dp), ambientColor = Kit.Accent, spotColor = Kit.Accent)
+                .clip(RoundedCornerShape(6.dp)).background(androidx.compose.ui.graphics.Brush.verticalGradient(listOf(Color(0xFF3A2A1A), Color(0xFF1C1712))))
+                .border(1.5.dp, Kit.Accent, RoundedCornerShape(6.dp)),
+            contentAlignment = Alignment.Center,
+        ) { Text(meta.ratioLabel, color = Kit.Accent, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
+        Row(Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            for (t in listOf("${meta.width} × ${meta.height}", "${meta.fpsLabel} fps", "$bitDepth-bit")) Text(
+                t, color = Kit.Text, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace,
+                modifier = Modifier.clip(CircleShape).background(Color(0x99000000)).border(1.dp, Kit.Hair, CircleShape).padding(horizontal = 9.dp, vertical = 3.dp),
+            )
         }
     }
 }

@@ -603,6 +603,15 @@ private fun ExportProgress(vm: EditorViewModel) {
                 Spacer(Modifier.height(16.dp))
             }
         }
+        if (!ExportJob.running && phase == ExportJob.Phase.DONE) {
+            // Finished: straight on to the next one, from the project setup.
+            KSecondary("Start a new project", Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 10.dp), Lucide.Plus) {
+                ExportJob.reset()
+                vm.exportOpen = false
+                vm.closeProject()
+                vm.askNewProject = true
+            }
+        }
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             if (ExportJob.running) {
                 KSecondary(if (cancelArmed) "Tap again to cancel" else "Cancel", Modifier.weight(1f), danger = cancelArmed) {

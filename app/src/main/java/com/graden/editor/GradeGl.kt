@@ -174,6 +174,10 @@ private class GlCore(name: String) {
         image = Prog(ShaderCache.program(GradeShader.VERTEX, GradeShader.IMAGE_FRAGMENT))
         copyOes = ShaderCache.program(GradeShader.VERTEX, FrameExtras.COPY_OES)
         copy2d = ShaderCache.program(GradeShader.VERTEX, FrameExtras.COPY_2D)
+        // On ANGLE (Vulkan underneath: Samsung's Xclipse GPUs, among others) the full grade shader reading a video frame
+        // directly fails to build its pipeline and draws nothing (black preview). There, each frame is first copied
+        // into a plain texture by a tiny shader and graded from that, as pictures are.
+        viaCopy = GLES20.glGetString(GLES20.GL_RENDERER)?.contains("ANGLE", ignoreCase = true) == true
         quad = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
             .apply { put(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)); position(0) }
     }
@@ -221,6 +225,10 @@ private class GlCore(name: String) {
             GLES20.glDeleteFramebuffers(1, intArrayOf(fbo), 0)
             GLES20.glDeleteTextures(1, intArrayOf(fboTex), 0)
         }
+        if (copyFbo != 0) {
+            GLES20.glDeleteFramebuffers(1, intArrayOf(copyFbo), 0)
+            GLES20.glDeleteTextures(1, intArrayOf(copyTex), 0)
+        }
         surface?.let { EGL14.eglDestroySurface(display, it) }
         EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
         EGL14.eglDestroySurface(display, pbuffer)
@@ -237,7 +245,57 @@ private class GlCore(name: String) {
     private val stabBuf = FloatArray(9)
     private val stabGl = StabGl()
 
+    /** Video frames go through [frameCopy] first (see where it is set). */
+    private var viaCopy = false
+    private var copyFbo = 0
+    private var copyTex = 0
+    private var copyW = 0
+    private var copyH = 0
+
+    /**
+     * Copies video frame [tex] (an external texture, placed by [texM]) into a plain texture of [w] × [h] and returns it,
+     * upright as the grade reads it. Leaves the frame buffer that was bound.
+     */
+    private fun frameCopy(tex: Int, texM: FloatArray, w: Int, h: Int): Int {
+        val prev = IntArray(1).also { GLES20.glGetIntegerv(GLES20.GL_FRAMEBUFFER_BINDING, it, 0) }[0]
+        val vp = IntArray(4).also { GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, it, 0) }
+        if (copyFbo == 0 || copyW != w || copyH != h) {
+            if (copyFbo != 0) { GLES20.glDeleteFramebuffers(1, intArrayOf(copyFbo), 0); GLES20.glDeleteTextures(1, intArrayOf(copyTex), 0) }
+            copyTex = IntArray(1).also { GLES20.glGenTextures(1, it, 0) }[0]
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, copyTex)
+            android.opengl.GLES30.glTexStorage2D(GLES20.GL_TEXTURE_2D, 1, android.opengl.GLES30.GL_RGBA16F, w, h)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            copyFbo = IntArray(1).also { GLES20.glGenFramebuffers(1, it, 0) }[0]
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, copyFbo)
+            GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, copyTex, 0)
+            copyW = w; copyH = h
+        }
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, copyFbo)
+        GLES20.glViewport(0, 0, w, h)
+        GLES20.glUseProgram(copyOes)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(copyOes, "uSrc"), 0)
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(copyOes, "uTex"), 1, false, texM, 0)
+        GLES20.glUniform4fv(GLES20.glGetUniformLocation(copyOes, "uRect"), 1, FULL, 0)
+        val a = GLES20.glGetAttribLocation(copyOes, "aPos")
+        GLES20.glEnableVertexAttribArray(a)
+        GLES20.glVertexAttribPointer(a, 2, GLES20.GL_FLOAT, false, 0, quad)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, prev)
+        GLES20.glViewport(vp[0], vp[1], vp[2], vp[3])
+        return copyTex
+    }
+
     private fun drawQuad(tex: Int, texM: FloatArray, rect: FloatArray, grade: FloatArray?, texelX: Float, texelY: Float, still: Boolean = false, cm: FloatArray = CM_OFF, look: Grade? = null, layers: FloatArray? = null) {
+        if (!still && viaCopy) {
+            val w = (1f / texelX).toInt().coerceIn(1, 4096)
+            val h = (1f / texelY).toInt().coerceIn(1, 4096)
+            return drawQuad(frameCopy(tex, texM, w, h), IDENTITY_M, rect, grade, texelX, texelY, true, cm, look, layers)
+        }
         val p = if (still) image else video
         GLES20.glUseProgram(p.id)
         looks.bind(p.id, if (grade != null) look else null)
@@ -247,7 +305,7 @@ private class GlCore(name: String) {
         GLES20.glUniformMatrix4fv(p.uTex, 1, false, texM, 0)
         GLES20.glUniform4fv(p.uRect, 1, rect, 0)
         GLES20.glUniform1f(p.uOn, if (grade != null) 1f else 0f)
-        if (grade != null) GLES20.glUniform4fv(p.uG, 7, grade, 0)
+        if (grade != null) GLES20.glUniform4fv(p.uG, 9, grade, 0)
         GLES20.glUniform2f(p.uTexel, texelX, texelY)
         ColorPipe.set(p.id, cm)
         stabGl.set(p.id, stabTrack, stabIndex, stabBuf)
@@ -410,6 +468,8 @@ private class GlCore(name: String) {
 
     private companion object {
         val FULL = floatArrayOf(-1f, -1f, 1f, 1f)
+        /** No change: a copied frame is already upright. */
+        val IDENTITY_M = floatArrayOf(1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f)
         val CM_OFF = GradeCore.CM_OFF
         /** Texture transform that turns an image upright: y becomes 1 - y. */
         val FLIP_Y = floatArrayOf(1f, 0f, 0f, 0f, 0f, -1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 1f, 0f, 1f)
@@ -439,6 +499,8 @@ class GradedVideoView(context: Context, val key: String) : TextureView(context),
             input?.let { v?.invoke(it, true) }
         }
     private var input: Surface? = null
+    /** The input surface, as the GL thread knows it (for drawing still pictures into it). */
+    @Volatile private var glInput: Surface? = null
     private var core: GlCore? = null
     // GL-thread state.
     @Volatile private var inputTexture: SurfaceTexture? = null
@@ -534,6 +596,28 @@ class GradedVideoView(context: Context, val key: String) : TextureView(context),
         return true
     }
 
+    /**
+     * A still picture played by the player: [bmp] goes into the input surface as its next frame, at the picture's own
+     * size, and is drawn through the grade and placed exactly like a video frame. (The player gives pictures as
+     * bitmaps, never into the video surface: without this a picture on the timeline showed as black.)
+     */
+    fun drawPicture(bmp: android.graphics.Bitmap) {
+        val c = core ?: return
+        c.handler.post {
+            if (core !== c) return@post
+            val t = inputTexture ?: return@post
+            val s = glInput ?: return@post
+            runCatching {
+                t.setDefaultBufferSize(bmp.width, bmp.height)
+                val cv = s.lockHardwareCanvas()
+                try {
+                    cv.drawColor(android.graphics.Color.BLACK, android.graphics.PorterDuff.Mode.SRC)
+                    cv.drawBitmap(bmp, null, android.graphics.Rect(0, 0, bmp.width, bmp.height), stillPaint)
+                } finally { s.unlockCanvasAndPost(cv) }
+            }.onFailure { android.util.Log.w("GradedVideoView", "picture not drawn", it) }
+        }
+    }
+
     /** Redraws the last frame soon (coalesced), e.g. after the grade changed. */
     internal fun redraw() {
         val c = core ?: return
@@ -588,6 +672,7 @@ class GradedVideoView(context: Context, val key: String) : TextureView(context),
             }, c.handler)
             inputTexture = it
             val surface = Surface(it)
+            glInput = surface
             post {
                 if (core !== c) return@post
                 input = surface
@@ -616,6 +701,7 @@ class GradedVideoView(context: Context, val key: String) : TextureView(context),
         core = null
         if (c == null) st.release()
         else c.handler.post {
+            glInput = null
             inputTexture?.release()
             inputTexture = null
             s?.release()

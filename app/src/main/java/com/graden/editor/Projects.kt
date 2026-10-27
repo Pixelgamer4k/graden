@@ -90,7 +90,7 @@ data class ProjectMeta(
             return base.copy(preset = "Custom", aspectW = w / g, aspectH = h / g, customW = w, customH = h)
         }
 
-        /** The name a project gets when none is typed, e.g. "2:34PM_Oct_2026_IST". */
+        /** The name a project gets when none is typed, e.g. "2:34PM_Oct_2026_UTC". */
         fun defaultName(at: Long = System.currentTimeMillis()): String {
             val stamp = SimpleDateFormat("h:mma_MMM_yyyy", Locale.ENGLISH).format(Date(at))
             // Short zone names are often just "GMT+05:30"; the initials of the full name ("India Standard Time") read better.
@@ -130,6 +130,29 @@ class Projects(private val context: Context) {
 
     fun delete(id: String) {
         File(root, id).deleteRecursively()
+    }
+
+    /** Gives project [id] a new name, keeping everything else. */
+    fun rename(id: String, name: String) {
+        val st = store(id)
+        val l = st.load() ?: return
+        st.save(l.assets.values, l.tracks, l.ui, l.meta.copy(name = name))
+        st.writeSummary(l.meta.copy(name = name), l.tracks, l.assets)
+    }
+
+    /** A full copy of project [id] (its edit, grades and history) named [name]; returns the copy's id. */
+    fun duplicate(id: String, name: String): String? {
+        val from = File(root, id)
+        if (!from.isDirectory) return null
+        val nid = UUID.randomUUID().toString().take(8)
+        val to = File(root, nid)
+        if (!from.copyRecursively(to)) return null
+        val st = store(nid)
+        val l = st.load() ?: return nid
+        val m = l.meta.copy(name = name, created = System.currentTimeMillis())
+        st.save(l.assets.values, l.tracks, l.ui, m)
+        st.writeSummary(m, l.tracks, l.assets)
+        return nid
     }
 
     fun list(): List<ProjectSummary> {

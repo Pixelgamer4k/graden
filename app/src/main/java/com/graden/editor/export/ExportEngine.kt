@@ -164,14 +164,24 @@ class ExportEngine(
                 started = true
             }
 
+            var lastAudioUs = -1L
             /** Writes sound up to [untilUs], keeping the file interleaved. */
             fun writeAudio(untilUs: Long) {
                 val a = samples ?: return
-                while (started && a.timeUs <= untilUs) {
+                // Long.MAX_VALUE is the reader's end mark, never a sample: written, it overflowed Samsung's MP4 writer.
+                while (started && a.timeUs != Long.MAX_VALUE && a.timeUs <= untilUs) {
                     audioBuf.clear()
                     audioBuf.put(a.data)
                     audioBuf.flip()
-                    audioInfo.set(0, a.data.size, a.timeUs, MediaCodec.BUFFER_FLAG_KEY_FRAME)
+                    // Samsung's MP4 writer aborts the whole app (an overflow check in its audio thread) on a sample
+                    // whose time does not move forward; others let it pass. Every sample is written strictly later.
+                    var t = a.timeUs
+                    if (t <= lastAudioUs) {
+                        android.util.Log.w("Export", "audio time ${a.timeUs} not after $lastAudioUs: moved on")
+                        t = lastAudioUs + 1
+                    }
+                    lastAudioUs = t
+                    audioInfo.set(0, a.data.size, t, MediaCodec.BUFFER_FLAG_KEY_FRAME)
                     muxer.writeSampleData(audioTrack, audioBuf, audioInfo)
                     if (!a.next()) break
                 }

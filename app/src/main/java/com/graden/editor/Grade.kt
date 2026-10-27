@@ -5,11 +5,13 @@ import org.json.JSONObject
 import kotlin.math.hypot
 
 /**
- * One colour wheel. [u] and [v] are where its puck sits, in a unit disc (blue–yellow across, red–cyan up);
- * [y] is its master ring, which moves all channels together.
+ * One colour wheel, as Resolve keeps it. [u] and [v] are where its puck sits, in a unit disc (blue–yellow across,
+ * red–cyan up); [y] moves the three channels together, so the puck and [y] make the R, G and B values. [m] is the
+ * wheel's Y (Resolve's master, the jog under the wheel): it acts on luminance, as far as Lum Mix lets it. Offset has no
+ * Y in Resolve: its jog moves [y].
  */
-data class Wheel(val u: Float = 0f, val v: Float = 0f, val y: Float = 0f) {
-    val isZero: Boolean get() = u == 0f && v == 0f && y == 0f
+data class Wheel(val u: Float = 0f, val v: Float = 0f, val y: Float = 0f, val m: Float = 0f) {
+    val isZero: Boolean get() = u == 0f && v == 0f && y == 0f && m == 0f
 
     /**
      * The red, green and blue shifts the puck makes, with the luma left where it is: the puck adds colour
@@ -77,25 +79,30 @@ data class Grade(
 ) {
     val isIdentity: Boolean get() = this == Grade()
 
-    /** The values the shader reads, in the order its uniforms expect. */
+    /**
+     * The values the shader reads, in the order its uniforms expect: each wheel's R, G and B values (as the readouts
+     * show them, less neutral) and its Y; then the primaries; then the temperature and tint matrix.
+     */
     fun uniforms(): FloatArray {
         val l = lift.rgb(LIFT_REACH)
         val g = gamma.rgb(GAMMA_REACH)
         val n = gain.rgb(GAIN_REACH)
         val o = offset.rgb(OFFSET_REACH)
+        val t = TempTint.matrix(temp, tint)
         return floatArrayOf(
-            l[0], l[1], l[2], lift.y,
-            g[0], g[1], g[2], gamma.y,
-            n[0], n[1], n[2], gain.y,
-            o[0], o[1], o[2], offset.y,
+            lift.y + l[0], lift.y + l[1], lift.y + l[2], lift.m,
+            gamma.y + g[0], gamma.y + g[1], gamma.y + g[2], gamma.m,
+            gain.y + n[0], gain.y + n[1], gain.y + n[2], gain.m,
+            offset.y + o[0], offset.y + o[1], offset.y + o[2], 0f,
             temp / 2000f, tint / 100f, contrast, pivot,
             (midDetail + if (zones.on) zones.md else 0f) / 100f, colorBoost / 100f, shadows / 100f, highlights / 100f,
-            saturation / 50f, (hue - 50f) / 50f * Math.PI.toFloat(), lumMix / 100f, 0f,
+            saturation / 50f, (hue - 50f) / 50f * Math.PI.toFloat(), lumMix / 100f, t[8],
+            t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7],
         )
     }
 
     fun toJson(): JSONObject {
-        fun w(x: Wheel) = JSONArray().put(x.u.toDouble()).put(x.v.toDouble()).put(x.y.toDouble())
+        fun w(x: Wheel) = JSONArray().put(x.u.toDouble()).put(x.v.toDouble()).put(x.y.toDouble()).put(x.m.toDouble())
         return JSONObject().put("l", w(lift)).put("g", w(gamma)).put("n", w(gain)).put("o", w(offset))
             .put("temp", temp.toDouble()).put("tint", tint.toDouble()).put("con", contrast.toDouble()).put("piv", pivot.toDouble())
             .put("md", midDetail.toDouble()).put("cb", colorBoost.toDouble()).put("sh", shadows.toDouble()).put("hl", highlights.toDouble())
@@ -125,7 +132,16 @@ data class Grade(
             if (o == null) return Grade()
             // An earlier version saved the correction switch over Contrast ("con"): a true or false there is not a contrast.
             if (o.opt("con") is Boolean) o.put("con", 1.0)
-            fun w(k: String): Wheel = o.optJSONArray(k)?.let { Wheel(it.optDouble(0).toFloat(), it.optDouble(1).toFloat(), it.optDouble(2).toFloat()) } ?: Wheel()
+            // Before the wheels had their own Y, the jog's value (the third) was the master: it moves to Y, which keeps
+            // the picture (at the default Lum Mix). Offset has no Y and keeps it.
+            fun w(k: String): Wheel = o.optJSONArray(k)?.let {
+                val y = it.optDouble(2).toFloat()
+                when {
+                    it.length() >= 4 -> Wheel(it.optDouble(0).toFloat(), it.optDouble(1).toFloat(), y, it.optDouble(3).toFloat())
+                    k == "o" -> Wheel(it.optDouble(0).toFloat(), it.optDouble(1).toFloat(), y)
+                    else -> Wheel(it.optDouble(0).toFloat(), it.optDouble(1).toFloat(), 0f, y)
+                }
+            } ?: Wheel()
             fun f(k: String, d: Float) = o.optDouble(k, d.toDouble()).toFloat()
             return Grade(
                 w("l"), w("g"), w("n"), w("o"),
@@ -143,6 +159,53 @@ data class Grade(
                 RawLayer.fromJson(o.optJSONObject("raw")),
             )
         }
+    }
+}
+
+/**
+ * Resolve's Temp and Tint (measured from Resolve 21): a Bradford chromatic adaptation on Rec.709, scaled so grey keeps
+ * its luminance. The cone gains it uses for each Temp (−2000 to 2000 by 500) and Tint (−100 to 100 by 20) were measured
+ * and are interpolated here (in log), matching Resolve to about 0.002.
+ */
+object TempTint {
+    /** Rec.709 to Bradford cone space, and back. */
+    private val T = floatArrayOf(0.422658f, 0.491357f, 0.027364f, 0.055691f, 0.961556f, 0.023189f, 0.021379f, 0.087644f, 0.980743f)
+    private val TI = floatArrayOf(2.538448f, -1.293483f, -0.040243f, -0.146000f, 1.116622f, -0.022329f, -0.042288f, -0.071590f, 1.022507f)
+    /** ln of the cone gains, [temp][tint][cone]. */
+    private val D = floatArrayOf(
+        -0.084301f, 0.046685f, 0.132466f, -0.075692f, 0.039151f, 0.146454f, -0.067036f, 0.031574f, 0.160301f, -0.058432f, 0.023841f, 0.174090f, -0.049843f, 0.016005f, 0.187783f, -0.041272f, 0.008064f, 0.201335f, -0.032749f, -0.000038f, 0.214830f, -0.024186f, -0.008196f, 0.228199f, -0.015669f, -0.016519f, 0.241511f, -0.007202f, -0.024965f, 0.254690f, 0.001307f, -0.033515f, 0.267826f,
+        -0.075109f, 0.045471f, 0.086818f, -0.066756f, 0.038018f, 0.101902f, -0.058385f, 0.030475f, 0.116858f, -0.050057f, 0.022825f, 0.131685f, -0.041714f, 0.015075f, 0.146442f, -0.033381f, 0.007224f, 0.161026f, -0.025100f, -0.000795f, 0.175489f, -0.016826f, -0.008917f, 0.189882f, -0.008540f, -0.017147f, 0.204114f, -0.000267f, -0.025492f, 0.218279f, 0.007990f, -0.033955f, 0.232333f,
+        -0.063754f, 0.043100f, 0.034916f, -0.055690f, 0.035775f, 0.051424f, -0.047641f, 0.028302f, 0.067710f, -0.039597f, 0.020732f, 0.083883f, -0.031564f, 0.013058f, 0.099902f, -0.023572f, 0.005223f, 0.115755f, -0.015586f, -0.002711f, 0.131508f, -0.007549f, -0.010697f, 0.147114f, 0.000413f, -0.018904f, 0.162563f, 0.008427f, -0.027161f, 0.177922f, 0.016398f, -0.035593f, 0.193130f,
+        -0.051133f, 0.040442f, -0.026527f, -0.043423f, 0.033186f, -0.008322f, -0.035751f, 0.025778f, 0.009659f, -0.028022f, 0.018329f, 0.027435f, -0.020326f, 0.010729f, 0.045053f, -0.012665f, 0.003021f, 0.062465f, -0.004950f, -0.004780f, 0.079680f, 0.002703f, -0.012750f, 0.096799f, 0.010377f, -0.020822f, 0.113679f, 0.018075f, -0.029002f, 0.130471f, 0.025740f, -0.037299f, 0.147029f,
+        -0.036586f, 0.036913f, -0.099150f, -0.029264f, 0.029764f, -0.078880f, -0.021969f, 0.022470f, -0.058782f, -0.014640f, 0.015135f, -0.038961f, -0.007340f, 0.007648f, -0.019420f, -0.000044f, -0.000044f, -0.000044f, 0.007290f, -0.007678f, 0.019081f, 0.014591f, -0.015525f, 0.037996f, 0.021917f, -0.023476f, 0.056666f, 0.029245f, -0.031533f, 0.075146f, 0.036571f, -0.039752f, 0.093434f,
+        -0.019264f, 0.031841f, -0.185417f, -0.012414f, 0.024789f, -0.162309f, -0.005555f, 0.017644f, -0.139597f, 0.001315f, 0.010408f, -0.117147f, 0.008219f, 0.003080f, -0.095064f, 0.015097f, -0.004404f, -0.073294f, 0.021985f, -0.011988f, -0.051754f, 0.028874f, -0.019727f, -0.030559f, 0.035769f, -0.027570f, -0.009641f, 0.042700f, -0.035512f, 0.011065f, 0.049603f, -0.043625f, 0.031453f,
+        0.000982f, 0.025152f, -0.290969f, 0.007337f, 0.018285f, -0.264176f, 0.013677f, 0.011275f, -0.237880f, 0.020059f, 0.004177f, -0.212058f, 0.026456f, -0.003012f, -0.186618f, 0.032834f, -0.010356f, -0.161690f, 0.039252f, -0.017792f, -0.137112f, 0.045684f, -0.025329f, -0.112884f, 0.052096f, -0.033025f, -0.089113f, 0.058548f, -0.040819f, -0.065660f, 0.065007f, -0.048776f, -0.042581f,
+        0.025021f, 0.016139f, -0.423449f, 0.030801f, 0.009442f, -0.391457f, 0.036599f, 0.002653f, -0.360304f, 0.042390f, -0.004279f, -0.329796f, 0.048201f, -0.011300f, -0.299891f, 0.054028f, -0.018465f, -0.270649f, 0.059905f, -0.025671f, -0.241954f, 0.065743f, -0.033085f, -0.213800f, 0.071622f, -0.040598f, -0.186219f, 0.077547f, -0.048207f, -0.159120f, 0.083488f, -0.055917f, -0.132487f,
+        0.054463f, 0.002985f, -0.588742f, 0.059561f, -0.003532f, -0.549498f, 0.064716f, -0.010128f, -0.511273f, 0.069869f, -0.016813f, -0.474200f, 0.075048f, -0.023638f, -0.438120f, 0.080249f, -0.030557f, -0.403045f, 0.085474f, -0.037618f, -0.368775f, 0.090699f, -0.044779f, -0.335338f, 0.095999f, -0.052027f, -0.302679f, 0.101269f, -0.059433f, -0.270779f, 0.106562f, -0.066996f, -0.239520f,
+    )
+
+    /** The 3×3 matrix (row-major) that applies [temp] and [tint] to linear-or-display Rec.709 values. */
+    fun matrix(temp: Float, tint: Float): FloatArray {
+        if (temp == 0f && tint == 0f) return floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f)
+        val ti = ((temp.coerceIn(-2000f, 2000f) + 2000f) / 500f).coerceIn(0f, 8f)
+        val ni = ((tint.coerceIn(-100f, 100f) + 100f) / 20f).coerceIn(0f, 10f)
+        val i0 = minOf(ti.toInt(), 7); val j0 = minOf(ni.toInt(), 9)
+        val a = ti - i0; val b = ni - j0
+        val g = FloatArray(3) { k ->
+            fun at(i: Int, j: Int) = D[(i * 11 + j) * 3 + k]
+            kotlin.math.exp((at(i0, j0) * (1 - a) + at(i0 + 1, j0) * a) * (1 - b) + (at(i0, j0 + 1) * (1 - a) + at(i0 + 1, j0 + 1) * a) * b)
+        }
+        // TI · diag(g) · T
+        val m = FloatArray(9)
+        for (r in 0 until 3) for (c in 0 until 3) {
+            var s = 0f
+            for (k in 0 until 3) s += TI[r * 3 + k] * g[k] * T[k * 3 + c]
+            m[r * 3 + c] = s
+        }
+        // Grey keeps its luminance.
+        val yr = 0.2126f * (m[0] + m[1] + m[2]) + 0.7152f * (m[3] + m[4] + m[5]) + 0.0722f * (m[6] + m[7] + m[8])
+        for (k in 0 until 9) m[k] /= yr
+        return m
     }
 }
 
@@ -174,10 +237,12 @@ enum class WheelKind(val label: String, val reach: Float) {
     private fun raw(readout: Float) = when (this) { GAIN -> readout - 1f; OFFSET -> (readout - 25f) / 100f; else -> readout }
 
     /**
-     * [w] with one channel's readout (0 Y, 1 R, 2 G, 3 B) set to [value] and the others kept: Y moves all three together;
-     * a colour channel is solved back into the puck's position and the master, so the wheel shows exactly what was set.
+     * [w] with one channel's readout (0 Y, 1 R, 2 G, 3 B) set to [value] and the others kept: Y is the wheel's own (for
+     * Offset, which has none, it moves all three); a colour channel is solved back into the puck's position and the
+     * channels' common shift, so the wheel shows exactly what was set.
      */
     fun withChannel(w: Wheel, ch: Int, value: Float): Wheel {
+        if (ch == 0 && this != OFFSET) return w.copy(m = raw(value).coerceIn(-1f, 1f))
         if (ch == 0) {
             val dy = raw(value) - raw(readout(w)[0])
             return w.copy(y = (w.y + dy).coerceIn(-1f, 1f))
@@ -190,16 +255,20 @@ enum class WheelKind(val label: String, val reach: Float) {
         var v = (R - y) / 1.5748f / reach
         val m = hypot(u, v)
         if (m > 1f) { u /= m; v /= m }
-        return Wheel(u, v, y.coerceIn(-1f, 1f))
+        return Wheel(u, v, y.coerceIn(-1f, 1f), w.m)
     }
+
+    /** What the jog under the wheel moves: the wheel's Y, or for Offset (which has none) all three channels. */
+    fun master(w: Wheel): Float = if (this == OFFSET) w.y else w.m
+    fun withMaster(w: Wheel, x: Float): Wheel = if (this == OFFSET) w.copy(y = x) else w.copy(m = x)
 
     /** Y, R, G and B as Resolve shows them under the wheel: Gain sits at 1, Offset at 25, the others at 0. */
     fun readout(w: Wheel): FloatArray {
         val c = w.rgb(reach)
         return when (this) {
-            GAIN -> floatArrayOf(1 + w.y, 1 + w.y + c[0], 1 + w.y + c[1], 1 + w.y + c[2])
+            GAIN -> floatArrayOf(1 + w.m, 1 + w.y + c[0], 1 + w.y + c[1], 1 + w.y + c[2])
             OFFSET -> floatArrayOf(25 + w.y * 100, 25 + (w.y + c[0]) * 100, 25 + (w.y + c[1]) * 100, 25 + (w.y + c[2]) * 100)
-            else -> floatArrayOf(w.y, w.y + c[0], w.y + c[1], w.y + c[2])
+            else -> floatArrayOf(w.m, w.y + c[0], w.y + c[1], w.y + c[2])
         }
     }
 }
@@ -231,7 +300,7 @@ precision highp float;
 varying vec2 vUv;
 uniform samplerExternalOES uSrc;
 uniform mat4 uTex;
-uniform vec4 uG[7];
+uniform vec4 uG[9];
 uniform float uOn;
 uniform vec2 uTexel;
 
@@ -436,43 +505,94 @@ vec3 inputAt(vec2 p0) {
 }
 
 // ---- correction --------------------------------------------------------------------------------
-vec3 lgg(vec3 c, vec3 lift, vec3 gam, vec3 gain) {
-    c = c + lift * (1.0 - c);
-    c = c * gain;
-    vec3 e = exp2(-gam * 2.2);
+// The Color Wheels palette, as Resolve 21 does it (measured through its own LUT export, to 3e-5 for the wheels).
+const float OFFSET_STEP = 7.5 / 1023.0 * 100.0;   // Offset moves 7.5 ten-bit codes per step (kept here / 100)
+
+/** Lift then gain, as Resolve: black moves with lift, white with gain. */
+vec3 liftGain(vec3 c, vec3 l, vec3 n) { return n * (c + l * (1.0 - c)) / (1.0 + l * (n - 1.0)); }
+
+/** Resolve's gamma: brighter by 1 / (1 + g) above zero, darker by (1 − g) below. */
+vec3 wheelGamma(vec3 c, vec3 g) {
+    vec3 e = mix(1.0 - g, 1.0 / (1.0 + g), step(0.0, g));
     return sign(c) * pow(abs(c), e);
 }
 
+/** One side of Resolve's contrast S-curve (measured table, see SatCompTable): [u] 0 at the end, 1 at the pivot. */
+float conSide(float u, float k) {
+    float row = clamp((k - 1.0) / 0.05, 0.0, 20.0);
+    return texture2D(uSatComp, vec2((clamp(u, 0.0, 1.0) * 191.0 + 0.5) / 192.0, (1729.0 + row + 0.5) / 1772.0)).r;
+}
+float conCurve(float x, float k, float p, float f0, float s0) {
+    if (x <= 0.0) return p * f0 + x * s0;
+    if (x >= 1.0) return 1.0 - (1.0 - p) * f0 + (x - 1.0) * s0;
+    return x < p ? p * conSide(x / p, k) : 1.0 - (1.0 - p) * conSide((1.0 - x) / (1.0 - p), k);
+}
+
 /**
- * Contrast about [pivot] as Resolve does by default ("Use S-curve for contrast", Project Settings > General Options): the
- * slope at the pivot is [k], and the shadows and highlights ease into black and white instead of clipping. Each side is a
- * power curve through the pivot, so 0 stays 0 and 1 stays 1; beyond 0…1 (HDR, log) values carry on unchanged.
+ * Contrast about [pivot], as Resolve's (its default S-curve): below 1 a straight line through the pivot; above, a
+ * measured S-curve with Resolve's own shape, carrying on beyond 0 and 1 at its end slope.
  */
 vec3 sContrast(vec3 c, float k, float pivot) {
     if (abs(k - 1.0) < 1e-4) return c;
     float p = clamp(pivot, 0.01, 0.99);
-    k = max(k, 0.01);
-    vec3 x = clamp(c, 0.0, 1.0);
-    vec3 lo = p * pow(x / p, vec3(k));
-    vec3 hi = 1.0 - (1.0 - p) * pow((1.0 - x) / (1.0 - p), vec3(k));
-    vec3 s = mix(lo, hi, step(p, x));
-    return s + (c - x);
+    if (k < 1.0) return p + (c - p) * k;
+    if (uSatCompOn < 0.5) {
+        vec3 x = clamp(c, 0.0, 1.0);
+        vec3 lo = p * pow(x / p, vec3(k));
+        vec3 hi = 1.0 - (1.0 - p) * pow((1.0 - x) / (1.0 - p), vec3(k));
+        return mix(lo, hi, step(p, x)) + (c - x);
+    }
+    float f0 = conSide(0.0, k);
+    float s0 = (conSide(1.0 / 191.0, k) - f0) * 191.0;
+    return vec3(conCurve(c.r, k, p, f0, s0), conCurve(c.g, k, p, f0, s0), conCurve(c.b, k, p, f0, s0));
 }
 
-/** The primaries and wheels (Resolve's Color Wheels palette). */
+/**
+ * Resolve's Color Boost (measured): luminance kept, the colour moved straight from grey so its chroma (max − min
+ * channel) follows a measured curve for the amount [b] (−1 to 1). Up, chroma rises by a near-constant amount, eased in
+ * from grey; down, it falls by one and stops at grey, so muted colours move most. Smooth, so gradients stay clean.
+ */
+float boostAt(float ch, float b) {
+    float row = (clamp(b, -1.0, 1.0) + 1.0) * 10.0;
+    float v = (1750.0 + row + 0.5) / 1772.0;
+    float x = clamp(ch, 0.0, 1.0);
+    float f = texture2D(uSatComp, vec2((x * 191.0 + 0.5) / 192.0, v)).r;
+    if (ch > 1.0) f += (ch - 1.0) * (f - texture2D(uSatComp, vec2((190.0 + 0.5) / 192.0, v)).r) * 191.0;
+    return f;
+}
+vec3 colorBoost(vec3 c, float b) {
+    float ch = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+    if (ch < 1e-6) return c;
+    if (uSatCompOn < 0.5) {
+        float y = luma(c);
+        return y + (c - y) * (1.0 + b * (1.0 - smoothstep(0.0, 0.6, ch)));
+    }
+    float y = luma(c);
+    return y + (c - y) * (boostAt(ch, b) / ch);
+}
+
+// Resolve's Hue turns colours about grey in its own plane (measured: an exact rotation by the dial's angle).
+const mat3 HUE_A = mat3(0.5773503, 0.5773503, 0.5773503, 0.6964470, -0.2084033, -0.0040914, 0.0000000, 0.0875793, -0.6810601);
+const mat3 HUE_AI = mat3(0.3637189, 1.1343388, 0.3015185, 1.2124232, -1.0050914, 1.0338369, 0.1559087, -0.1292474, -1.3353554);
+
+/**
+ * The primaries and wheels (Resolve's Color Wheels palette), in Resolve's order: Temp and Tint; Color Boost; Lift, Gain, Offset and
+ * Gamma on each channel, with the wheels' Y on luminance as far as Lum Mix allows; Contrast; Saturation; Hue.
+ */
 vec3 primaries(vec3 src) {
     vec4 L = uG[0]; vec4 G = uG[1]; vec4 N = uG[2]; vec4 O = uG[3];
     vec4 P = uG[4]; vec4 Q = uG[5]; vec4 R = uG[6];
     vec3 c = src;
-    c += O.rgb + O.a;
-    c *= vec3(1.0 + 0.22 * P.x + 0.07 * P.y, 1.0 - 0.16 * P.y, 1.0 - 0.22 * P.x + 0.07 * P.y);
-    vec3 perChannel = lgg(c, L.rgb + L.a, G.rgb + G.a, 1.0 + N.rgb + N.a);
-    vec3 colourOnly = lgg(c, L.rgb, G.rgb, 1.0 + N.rgb);
-    float y0 = luma(colourOnly);
-    float y1 = luma(lgg(vec3(y0), vec3(L.a + 0.0), vec3(G.a), vec3(1.0 + N.a)));
-    vec3 lumaOnly = colourOnly + (y1 - y0);
-    c = mix(perChannel, lumaOnly, R.z);
-    c = sContrast(c, P.z, P.w);
+    c = mat3(uG[7].x, uG[7].w, uG[8].z, uG[7].y, uG[8].x, uG[8].w, uG[7].z, uG[8].y, R.w) * c;
+    if (abs(Q.y) > 0.0001) c = colorBoost(c, Q.y);
+    // Each channel; the luminance as the Y values would have it; then the luminance put where Lum Mix says.
+    vec3 off = O.rgb * OFFSET_STEP;
+    vec3 q = wheelGamma(liftGain(c, 2.0 * L.rgb, 1.0 + N.rgb) + off, 4.0 * G.rgb);
+    float ty = wheelGamma(liftGain(vec3(luma(c)), vec3(2.0 * L.a), vec3(1.0 + N.a)) + luma(off), vec3(4.0 * G.a)).x;
+    // Contrast on both, and the luminance settled once, after it (as Resolve).
+    q = sContrast(q, P.z, P.w);
+    ty = sContrast(vec3(ty), P.z, P.w).x;
+    c = q + R.z * (ty - luma(q));
     float y = luma(c);
     float ws = 1.0 - smoothstep(0.0, 0.55, y);
     float wh = smoothstep(0.45, 1.0, y);
@@ -489,16 +609,10 @@ vec3 primaries(vec3 src) {
         c += (ys - b) * Q.x * 2.5 * mid;
     }
     y = luma(c);
-    float s = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
-    c = y + (c - y) * (1.0 + Q.y * (1.0 - clamp(s * 2.0, 0.0, 1.0)));
     c = y + (c - y) * R.x;
     if (abs(R.y) > 0.0001) {
-        float cb = (c.b - y) / 1.8556;
-        float cr = (c.r - y) / 1.5748;
         float cs = cos(R.y); float sn = sin(R.y);
-        float nb = cb * cs - cr * sn;
-        float nr = cb * sn + cr * cs;
-        c = vec3(y + 1.5748 * nr, y - 0.1873 * nb - 0.4681 * nr, y + 1.8556 * nb);
+        c = HUE_A * (mat3(1.0, 0.0, 0.0, 0.0, cs, -sn, 0.0, sn, cs) * (HUE_AI * c));
     }
     return c;
 }

@@ -111,7 +111,7 @@ private class SegmentReader(context: Context, val seg: Segment, private val rate
     private var inRate = 48_000
     private var inCh = 2
     private var floatPcm = false
-    private val sonic = SonicAudioProcessor()
+    private var sonic = SonicAudioProcessor()
     private var sonicOn = false
     /** Stereo frames ready to be mixed. */
     private var fifo = FloatArray(0)
@@ -131,8 +131,20 @@ private class SegmentReader(context: Context, val seg: Segment, private val rate
         dec.configure(f, null, null, 0)
         dec.start()
         ex.seekTo(seg.srcIn, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        setUpSonic()
+    }
+
+    /**
+     * Speed, pitch and sample-rate change for the sound as it is decoded at [inRate]: a new processor each time the
+     * decoder says what it really gives. (The file's own rate can differ: HE-AAC files give their core rate, half the
+     * real one. A processor told to change to "nothing to do" keeps its old setting, which played such files an
+     * octave low at half speed.)
+     */
+    private fun setUpSonic() {
         val pitch = 2.0.pow(seg.clip.snd.pitch / 12.0).toFloat()
         sonicOn = seg.clip.speed != 1f || pitch != 1f || inRate != rate
+        runCatching { sonic.reset() }
+        sonic = SonicAudioProcessor()
         if (sonicOn) {
             sonic.setSpeed(seg.clip.speed)
             sonic.setPitch(pitch)
@@ -176,12 +188,7 @@ private class SegmentReader(context: Context, val seg: Segment, private val rate
             inRate = f.getInteger(MediaFormat.KEY_SAMPLE_RATE)
             inCh = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
             floatPcm = f.containsKey(MediaFormat.KEY_PCM_ENCODING) && f.getInteger(MediaFormat.KEY_PCM_ENCODING) == AudioFormat.ENCODING_PCM_FLOAT
-            if (sonicOn || inRate != rate) {
-                sonicOn = true
-                sonic.setOutputSampleRateHz(rate)
-                sonic.configure(AudioProcessor.AudioFormat(inRate, 2, C.ENCODING_PCM_16BIT))
-                sonic.flush()
-            }
+            setUpSonic()
             return
         }
         if (o < 0) return

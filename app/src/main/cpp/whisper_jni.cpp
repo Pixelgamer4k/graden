@@ -4,6 +4,7 @@
 #include <jni.h>
 #include <android/log.h>
 #include <atomic>
+#include <cmath>
 #include <string>
 #include <vector>
 #include "whisper.h"
@@ -15,6 +16,35 @@ namespace {
 
     void log_cb(enum ggml_log_level level, const char* text, void*) {
         if (level >= GGML_LOG_LEVEL_WARN) __android_log_print(ANDROID_LOG_WARN, "Whisper", "%s", text);
+    }
+
+    /** A number JSON can hold: NaN and infinity (a model can give them) become 0. */
+    double num(double v) { return std::isfinite(v) ? v : 0.0; }
+
+    /** Whether [s] ends part-way through a UTF-8 letter. */
+    bool incomplete(const std::string& s) {
+        int n = static_cast<int>(s.size());
+        for (int back = 1; back <= 4 && back <= n; back++) {
+            unsigned char c = static_cast<unsigned char>(s[n - back]);
+            if ((c & 0xC0) == 0x80) continue;                 // a continuation byte: look further back
+            int need = (c & 0x80) == 0 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 1;
+            return back < need;
+        }
+        return false;
+    }
+
+    /** [s] as valid UTF-8: any broken sequence becomes U+FFFD. */
+    std::string clean(const std::string& s) {
+        std::string o;
+        size_t i = 0;
+        while (i < s.size()) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            int need = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 0;
+            bool ok = need > 0 && i + need <= s.size();
+            for (int k = 1; ok && k < need; k++) ok = (static_cast<unsigned char>(s[i + k]) & 0xC0) == 0x80;
+            if (ok) { o.append(s, i, need); i += need; } else { o += "\xEF\xBF\xBD"; i++; }
+        }
+        return o;
     }
 
     std::string esc(const char* s) {
@@ -95,7 +125,7 @@ JNIEXPORT jfloatArray JNICALL Java_com_graden_editor_Whisper_nativeVad(JNIEnv* e
  * nativeCancel stops it. Returns JSON: {"lang":"hi","segments":[{"t0":cs,"t1":cs,"ns":p,
  * "tokens":[{"t":"text","t0":cs,"t1":cs,"d":cs,"p":prob}]}]} (cs: hundredths of a second), or null.
  */
-JNIEXPORT jstring JNICALL Java_com_graden_editor_Whisper_nativeTranscribe(JNIEnv* env, jclass, jlong h, jfloatArray pcm, jstring jlang,
+JNIEXPORT jbyteArray JNICALL Java_com_graden_editor_Whisper_nativeTranscribe(JNIEnv* env, jclass, jlong h, jfloatArray pcm, jstring jlang,
                                                                         jint threads, jstring jprompt, jobject cb) {
     auto* ctx = reinterpret_cast<whisper_context*>(h);
     if (!ctx) return nullptr;
@@ -145,25 +175,41 @@ JNIEXPORT jstring JNICALL Java_com_graden_editor_Whisper_nativeTranscribe(JNIEnv
         if (s) out += ',';
         char b[160];
         snprintf(b, sizeof b, "{\"t0\":%lld,\"t1\":%lld,\"ns\":%.3f,\"tokens\":[", (long long) whisper_full_get_segment_t0(ctx, s),
-                 (long long) whisper_full_get_segment_t1(ctx, s), whisper_full_get_segment_no_speech_prob(ctx, s));
+                 (long long) whisper_full_get_segment_t1(ctx, s), num(whisper_full_get_segment_no_speech_prob(ctx, s)));
         out += b;
         int nt = whisper_full_n_tokens(ctx, s);
         bool first = true;
+        // Whisper's tokens are bytes: a letter of Devanagari, Bengali or CJK can be split between two of them. A piece
+        // that ends part-way through a letter waits for the next one, and goes out with it (the first one's start, the
+        // last one's end), so every piece is whole UTF-8.
+        std::string pending;
+        whisper_token_data from{};
+        auto emit = [&](const whisper_token_data& d0, const whisper_token_data& d1, const std::string& text) {
+            if (!first) out += ',';
+            first = false;
+            snprintf(b, sizeof b, "{\"t0\":%lld,\"t1\":%lld,\"d\":%lld,\"p\":%.3f,\"t\":\"", (long long) d0.t0, (long long) d1.t1, (long long) d0.t_dtw, num(d0.p));
+            out += b;
+            out += esc(clean(text).c_str());
+            out += "\"}";
+        };
         for (int t = 0; t < nt; t++) {
             whisper_token_data d = whisper_full_get_token_data(ctx, s, t);
             if (d.id >= whisper_token_eot(ctx)) continue;   // special tokens (timestamps, end)
             const char* text = whisper_full_get_token_text(ctx, s, t);
-            if (!first) out += ',';
-            first = false;
-            snprintf(b, sizeof b, "{\"t0\":%lld,\"t1\":%lld,\"d\":%lld,\"p\":%.3f,\"t\":\"", (long long) d.t0, (long long) d.t1, (long long) d.t_dtw, d.p);
-            out += b;
-            out += esc(text);
-            out += "\"}";
+            if (pending.empty()) from = d;
+            pending += text ? text : "";
+            if (incomplete(pending) && pending.size() < 16) continue;
+            emit(from, d, pending);
+            pending.clear();
         }
+        if (!pending.empty()) emit(from, from, pending);
         out += "]}";
     }
     out += "]}";
-    return env->NewStringUTF(out.c_str());
+    // As bytes: Java's own string conversion takes modified UTF-8, which four-byte letters (emoji) are not.
+    jbyteArray arr = env->NewByteArray(static_cast<jsize>(out.size()));
+    env->SetByteArrayRegion(arr, 0, static_cast<jsize>(out.size()), reinterpret_cast<const jbyte*>(out.data()));
+    return arr;
 }
 
 }

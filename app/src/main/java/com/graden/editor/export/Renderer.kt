@@ -929,7 +929,7 @@ class Compositor(private val context: Context, private val project: ExportProjec
         stabGl.set(gradeProg, stab, stabI, stabTmp)
         var layers = project.layers[p.clip.id] ?: com.graden.editor.LayerPack.EXPORT_NONE
         GLES20.glUniform1f(u("uTime"), us / 1e6f)
-        GLES20.glUniform4fv(u("uG"), 7, g.uniforms(), 0)
+        GLES20.glUniform4fv(u("uG"), 9, g.uniforms(), 0)
         looks.bind(gradeProg, if (g.isIdentity) null else g)
         // Mid/Detail measures its blur in pixels of the picture as the phone's preview shows it, so it looks the same.
         val previewScale = 1080f / max(cw, ch)
@@ -1142,7 +1142,7 @@ precision highp float;
 varying vec2 vLocal;
 vec2 vUv;
 uniform sampler2D uSrc;
-uniform vec4 uG[7];
+uniform vec4 uG[9];
 uniform float uOn;
 uniform vec2 uTexel;
 uniform vec4 uBase;

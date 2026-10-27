@@ -43,7 +43,7 @@ object Whisper {
     @JvmStatic private external fun nativeCancel()
     @JvmStatic private external fun nativeMultilingual(h: Long): Boolean
     @JvmStatic private external fun nativeVad(path: String, pcm: FloatArray, threads: Int): FloatArray?
-    @JvmStatic private external fun nativeTranscribe(h: Long, pcm: FloatArray, lang: String, threads: Int, prompt: String?, cb: WhisperProgress): String?
+    @JvmStatic private external fun nativeTranscribe(h: Long, pcm: FloatArray, lang: String, threads: Int, prompt: String?, cb: WhisperProgress): ByteArray?
 
     /** A loaded model. [aheads]: whisper.cpp's alignment-heads preset for word timing (0: none). */
     class Model(path: String, aheads: Int) : AutoCloseable {
@@ -55,6 +55,7 @@ object Whisper {
         fun transcribe(pcm: FloatArray, lang: String, progress: (Int) -> Unit): String? {
             if (h == 0L) return null
             return nativeTranscribe(h, pcm, lang, threads, null, object : WhisperProgress() { override fun onProgress(percent: Int) = progress(percent) })
+                ?.toString(Charsets.UTF_8)
         }
 
         override fun close() { if (h != 0L) nativeFree(h); h = 0L }

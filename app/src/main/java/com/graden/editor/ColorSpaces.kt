@@ -324,8 +324,8 @@ object ColorSpaces {
          */
         val levels: Int = 0,
     ) {
-        /** Nothing to do: same curve and gamut. */
-        val identity: Boolean get() = fromGamut === toGamut && fromGamma === toGamma && levels == 0
+        /** Nothing to do: same curve and gamut (and no peak given that the target's differs from). */
+        val identity: Boolean get() = fromGamut === toGamut && fromGamma === toGamma && levels == 0 && inNits == null
 
         /** (on, gamma in, gamma out, tone method), (peak in, peak out, gamut method, levels), the matrix, luminance weights. */
         fun pack(out: FloatArray, at: Int) {
@@ -336,17 +336,18 @@ object ColorSpaces {
             }
             // Linear light: 1.0 = SDR white (100 nits on SDR scenes, 203 nits for HDR, ITU-R BT.2408, as Resolve).
             val outPeak = if (toGamma.display) 1f else outNits / 203f
-            out[at] = 1f
+            val m = if (fromGamut === toGamut) IDENTITY else matrix(fromGamut, toGamut)
+            // 2: the target gamut is the wider one (its matrix back holds the larger negative), so tone mapping runs there.
+            out[at] = if (m !== IDENTITY && m.min() > matrix(toGamut, fromGamut).min()) 2f else 1f
             out[at + 1] = fromGamma.code.toFloat()
             out[at + 2] = toGamma.code.toFloat()
-            out[at + 3] = if (toGamma.display || toGamma.hdr) toneMaps.indexOf(tone).coerceAtLeast(0).toFloat() else 0f
+            out[at + 3] = toneMaps.indexOf(tone).coerceAtLeast(0).toFloat()
             // Peak in: -1 is "the curve's own" (the shader decodes code 1.0).
             out[at + 4] = inNits?.let { if (fromGamma.hdr) it / 203f else it / 100f } ?: -1f
             out[at + 5] = outPeak
             // Gamut mapping: 0 none, else which measured Saturation Compression table (by the output gamut).
             out[at + 6] = if ((toGamma.display || toGamma.hdr) && gamutMaps.indexOf(gamutMap) > 0) SatCompTable.index(toGamut).toFloat() else 0f
             out[at + 7] = levels.toFloat()
-            val m = if (fromGamut === toGamut) IDENTITY else matrix(fromGamut, toGamut)
             System.arraycopy(m, 0, out, at + 8, 9)
             lumaWeights(fromGamut).copyInto(out, at + 17)
         }
@@ -399,11 +400,13 @@ vec3 hlgDec(vec3 e) {
     float y = dot(s, vec3(0.2627, 0.6780, 0.0593));
     return s * pow(max(y, 1e-6), 0.2) * 1000.0;
 }
+// As Resolve (measured): the luminance is taken from the signed channels with a tiny floor, so a colour past the
+// gamut (negative luminance) is lifted hard rather than dropped; the code is clipped just under 1.
 vec3 hlgEnc(vec3 nits) {
-    vec3 d = max(nits / 1000.0, 0.0);
+    vec3 d = nits / 1000.0;
     float yd = dot(d, vec3(0.2627, 0.6780, 0.0593));
-    vec3 s = d * pow(max(yd, 1e-6), -0.2 / 1.2);
-    return mix(sqrt(3.0 * s), 0.17883277 * log(max(12.0 * s - 0.28466892, 1e-6)) + 0.55991073, step(1.0 / 12.0, s));
+    vec3 s = max(d * pow(max(yd, 1.19e-10), -0.2 / 1.2), 0.0);
+    return min(mix(sqrt(3.0 * s), 0.17883277 * log(max(12.0 * s - 0.28466892, 1e-6)) + 0.55991073, step(1.0 / 12.0, s)), 0.99971);
 }
 
 // The log curves, three channels at once (both sides of each cut are computed and the right one kept, so every
@@ -502,7 +505,7 @@ vec3 encodeG(vec3 l, float g) {
     if (g < 3.5) return pw(l, 1.0 / 2.6);
     if (g < 4.5) return r709Enc(l);
     if (g < 5.5) return srgbEnc(l);
-    if (g < 6.5) return hlgEnc(max(l, 0.0) * SDR_WHITE);
+    if (g < 6.5) return hlgEnc(l * SDR_WHITE);
     if (g < 7.5) return pqEnc(max(l, 0.0) * SDR_WHITE);
     if (g > 29.5) return pw(l, 1.0 / 1.961);
     return elog(l, g);
@@ -518,7 +521,7 @@ float shoulder(float x, float k, float hi, float top) {
 /**
  * Resolve's DaVinci tone curve, measured from Resolve 21 itself (Fusion's Color Space Transform, 274,625 colours):
  * a·x / (x + k) on each channel of scene light, odd about zero, reaching the target peak [F] (scene units) at the input
- * peak [X], with k = k0·X/(X − 1). k0 is 0.91 at Adaptation 9 for log and linear sources, 1.5306 for HDR video sources.
+ * peak [X], with k = k0·X/(X − 1). k0 is 0.91 at Adaptation 9.
  */
 vec3 dvCurve(vec3 x, float X, float F, float k0) {
     float k = k0 * X / max(X - 1.0, 1e-4);
@@ -526,24 +529,55 @@ vec3 dvCurve(vec3 x, float X, float F, float k0) {
     return sign(x) * a * abs(x) / (abs(x) + k);
 }
 
-/** Tone mapping in the source gamut (as Resolve does it); [yw] the source's luminance weights. */
-vec3 toneMap(vec3 l, float m, float X, float F, float k0, vec3 yw) {
-    // Simple and DaVinci: each channel on its own.
-    if (m < 1.5 || m > 3.5) return dvCurve(l, X, F, k0);
-    // Luminance Mapping and Saturation Preserving: the luminance through the curve, the colour ratios kept.
-    float y = dot(l, yw);
-    if (y <= 1e-7) return l;
-    return l * (dvCurve(vec3(y), X, F, k0).x / y);
+/** The DaVinci curve run backwards: SDR scene light (1.0 = white) out to a brighter peak [X]. */
+vec3 dvExpand(vec3 y, float X, float k0) {
+    float k = k0 * X / max(X - 1.0, 1e-4);
+    float a = (X + k) / X;
+    vec3 v = min(abs(y), vec3(a * 0.999999));
+    return sign(y) * k * v / (a - v);
 }
 
-/** k0 of the DaVinci curve for an HDR master of [nits] (measured at 203, 400, 600, 1000, 2000 and 4000 nits). */
-float hdrK0(float nits) {
-    if (nits <= 203.0) return 0.91;
-    if (nits <= 400.0) return mix(0.91, 1.7401, (nits - 203.0) / 197.0);
-    if (nits <= 600.0) return mix(1.7401, 2.5636, (nits - 400.0) / 200.0);
-    if (nits <= 1000.0) return mix(2.5636, 4.2078, (nits - 600.0) / 400.0);
-    if (nits <= 2000.0) return mix(4.2078, 8.4970, (nits - 1000.0) / 1000.0);
-    return mix(8.4970, 18.554, (min(nits, 4000.0) - 2000.0) / 2000.0);
+uniform sampler2D uSatComp;
+uniform float uSatCompOn;
+
+/** Resolve's Simple tone curve on one channel of scene light (its measured table: see SatCompTable). */
+float simpleCurve(float x) {
+    float t = clamp((elog0(vec3(x), 16.0).x + 0.2) / 1.2, 0.0, 1.0);
+    return texture2D(uSatComp, vec2((t * 191.0 + 0.5) / 192.0, 1728.5 / 1772.0)).r;
+}
+
+/**
+ * Tone mapping down to SDR (F = 1), as Resolve's four methods (measured from Resolve 21, the first three exactly):
+ * DaVinci, the curve on each channel; Simple, its own fixed curve on each channel (it ignores the peak); Luminance
+ * Mapping, the curve on each channel with the middle one put back to keep the hue; Saturation Preserving, the
+ * luminance through the curve with the colour scaled along, eased towards grey above SDR white by a measured amount
+ * that depends on the luminance alone.
+ */
+vec3 toneMap(vec3 l, float m, float X, float F, float k0, vec3 yw) {
+    if (m > 3.5) return dvCurve(l, X, F, k0);
+    if (m < 1.5) return uSatCompOn > 0.5 ? vec3(simpleCurve(l.r), simpleCurve(l.g), simpleCurve(l.b)) : dvCurve(l, X, F, k0);
+    if (m < 2.5) {
+        vec3 y = dvCurve(l, X, F, k0);
+        float lo = min(l.r, min(l.g, l.b)), hi = max(l.r, max(l.g, l.b));
+        if (hi - lo < 1e-12) return y;
+        float ylo = min(y.r, min(y.g, y.b)), yhi = max(y.r, max(y.g, y.b));
+        vec3 isMid = step(vec3(lo), l) * step(l, vec3(hi)) * (1.0 - step(abs(l - lo), vec3(0.0))) * (1.0 - step(abs(l - hi), vec3(0.0)));
+        float mid = dot(l, isMid);
+        return mix(y, vec3(ylo + (yhi - ylo) * (mid - lo) / (hi - lo)), isMid);
+    }
+    float y = dot(l, yw);
+    // Past the gamut the luminance can be negative: the curve is odd, so the scale stays positive (as Resolve).
+    if (abs(y) <= 1e-9) return l * dvCurve(vec3(1e-9), X, F, k0).x * 1e9;
+    float yo = dvCurve(vec3(y), X, F, k0).x;
+    vec3 c = l * (yo / y);
+    // Beyond SDR white (either way: past the gamut the luminance can be negative, and Resolve treats it alike) the
+    // colour eases towards grey by an amount that depends on the scene luminance alone (measured from Resolve, the
+    // same for every source curve).
+    if (abs(y) > 1.0 && uSatCompOn > 0.5) {
+        float t = texture2D(uSatComp, vec2((clamp(log(abs(y)) / log(128.0), 0.0, 1.0) * 191.0 + 0.5) / 192.0, 1771.5 / 1772.0)).r;
+        c = mix(vec3(yo), c, t);
+    }
+    return c;
 }
 
 // Curves that describe a display's light (SDR gammas, sRGB; HDR: HLG, PQ) and those that describe the scene (linear,
@@ -553,9 +587,12 @@ bool sdrDisplay(float g) { return (g > 0.5 && g < 3.5) || (g > 4.5 && g < 5.5) |
 bool hdrDisplay(float g) { return g > 5.5 && g < 7.5; }
 vec3 spow(vec3 v, float p) { return sign(v) * pow(abs(v), vec3(p)); }
 const float HDR_SCENE = 0.827660;   // 1 / (0.595208 · 2.03): HDR display light to scene light, at 203 nits = SDR white
+// The tone curve's own scale for HDR (measured): nits to scene light through the OOTF with 203 nits landing on 1.0,
+// SDR white, so HDR sources, SDR and HDR targets all meet the same DaVinci curve (k0 0.91).
+const float HDR_S = 0.5467035;      // 1 / OETF709⁻¹(2.03^(1/2.4))
+vec3 nitsToScene(vec3 n) { return r709Dec(spow(n / 100.0, 1.0 / 2.4)) * HDR_S; }
+vec3 sceneToNits(vec3 u) { return spow(r709Enc(u / HDR_S), 2.4) * 100.0; }
 
-uniform sampler2D uSatComp;
-uniform float uSatCompOn;
 /**
  * Resolve's Saturation Compression, from its measured table (see SatCompTable): the colour scaled so its largest
  * channel is 1, looked up by the other two on that face of the cube, scaled back. [m]: 0 off, 1 Rec.709, 2 Rec.2020, 3 P3.
@@ -571,14 +608,21 @@ vec3 gamutMap(vec3 c, float m) {
     else { face = 2.0; ab = n.rg; }
     vec2 q = (clamp(ab, -3.0, 1.0) + 3.0) * (191.0 / 4.0);
     float row = ((m - 1.0) * 3.0 + face) * 192.0 + q.y;
-    return texture2D(uSatComp, vec2((q.x + 0.5) / 192.0, (row + 0.5) / 1728.0)).rgb * mx;
+    return texture2D(uSatComp, vec2((q.x + 0.5) / 192.0, (row + 0.5) / 1772.0)).rgb * mx;
 }
 
 /**
  * One packed transform (see ColorSpaces.Xf): A = (on, gamma in, gamma out, tone), B = (peak in, peak out, gamut,
- * levels), [yw] the source's luminance weights. Resolve's order (measured): decode; display light to scene light
- * where the target is a scene curve or tone mapping runs; tone map in the source gamut; matrix; gamut map; clip to the
- * target; scene light back to display light where the target is a display; encode.
+ * levels), [yw] the source's luminance weights. A.x is 2 when the target gamut is the wider one.
+ *
+ * Tone mapping (measured against Resolve 21 to about 1e-5 on every pairing of log, linear, SDR, PQ and HLG): the
+ * picture comes down to SDR through the DaVinci curve and, for a target that holds more (HDR, a log curve), goes back
+ * up to that target's peak through the same curve inverted. Display pictures reach the curve through the BT.1886 OOTF
+ * (HDR with 203 nits as SDR white, up to its peak: Auto is PQ 10,000 nits, HLG 1,200, as Resolve). The curve runs in
+ * the wider of the two gamuts: from a wider source it runs first and the matrix after (an SDR picture expanding into
+ * HDR is matrixed and clipped first); into a wider target the matrix goes first. HDR targets keep what goes past
+ * their peak; SDR and scene targets are clipped to theirs. Linear takes the light of its source: a display's light
+ * stays display light.
  */
 vec3 xform(vec3 c, vec4 A, vec4 B, vec3 yw, mat3 M) {
     if (A.x < 0.5) return c;
@@ -586,37 +630,47 @@ vec3 xform(vec3 c, vec4 A, vec4 B, vec3 yw, mat3 M) {
     else if (B.w < -0.5) c = (c - 64.0 / 1023.0) * (1023.0 / 876.0);
     float gi = A.y, go = A.z;
     bool inSdr = sdrDisplay(gi), inHdr = hdrDisplay(gi), outSdr = sdrDisplay(go), outHdr = hdrDisplay(go);
-    vec3 l = decodeG(c, gi);
-    // The input's peak: given (B.x, in this curve's linear units), else the curve's own (HDR video: 1,000 nits).
-    float Xl = B.x > 0.0 ? B.x : (inHdr ? 1000.0 / SDR_WHITE : decodeG(vec3(1.0), gi).g);
-    // The target's peak: SDR 1.0; HDR the master's nits (B.y is nits / 203).
-    float outNits = outHdr ? B.y * SDR_WHITE : 100.0;
-    bool tm = A.w > 0.5 && (outSdr || outHdr || go == 4.0) && (inHdr ? Xl * SDR_WHITE > outNits * 1.001 : Xl > (outHdr ? outNits / 100.0 : 1.0) * 1.001);
     bool scene = !(inSdr || inHdr);
-    float X = Xl;
-    if (!scene && (tm || !(outSdr || outHdr))) {
-        if (inHdr) {
-            // HDR video: clipped at its peak when tone mapped (as Resolve), then to scene light.
-            if (tm) l = min(l, vec3(Xl));
-            l = r709Dec(spow(l * (SDR_WHITE / 100.0), 1.0 / 2.4)) * HDR_SCENE;
-            X = r709Dec(vec3(pow(Xl * SDR_WHITE / 100.0, 1.0 / 2.4))).x * HDR_SCENE;
-        } else {
-            l = r709Dec(spow(l, 1.0 / 2.4));
-            X = r709Dec(vec3(pow(max(Xl, 1e-6), 1.0 / 2.4))).x;
+    vec3 l = decodeG(c, gi);
+    // The input's peak: given (B.x, in this curve's linear units), else the curve's own (PQ 10,000 nits, HLG 1,200).
+    float Xl = B.x > 0.0 ? B.x : (inHdr ? (gi > 6.5 ? 10000.0 : 1200.0) / SDR_WHITE : decodeG(vec3(1.0), gi).g);
+
+    if (A.w > 0.5) {
+        vec3 u; float X;
+        if (inHdr) { u = nitsToScene(min(l, vec3(Xl)) * SDR_WHITE); X = nitsToScene(vec3(Xl * SDR_WHITE)).x; }
+        else if (inSdr) { u = r709Dec(spow(l, 1.0 / 2.4)); X = 1.0; }
+        else { u = l; X = Xl; }
+        // The target's peak: SDR 1.0; HDR the master's nits (B.y is nits / 203); a scene curve its value at code 1.0.
+        bool dispOut = outSdr || (go < 0.5 && !scene);
+        float Xo = outHdr ? nitsToScene(vec3(B.y * SDR_WHITE)).x : (dispOut ? 1.0 : decodeG(vec3(1.0), go).g);
+        if (abs(X - Xo) > 1e-4 * Xo) {
+            bool down = X > 1.0001, wide = A.x > 1.5;
+            vec3 y = wide ? M * u : u;
+            // Simple into HDR gives a near-black picture in Resolve itself; the DaVinci curve stands in there.
+            // An SDR picture going into a wider HDR gamut is gamut mapped there before it is expanded (measured).
+            y = down ? toneMap(y, outHdr && A.w < 1.5 ? 4.0 : A.w, X, 1.0, 0.91, yw) : (wide ? clamp(outHdr ? gamutMap(y, B.z) : y, 0.0, 1.0) : y);
+            if (Xo <= 1.0001) {
+                y = clamp(gamutMap(wide ? y : M * y, B.z), 0.0, 1.0);
+                return encodeG(dispOut ? spow(r709Enc(y), 2.4) : y, go);
+            }
+            vec3 z = wide ? dvExpand(y, Xo, 0.91)
+                : (down ? M * dvExpand(max(y, 0.0), Xo, 0.91) : dvExpand(clamp(M * y, 0.0, 1.0), Xo, 0.91));
+            // Saturation Compression for HDR: otherwise on the expanded light, in the target gamut (measured).
+            if (outHdr) return encodeG(sceneToNits(wide && !down ? z : gamutMap(z, B.z)) / SDR_WHITE, go);
+            return clamp(encodeG(min(z, vec3(Xo)), go), 0.0, 1.0);
         }
-        scene = true;
     }
-    // The target's peak in scene light (the light that, shown through the OOTF, reaches it).
-    float F = outHdr ? r709Dec(vec3(pow(outNits / 100.0, 1.0 / 2.4))).x : 1.0;
-    if (tm) {
-        l = toneMap(l, A.w, X, F, inHdr ? 1.5306 : (outHdr ? hdrK0(outNits) : 0.91), yw);
-        // For an HDR master Resolve drops negative channels here, before the matrix (SDR keeps them; both measured).
-        if (outHdr) l = max(l, 0.0);
+
+    // No tone mapping: display and scene light meet through the OOTF (linear passes either through as it is; HLG,
+    // already scene-referred, is taken as its light, measured).
+    if (!scene && !(outSdr || outHdr) && go > 0.5) {
+        if (inHdr) { if (gi > 6.5) l = r709Dec(spow(l * (SDR_WHITE / 100.0), 1.0 / 2.4)) * HDR_SCENE; }
+        else l = r709Dec(spow(l, 1.0 / 2.4));
+        scene = true;
     }
     l = M * l;
     l = gamutMap(l, B.z);
-    if (tm) l = clamp(l, 0.0, F);
-    if (scene && (outSdr || outHdr)) {
+    if (scene && gi > 0.5 && (outSdr || outHdr)) {
         l = spow(r709Enc(l), 2.4);
         if (outHdr) l *= 100.0 / SDR_WHITE;
     }

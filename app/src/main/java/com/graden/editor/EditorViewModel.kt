@@ -561,6 +561,28 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         save()
     }
 
+    /** Set to open the new-project sheet once the projects screen shows (e.g. from the end of an export). */
+    var askNewProject by mutableStateOf(false)
+
+    /** Renames a project from the projects screen. */
+    fun renameProjectById(id: String, name: String) {
+        val n = name.trim().take(ProjectMeta.MAX_NAME).ifEmpty { return }
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { runCatching { projects.rename(id, n) } }
+            refreshProjects()
+        }
+    }
+
+    /** Copies a project, as "<name> copy", next to it. */
+    fun duplicateProject(id: String) {
+        val src = projectList.firstOrNull { it.id == id } ?: return
+        val n = (src.meta.name.take(ProjectMeta.MAX_NAME - 5) + " copy").take(ProjectMeta.MAX_NAME)
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { runCatching { projects.duplicate(id, n) } }
+            refreshProjects()
+        }
+    }
+
     fun deleteProject(id: String) {
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
@@ -1512,6 +1534,9 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     val clipCount: Int get() = tracks.sumOf { it.clips.size }
+
+    /** Whether any clip on lane [trackId] has sound (a visual lane then offers a mute). */
+    fun laneHasSound(trackId: Int): Boolean = tracks.firstOrNull { it.id == trackId }?.clips?.any { c -> assets[c.assetId]?.let { it.hasAudio && !it.isImage } == true } == true
 
     fun toggleMute(trackId: Int) {
         mutedTracks = if (trackId in mutedTracks) mutedTracks - trackId else mutedTracks + trackId

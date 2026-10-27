@@ -1467,7 +1467,7 @@ private fun MasterJog(vm: EditorViewModel, kind: WheelKind, w: Wheel) {
                     val v = vmNow
                     var travel = 0f
                     var travelY = 0f
-                    var free = kind.of(v.gradeTarget?.clip?.grade ?: Grade()).y
+                    var free = kind.master(kind.of(v.gradeTarget?.clip?.grade ?: Grade()))
                     var engaged = false
                     val ticks = Ticker(view, perWidth / 50f, 0f)
                     while (true) {
@@ -1488,14 +1488,14 @@ private fun MasterJog(vm: EditorViewModel, kind: WheelKind, w: Wheel) {
                         val inDetent = abs(free) < perWidth * 0.012f
                         val y = if (inDetent) 0f else free
                         ticks.at(y)
-                        v.setGrade { g -> kind.set(g, kind.of(g).copy(y = y)) }
+                        v.setGrade { g -> kind.set(g, kind.withMaster(kind.of(g), y)) }
                         c.consume()
                     }
                     if (engaged) v.gradeEnd()
                     else if (travel + travelY < SLOP_DP * density) {
                         val now = System.currentTimeMillis()
                         if (now - lastTapAt < 320) {
-                            v.gradeOnce { g -> kind.set(g, kind.of(g).copy(y = 0f)) }
+                            v.gradeOnce { g -> kind.set(g, kind.withMaster(kind.of(g), 0f)) }
                             view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                             lastTapAt = 0L
                         } else lastTapAt = now
@@ -1506,7 +1506,7 @@ private fun MasterJog(vm: EditorViewModel, kind: WheelKind, w: Wheel) {
         val mid = size.width / 2
         val spacing = 7.dp.toPx()
         // Ticks scroll with the value, so the strip feels like a wheel turning under the thumb.
-        val shift = (w.y / perWidth * size.width) % spacing
+        val shift = (kind.master(w) / perWidth * size.width) % spacing
         var x = mid + shift - spacing * (mid / spacing).toInt() - spacing
         var i = 0
         while (x < size.width + spacing) {
@@ -1516,7 +1516,7 @@ private fun MasterJog(vm: EditorViewModel, kind: WheelKind, w: Wheel) {
             i++
         }
         // How far from neutral, as a bar from the centre.
-        val bar = (w.y / perWidth * size.width).coerceIn(-mid, mid)
+        val bar = (kind.master(w) / perWidth * size.width).coerceIn(-mid, mid)
         if (bar != 0f) drawRect(Palette.Accent.copy(alpha = 0.35f), Offset(min(mid, mid + bar), size.height - 3.dp.toPx()), Size(abs(bar), 3.dp.toPx()))
         drawLine(Palette.Accent, Offset(mid, 3.dp.toPx()), Offset(mid, size.height - 3.dp.toPx()), 2.dp.toPx(), StrokeCap.Round)
     }

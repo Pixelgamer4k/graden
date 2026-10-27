@@ -394,6 +394,25 @@ private fun playerInput(p: androidx.media3.common.Player): (Surface, Boolean) ->
     if (attached) p.setVideoSurface(s) else p.clearVideoSurface(s)
 }
 
+/**
+ * Shows the still pictures [p] plays in [v]. The player hands pictures over as bitmaps (to an image output), not into
+ * the video surface; each is copied (at most 4K on its long side, so the GPU can take it) and drawn into the view.
+ */
+@OptIn(UnstableApi::class)
+private fun pictureOutput(p: androidx.media3.exoplayer.ExoPlayer, v: com.graden.editor.GradedVideoView) {
+    p.setImageOutput(object : androidx.media3.exoplayer.image.ImageOutput {
+        override fun onImageAvailable(presentationTimeUs: Long, bitmap: android.graphics.Bitmap) {
+            val k = (3840f / maxOf(bitmap.width, bitmap.height)).coerceAtMost(1f)
+            val copy = runCatching {
+                if (k < 1f) android.graphics.Bitmap.createScaledBitmap(bitmap, (bitmap.width * k).toInt().coerceAtLeast(1), (bitmap.height * k).toInt().coerceAtLeast(1), true)
+                else bitmap.copy(android.graphics.Bitmap.Config.ARGB_8888, false)
+            }.getOrNull() ?: return
+            v.drawPicture(copy)
+        }
+        override fun onDisabled() {}
+    })
+}
+
 private fun resizeFor(scaling: String) =
     if (scaling == "Fill") androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_ZOOM else androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
 
@@ -535,7 +554,7 @@ private fun Preview(vm: EditorViewModel) {
                     scaleY = HIDDEN_SCALE
                 }
             },
-            factory = { ctx -> GradedVideoView(ctx, "still").apply { onInput = playerInput(vm.still) } },
+            factory = { ctx -> GradedVideoView(ctx, "still").apply { onInput = playerInput(vm.still); pictureOutput(vm.still, this) } },
             update = {
                 it.setLook(vm.gradeFor(top), topAspect, vm.meta.scaling == "Fill", vm.cmFor(top, native = true), vm.layersFor(top))
                 it.setStab(vm.stabFor(top)) { _ -> vm.stabStillUs(top) }
@@ -818,7 +837,7 @@ private fun LaneLayers(vm: EditorViewModel, t: com.graden.editor.Track) {
                     },
                     // Drawn through the grade on the GPU, so a change to the grade shows at once, playing or paused.
                     factory = { ctx ->
-                        GradedVideoView(ctx, "L${t.id}-$k").apply { onInput = playerInput(lp.players[k]) }
+                        GradedVideoView(ctx, "L${t.id}-$k").apply { onInput = playerInput(lp.players[k]); pictureOutput(lp.players[k], this) }
                     },
                     update = {
                         it.setLook(vm.gradeFor(shownClip), pictureAspect, vm.meta.scaling == "Fill", vm.cmFor(shownClip, native = false), vm.layersFor(shownClip))

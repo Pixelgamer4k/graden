@@ -43,6 +43,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -74,7 +75,13 @@ object Kit {
     val Good = Color(0xFF4CD787)
     val Bad = Color(0xFFE5484D)
     val Ink = Color(0xFF15161C)
-    val Primary = Brush.verticalGradient(listOf(Color(0xFFF7A253), Color(0xFFEC7F22)))
+    val Primary = Brush.verticalGradient(listOf(Color(0xFFF9AE62), Color(0xFFEE8526), Color(0xFFDD6F14)))
+    /** A raised surface: lit from above, a little darker at the foot. */
+    val RaisedFill = Brush.verticalGradient(listOf(Color(0xFF2C2E37), Color(0xFF22242B)))
+    val GroupFill = Brush.verticalGradient(listOf(Color(0xFF1E1F26), Color(0xFF191A20)))
+    /** The light catching a raised edge: brighter at the top. */
+    val Rim = Brush.verticalGradient(listOf(Color(0x2EFFFFFF), Color(0x08FFFFFF)))
+    val PrimaryRim = Brush.verticalGradient(listOf(Color(0x80FFE3C2), Color(0x14FFFFFF)))
 }
 
 /** The small handle at the top of a sheet. */
@@ -102,7 +109,8 @@ fun KHeader(title: String, subtitle: String? = null, onClose: (() -> Unit)? = nu
 @Composable
 fun KIconButton(icon: ImageVector, label: String, onClick: () -> Unit, filled: Boolean = false, size: Dp = 40.dp) {
     Box(
-        Modifier.size(size).clip(CircleShape).background(if (filled) SolidColor(Kit.Accent) else SolidColor(Kit.Raised)).clickable(onClick = onClick),
+        Modifier.size(size).shadow(if (filled) 8.dp else 3.dp, CircleShape, ambientColor = if (filled) Kit.Accent else Color.Black, spotColor = if (filled) Kit.Accent else Color.Black)
+            .clip(CircleShape).background(if (filled) Kit.Primary else Kit.RaisedFill).border(1.dp, if (filled) Kit.PrimaryRim else Kit.Rim, CircleShape).clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) { Icon(icon, label, tint = if (filled) Kit.Ink else Kit.Text, modifier = Modifier.size(size * 0.45f)) }
 }
@@ -119,7 +127,8 @@ fun KSection(title: String, modifier: Modifier = Modifier, trailing: (@Composabl
 /** A rounded group of rows. */
 @Composable
 fun KGroup(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
-    Column(modifier.fillMaxWidth().padding(horizontal = 16.dp).clip(RoundedCornerShape(18.dp)).background(Kit.Group), content = content)
+    val shape = RoundedCornerShape(18.dp)
+    Column(modifier.fillMaxWidth().padding(horizontal = 16.dp).clip(shape).background(Kit.GroupFill).border(1.dp, Kit.Hair, shape), content = content)
 }
 
 /** The thin line between rows of a group, in from the left like a list's. */
@@ -170,7 +179,7 @@ fun KSegmented(options: List<String>, selected: Int, modifier: Modifier = Modifi
     BoxWithConstraints(modifier.height(36.dp).clip(RoundedCornerShape(11.dp)).background(Color(0xFF101115)).padding(3.dp)) {
         val w = maxWidth / options.size.coerceAtLeast(1)
         val x by animateDpAsState(w * selected.coerceAtLeast(0), spring(0.8f, 600f), label = "seg")
-        if (selected >= 0) Box(Modifier.offset(x = x).width(w).fillMaxHeight().clip(RoundedCornerShape(9.dp)).background(Kit.Raised))
+        if (selected >= 0) Box(Modifier.offset(x = x).width(w).fillMaxHeight().shadow(3.dp, RoundedCornerShape(9.dp)).clip(RoundedCornerShape(9.dp)).background(Kit.RaisedFill).border(1.dp, Kit.Rim, RoundedCornerShape(9.dp)))
         Row(Modifier.fillMaxWidth().fillMaxHeight()) {
             for ((i, o) in options.withIndex()) Box(
                 Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(9.dp)).clickable {
@@ -217,9 +226,12 @@ fun KToggle(on: Boolean, onChange: (Boolean) -> Unit) {
 /** The page's main action, across the bottom: [text], with what it will do under it in [sub]. */
 @Composable
 fun KPrimary(text: String, modifier: Modifier = Modifier, sub: String? = null, enabled: Boolean = true, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(16.dp)
     Column(
-        modifier.fillMaxWidth().heightIn(min = 54.dp).clip(RoundedCornerShape(16.dp))
-            .background(if (enabled) Kit.Primary else SolidColor(Kit.Raised)).clickable(enabled = enabled, onClick = onClick)
+        modifier.fillMaxWidth().heightIn(min = 54.dp)
+            .shadow(if (enabled) 14.dp else 0.dp, shape, ambientColor = Kit.Accent, spotColor = Kit.Accent)
+            .clip(shape).background(if (enabled) Kit.Primary else SolidColor(Kit.Raised))
+            .border(1.dp, if (enabled) Kit.PrimaryRim else Kit.Rim, shape).clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 18.dp, vertical = 9.dp),
         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
     ) {
@@ -231,8 +243,11 @@ fun KPrimary(text: String, modifier: Modifier = Modifier, sub: String? = null, e
 /** A second action beside the main one. */
 @Composable
 fun KSecondary(text: String, modifier: Modifier = Modifier, icon: ImageVector? = null, danger: Boolean = false, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(16.dp)
     Row(
-        modifier.height(54.dp).clip(RoundedCornerShape(16.dp)).background(if (danger) Kit.Bad else Kit.Raised).clickable(onClick = onClick).padding(horizontal = 16.dp),
+        modifier.height(54.dp).shadow(6.dp, shape, ambientColor = Color.Black, spotColor = Color.Black).clip(shape)
+            .background(if (danger) SolidColor(Kit.Bad) else Kit.RaisedFill).border(1.dp, Kit.Rim, shape)
+            .clickable(onClick = onClick).padding(horizontal = 16.dp),
         horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically,
     ) {
         icon?.let { Icon(it, null, tint = Kit.Text, modifier = Modifier.size(17.dp)); Spacer(Modifier.width(8.dp)) }
