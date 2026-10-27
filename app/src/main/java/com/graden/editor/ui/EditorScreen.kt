@@ -459,10 +459,7 @@ private fun HostBar(vm: EditorViewModel, soon: (String) -> Unit, onClose: () -> 
         BarIcon(Lucide.Captions, "Auto captions", tint = if (vm.captionRun != null) Palette.Accent else Palette.Text) { vm.pause(); vm.openCaptions(null) }
         BarIcon(Lucide.Info, "Clip details", tint = if (vm.infoOpen) Palette.Accent else Palette.Text) { vm.infoOpen = !vm.infoOpen }
         SaveButton(vm)
-        BarIcon(Lucide.Upload, "Export") {
-            vm.pause()
-            vm.exportOpen = true
-        }
+        ExportMenu(vm)
     }
 }
 
@@ -1211,5 +1208,55 @@ private fun RowScope.NavItem(icon: ImageVector, label: String, active: Boolean =
         Spacer(Modifier.height(3.dp))
         Text(label, color = if (active) Palette.Accent else Palette.TextDim, fontSize = 10.sp)
         Spacer(Modifier.height(5.dp))
+    }
+}
+
+/** The export button: a small menu drops from it, to export the video or the whole project as a .graden file. */
+@Composable
+private fun ExportMenu(vm: EditorViewModel) {
+    var open by remember { mutableStateOf(false) }
+    val saver = rememberBundleSaver(vm)
+    val shown = remember { androidx.compose.animation.core.MutableTransitionState(false) }
+    shown.targetState = open
+    BundleStatus(vm, Modifier)
+    Box {
+        BarIcon(Lucide.Upload, "Export") { vm.pause(); open = !open }
+        if (shown.currentState || shown.targetState) androidx.compose.ui.window.Popup(
+            alignment = Alignment.TopEnd, offset = androidx.compose.ui.unit.IntOffset(0, with(androidx.compose.ui.platform.LocalDensity.current) { 44.dp.roundToPx() }),
+            onDismissRequest = { open = false }, properties = androidx.compose.ui.window.PopupProperties(focusable = true),
+        ) {
+            androidx.compose.animation.AnimatedVisibility(
+                shown,
+                enter = androidx.compose.animation.expandVertically(expandFrom = Alignment.Top) + androidx.compose.animation.fadeIn() +
+                    androidx.compose.animation.scaleIn(initialScale = 0.92f, transformOrigin = androidx.compose.ui.graphics.TransformOrigin(1f, 0f)),
+                exit = androidx.compose.animation.shrinkVertically(shrinkTowards = Alignment.Top) + androidx.compose.animation.fadeOut(),
+            ) {
+                val shape = RoundedCornerShape(18.dp)
+                Column(
+                    Modifier.padding(end = 8.dp).width(230.dp).shadow(18.dp, shape, ambientColor = Color.Black, spotColor = Color.Black).clip(shape)
+                        .background(Kit.RaisedFill).border(1.dp, Kit.Rim, shape).padding(6.dp),
+                ) {
+                    ExportChoice(Lucide.Film, "Export media", "The finished video") { open = false; vm.exportOpen = true }
+                    ExportChoice(Lucide.Folder, "Export project", "A .graden file with all its media") { open = false; saver(null, vm.meta.name) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExportChoice(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, note: String, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(13.dp)).clickable(onClick = onClick).padding(horizontal = 10.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.size(36.dp).clip(RoundedCornerShape(10.dp)).background(Kit.AccentSoft), contentAlignment = Alignment.Center) {
+            Icon(icon, null, tint = Kit.Accent, modifier = Modifier.size(18.dp))
+        }
+        Spacer(Modifier.width(12.dp))
+        Column {
+            Text(title, color = Kit.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            Text(note, color = Kit.Dim, fontSize = 12.sp)
+        }
     }
 }

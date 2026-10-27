@@ -573,6 +573,37 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** 0..1 while a project is being exported or imported as a .graden file; null otherwise. */
+    var bundleProgress by mutableStateOf<Float?>(null)
+    var bundleMessage by mutableStateOf<String?>(null)
+
+    /** Writes project [id] (the open one when null) to [uri] as a .graden file. */
+    fun exportProjectBundle(id: String?, uri: android.net.Uri) {
+        val pid = id ?: projectId ?: return
+        if (id == null) flush()
+        viewModelScope.launch {
+            bundleProgress = 0f
+            val ok = withContext(Dispatchers.IO) {
+                runCatching {
+                    getApplication<Application>().contentResolver.openOutputStream(uri, "w")!!.use { o -> projects.exportBundle(pid, o) { p -> bundleProgress = p } }
+                }.isSuccess
+            }
+            bundleProgress = null
+            bundleMessage = if (ok) "Project exported" else "Couldn't export the project"
+        }
+    }
+
+    /** Opens a .graden file as a new project. */
+    fun importProjectBundle(uri: android.net.Uri) {
+        viewModelScope.launch {
+            bundleProgress = 0f
+            val id = withContext(Dispatchers.IO) { runCatching { getApplication<Application>().contentResolver.openInputStream(uri)!!.use { projects.importBundle(it) } }.getOrNull() }
+            bundleProgress = null
+            bundleMessage = if (id != null) "Project imported" else "That file isn't a Graden project"
+            refreshProjects()
+        }
+    }
+
     /** Copies a project, as "<name> copy", next to it. */
     fun duplicateProject(id: String) {
         val src = projectList.firstOrNull { it.id == id } ?: return

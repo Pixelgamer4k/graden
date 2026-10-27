@@ -132,6 +132,102 @@ class Projects(private val context: Context) {
         File(root, id).deleteRecursively()
     }
 
+    private fun prefixOf(a: MediaAsset) = "${a.uri.hashCode().toUInt()}_${a.durationUs}"
+
+    /**
+     * Writes project [id] as a .graden file: a zip, stored without compression, holding the project folder, every
+     * original media file it uses, and the caches made from them (proxies, waveforms, stabilisation, reversed copies),
+     * so it opens on another phone ready to edit. [progress] gets 0..1.
+     */
+    fun exportBundle(id: String, out: java.io.OutputStream, progress: (Float) -> Unit = {}) {
+        val dir = File(root, id)
+        val loaded = store(id).load() ?: error("Project can't be read")
+        val zip = java.util.zip.ZipOutputStream(out.buffered(1 shl 16))
+        val buf = ByteArray(1 shl 16)
+        fun put(name: String, size: Long, crcOf: () -> java.io.InputStream, open: () -> java.io.InputStream) {
+            // Stored entries need their size and CRC up front.
+            val crc = java.util.zip.CRC32()
+            crcOf().use { i -> while (true) { val n = i.read(buf); if (n < 0) break; crc.update(buf, 0, n) } }
+            val e = java.util.zip.ZipEntry(name).apply { method = java.util.zip.ZipEntry.STORED; this.size = size; compressedSize = size; this.crc = crc.value }
+            zip.putNextEntry(e)
+            open().use { it.copyTo(zip, 1 shl 16) }
+            zip.closeEntry()
+        }
+        fun putFile(name: String, f: File) = put(name, f.length(), { f.inputStream() }, { f.inputStream() })
+        dir.walkTopDown().filter { it.isFile }.forEach { putFile("project/" + it.relativeTo(dir).path, it) }
+        val manifest = org.json.JSONArray()
+        val assets = loaded.assets.values.toList()
+        assets.forEachIndexed { i, a ->
+            val ext = a.name.substringAfterLast('.', "").takeIf { it.length in 1..5 } ?: "bin"
+            val name = "media/${a.id}.$ext"
+            val uri = android.net.Uri.parse(a.uri)
+            val ok = runCatching {
+                val size = context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }?.takeIf { it >= 0 }
+                    ?: context.contentResolver.openInputStream(uri)!!.use { s -> var t = 0L; while (true) { val n = s.read(buf); if (n < 0) break; t += n }; t }
+                put(name, size, { context.contentResolver.openInputStream(uri)!! }, { context.contentResolver.openInputStream(uri)!! })
+            }.isSuccess
+            manifest.put(org.json.JSONObject().put("id", a.id).put("uri", a.uri).put("prefix", prefixOf(a)).put("media", if (ok) name else null))
+            progress(0.9f * (i + 1) / assets.size.coerceAtLeast(1))
+        }
+        // Everything made from these files, from every cache folder.
+        val prefixes = assets.map { prefixOf(it) }
+        context.filesDir.listFiles()?.filter { it.isDirectory && it.name != "projects" }?.forEach { cd ->
+            cd.listFiles()?.filter { f -> f.isFile && prefixes.any { f.name.startsWith(it) } }?.forEach { putFile("cache/${cd.name}/${it.name}", it) }
+        }
+        val m = org.json.JSONObject().put("graden", 1).put("name", loaded.meta.name).put("assets", manifest).toString().toByteArray()
+        put("manifest.json", m.size.toLong(), { m.inputStream() }, { m.inputStream() })
+        zip.finish(); zip.flush()
+        progress(1f)
+    }
+
+    /** Opens a .graden file as a new project (its media kept inside Graden) and returns its id. */
+    fun importBundle(input: java.io.InputStream): String {
+        val nid = UUID.randomUUID().toString().take(8)
+        val pdir = File(root, nid).apply { mkdirs() }
+        val media = File(context.filesDir, "imported/$nid").apply { mkdirs() }
+        val stage = File(context.cacheDir, "import_$nid").apply { mkdirs() }
+        var manifest: org.json.JSONObject? = null
+        java.util.zip.ZipInputStream(input.buffered(1 shl 16)).use { z ->
+            while (true) {
+                val e = z.nextEntry ?: break
+                val n = e.name
+                if (e.isDirectory || n.contains("..")) continue
+                when {
+                    n == "manifest.json" -> manifest = org.json.JSONObject(z.readBytes().decodeToString())
+                    n.startsWith("project/") -> File(pdir, n.removePrefix("project/")).apply { parentFile?.mkdirs() }.outputStream().use { z.copyTo(it) }
+                    n.startsWith("media/") -> File(media, n.removePrefix("media/")).outputStream().use { z.copyTo(it) }
+                    n.startsWith("cache/") -> File(stage, n.removePrefix("cache/")).apply { parentFile?.mkdirs() }.outputStream().use { z.copyTo(it) }
+                }
+            }
+        }
+        val st = store(nid)
+        val l = st.load() ?: run { pdir.deleteRecursively(); media.deleteRecursively(); stage.deleteRecursively(); error("Not a Graden project") }
+        val byId = HashMap<Int, org.json.JSONObject>()
+        manifest?.optJSONArray("assets")?.let { arr -> for (i in 0 until arr.length()) arr.getJSONObject(i).let { byId[it.getInt("id")] = it } }
+        val renames = HashMap<String, String>()
+        val assets = l.assets.mapValues { (aid, a) ->
+            val m = byId[aid]?.optString("media")?.takeIf { it.isNotEmpty() && it != "null" } ?: return@mapValues a
+            val f = File(media, m.removePrefix("media/"))
+            if (!f.exists()) return@mapValues a
+            val na = a.copy(uri = android.net.Uri.fromFile(f).toString())
+            renames[prefixOf(a)] = prefixOf(na)
+            na
+        }
+        // Caches back in place, renamed for the media's new home.
+        stage.listFiles()?.forEach { cd ->
+            val to = File(context.filesDir, cd.name).apply { mkdirs() }
+            cd.listFiles()?.forEach { f ->
+                val old = renames.keys.firstOrNull { f.name.startsWith(it) }
+                f.copyTo(File(to, if (old != null) renames[old] + f.name.removePrefix(old) else f.name), overwrite = true)
+            }
+        }
+        stage.deleteRecursively()
+        val meta = l.meta.copy(created = System.currentTimeMillis())
+        st.save(assets.values, l.tracks, l.ui, meta)
+        st.writeSummary(meta, l.tracks, assets)
+        return nid
+    }
+
     /** Gives project [id] a new name, keeping everything else. */
     fun rename(id: String, name: String) {
         val st = store(id)

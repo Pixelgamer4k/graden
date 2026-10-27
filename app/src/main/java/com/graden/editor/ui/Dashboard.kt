@@ -137,7 +137,13 @@ fun Dashboard(vm: EditorViewModel) {
                         }
                     }
                     Spacer(Modifier.height(20.dp))
-                    NewProjectCard { creating = true }
+                    val importer = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.OpenDocument()) { u ->
+                        u?.let { vm.importProjectBundle(it) }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Box(Modifier.weight(1f)) { NewProjectCard { creating = true } }
+                        ImportProjectCard { importer.launch(arrayOf("*/*")) }
+                    }
                     Spacer(Modifier.height(24.dp))
                     if (vm.projectList.isNotEmpty()) Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("Recent", color = Palette.Text, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
@@ -160,7 +166,56 @@ fun Dashboard(vm: EditorViewModel) {
             vm.createProject(it)
         }, modifier = Modifier.align(Alignment.BottomCenter))
         ProjectActions(vm, acting, Modifier.align(Alignment.BottomCenter)) { acting = null }
+        BundleStatus(vm, Modifier.align(Alignment.BottomCenter))
     }
+}
+
+/** Beside "New project": open a .graden file someone exported. */
+@Composable
+private fun ImportProjectCard(onClick: () -> Unit) {
+    val shape = RoundedCornerShape(22.dp)
+    Column(
+        Modifier.width(104.dp).height(118.dp).shadow(10.dp, shape, ambientColor = Color.Black, spotColor = Color.Black).clip(shape)
+            .background(Kit.RaisedFill).border(1.dp, Kit.Rim, shape).clickable(onClick = onClick).padding(10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
+    ) {
+        Box(Modifier.size(42.dp).clip(CircleShape).background(Kit.AccentSoft).border(1.dp, Kit.Accent.copy(alpha = 0.5f), CircleShape), contentAlignment = Alignment.Center) {
+            Icon(Lucide.Download, null, tint = Kit.Accent, modifier = Modifier.size(20.dp))
+        }
+        Text("Import", color = Kit.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 8.dp))
+        Text("project", color = Kit.Dim, fontSize = 12.sp)
+    }
+}
+
+/** Asks where to save project [id] as a .graden file, then writes it there. */
+@Composable
+fun rememberBundleSaver(vm: EditorViewModel): (String?, String) -> Unit {
+    var pending by remember { mutableStateOf<String?>(null) }
+    val launcher = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.CreateDocument("application/octet-stream")) { u ->
+        if (u != null) vm.exportProjectBundle(pending, u)
+    }
+    return { id, name -> pending = id; launcher.launch(name.replace(Regex("[^A-Za-z0-9 _.-]"), "_") + ".graden") }
+}
+
+/** A small card while a .graden file is written or read, and a word when it is done. */
+@Composable
+fun BundleStatus(vm: EditorViewModel, modifier: Modifier) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    androidx.compose.runtime.LaunchedEffect(vm.bundleMessage) {
+        vm.bundleMessage?.let { android.widget.Toast.makeText(context, it, android.widget.Toast.LENGTH_SHORT).show(); vm.bundleMessage = null }
+    }
+    val p = vm.bundleProgress ?: return
+    val shape = RoundedCornerShape(18.dp)
+    androidx.compose.ui.window.Popup(alignment = Alignment.BottomCenter) { Row(
+        Modifier.navigationBarsPadding().padding(16.dp).fillMaxWidth().shadow(14.dp, shape).clip(shape).background(Kit.RaisedFill).border(1.dp, Kit.Rim, shape)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        androidx.compose.material3.CircularProgressIndicator(progress = { p.coerceIn(0.02f, 1f) }, modifier = Modifier.size(22.dp), color = Kit.Accent, strokeWidth = 2.5.dp)
+        Spacer(Modifier.width(12.dp))
+        Text("Packing the project with its media…", color = Kit.Text, fontSize = 14.sp, modifier = Modifier.weight(1f))
+        Text("${(p * 100).toInt()}%", color = Kit.Dim, fontSize = 13.sp, fontFamily = FontFamily.Monospace)
+    } }
 }
 
 /** The way in: wide and warm, with the shapes a project can take drawn into it. */
@@ -289,6 +344,9 @@ private fun ProjectActions(vm: EditorViewModel, p: ProjectSummary?, modifier: Mo
                     KRow("Rename", icon = Lucide.Pencil, onClick = { renaming = true })
                     KDivider(58.dp)
                     KRow("Duplicate", "A full copy: edit, grades and all", icon = Lucide.Copy, onClick = { vm.duplicateProject(pr.id); onClose() })
+                    KDivider(58.dp)
+                    val saver = rememberBundleSaver(vm)
+                    KRow("Export project", "One .graden file with its media, to move or back up", icon = Lucide.Upload, onClick = { saver(pr.id, pr.meta.name); onClose() })
                 }
                 Spacer(Modifier.height(10.dp))
                 KGroup {
