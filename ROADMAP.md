@@ -45,6 +45,11 @@
 - Waveform, parade, vectorscope, histogram and CIE scopes
 - HDR projects with HDR10 and HLG export
 
+### Cinema DOF
+- Real lens blur after shooting, on the NPU on supported Snapdragon phones and the CPU elsewhere
+- Automatic focus on people, animals and objects; tap or drag on the picture to change it
+- Focus changes on the timeline, lens looks, and a live depth and focus view
+
 ### Stabilisation
 - A visual gyro that measures camera motion from the picture itself, no gyro data needed
 - Rolling-shutter aware, with a 3D view of how the camera really moved
@@ -69,7 +74,6 @@
 
 | Feature | What it means for you |
 |---|---|
-| **Cinema DOF** | Real lens blur after shooting, on the NPU on supported Snapdragon phones: automatic focus, tap or drag to change it, focus changes on the timeline, and lens looks |
 | **Smooth slow motion** | Slow down any clip without stutter, using optical flow and AI that run on your phone |
 | **Shadows, Highlights and Mid/Detail** | The last colour controls matched to Resolve |
 | **Exporting captions as files** | SRT and VTT subtitles, with burned-in captions optional |
