@@ -114,6 +114,10 @@ hardware encoder. The results and the fixes they led to are in [docs/TESTING.md]
 
 Needs **Android 10 or newer**. A recent phone with a capable chip gives the best experience with 4K footage.
 
+## Roadmap
+
+See what's available now and what's coming, from beat sync and motion tracking to smooth slow motion: **[the Graden roadmap](ROADMAP.md)**.
+
 ## Feedback
 
 This beta exists to collect feedback, so every report helps:
