@@ -19,6 +19,12 @@ target_compile_options(mcraw PRIVATE -O3 -fexceptions -frtti -D_FILE_OFFSET_BITS
 target_link_libraries(mcraw log)
 target_link_options(mcraw PRIVATE -Wl,--gc-sections -Wl,-z,max-page-size=16384 -s)
 
+# Opens the NPU runtime Cinema DOF downloads (see depth_npu.cpp); nothing of it is linked here.
+add_library(depthnpu SHARED depth_npu.cpp)
+target_link_libraries(depthnpu log dl jnigraphics)
+target_compile_options(depthnpu PRIVATE -O3)
+target_link_options(depthnpu PRIVATE -Wl,--gc-sections -Wl,-z,max-page-size=16384 -s)
+
 # The built-in software encoders are optional (-Psoftenc=true after scripts/build-codecs.sh). x264 and x265 are built
 # for arm64 from source (see third_party/*-COPYING.txt: both are GPL).
 if(GRADEN_SOFTENC AND ANDROID_ABI STREQUAL "arm64-v8a")

@@ -98,6 +98,8 @@ data class Clip(
     val stab: Stab? = null,
     /** A caption ([assetId] is then [CAPTION_ASSET]): its text, on a caption layer. */
     val caption: Caption? = null,
+    /** A cinema lens and its focus points, made on the Cinema page; null: none. */
+    val cinema: Cinema? = null,
 ) {
     val isCaption: Boolean get() = caption != null
     /** How long the clip lasts on the timeline. */

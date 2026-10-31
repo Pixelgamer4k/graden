@@ -1179,6 +1179,15 @@ private fun DrawScope.drawJunction(g: Geo, paints: Paints, box: Rect, tr: Fx?) {
 /** A thin light bar along the bottom of a clip for as long as its opening or closing animation runs. */
 private fun DrawScope.drawAnimMarks(g: Geo, c: Clip, x0: Float, x1: Float, top: Float, h: Float, usPerPx: Double) {
     val y = top + h - 5 * g.dp
+    // Cinema's focus points, as small diamonds where each starts.
+    c.cinema?.takeIf { it.on }?.keys?.forEach { k ->
+        val kx = x0 + (((k.us - c.inUs) / c.speed) / usPerPx).toFloat()
+        if (kx in x0..x1) {
+            val r = 3.5f * g.dp; val ky = top + 6 * g.dp
+            val p = Path().apply { moveTo(kx, ky - r); lineTo(kx + r, ky); lineTo(kx, ky + r); lineTo(kx - r, ky); close() }
+            drawPath(p, Color(0xFFF2C14E))
+        }
+    }
     c.animIn?.let { drawRoundRect(Color.White.copy(alpha = 0.65f), Offset(x0 + 2 * g.dp, y), Size(max(6 * g.dp, (it.durationUs / usPerPx).toFloat()), 3 * g.dp), CornerRadius(1.5f * g.dp)) }
     c.animOut?.let {
         val w = max(6 * g.dp, (it.durationUs / usPerPx).toFloat())

@@ -20,6 +20,7 @@ object ExportBuild {
     fun build(
         meta: ProjectMeta, tracks: List<Track>, assets: Map<Int, MediaAsset>, sources: Map<Int, String>, muted: Set<Int>, hidden: Set<Int>,
         norm: Map<Long, Float>, output: String, raw: (MediaAsset, RawLayer) -> FloatArray?, stab: (Clip, MediaAsset, Stab) -> StabTrack?,
+        cinemaRun: (Clip, MediaAsset, com.graden.editor.Cinema) -> com.graden.editor.CinemaRun? = { _, _, _ -> null },
     ): ExportProject {
         val dest = ColorSpaces.output(output)
         val nits = meta.masterNits.toFloat()
@@ -43,8 +44,14 @@ object ExportBuild {
             stab(c, a, st)?.let { stabs[c.id] = it; stabFrames += ((c.outUs - c.inUs) * meta.fps / 1_000_000.0).toLong() }
         }
         val stabPrepMs = android.os.SystemClock.elapsedRealtime() - t0
+        val cinema = HashMap<Long, com.graden.editor.CinemaRun>()
+        for (t in tracks) for (c in t.clips) {
+            val ci = c.cinema?.takeIf { it.on } ?: continue
+            val a = assets[c.assetId]?.takeIf { !it.isImage } ?: continue
+            cinemaRun(c, a, ci)?.let { cinema[c.id] = it }
+        }
         return ExportProject(
-            meta, tracks, assets, sources, muted, hidden, norm,
+            meta, tracks, assets, sources, muted, hidden, norm, cinema,
             pipes, ColorPipe.plain(meta, dest, nits), deep, dest.code, nits, layerPacks,
             preview = if (dest === ColorSpaces.REC709) null else ColorPipe.plain(meta, ColorSpaces.REC709, 100f).also {
                 // Shows the delivery as Rec.709: the second step goes from the output space.

@@ -52,6 +52,8 @@ class ExportProject(
     val hidden: Set<Int>,
     /** Per clip: the gain that normalising its loudest moment gives, where normalising is on. */
     val normGain: Map<Long, Float>,
+    /** Per clip: Cinema, measured and resolved. */
+    val cinema: Map<Long, com.graden.editor.CinemaRun> = emptyMap(),
     /** Per clip: its colour path into the delivery space (see [com.graden.editor.ColorPipe]). */
     val pipes: Map<Long, FloatArray> = emptyMap(),
     /** Rec.709 into the delivery space, for solid colours. */
@@ -891,7 +893,10 @@ class Compositor(private val context: Context, private val project: ExportProjec
         val shownW = abs(bw * sx)
         val shownH = abs(bh * sy)
 
-        val src = sourceTexture(p, us, shownW, shownH) ?: return
+        val raw = sourceTexture(p, us, shownW, shownH) ?: return
+        // Cinema: the lens goes on the frame first, at full resolution.
+        val cine = project.cinema[p.clip.id]?.takeIf { !a.isImage }
+        val src = if (cine == null) raw else copies[p.clip.id]?.let { c -> cinemaGl.render(raw, c[2], c[3], true, cine, srcAt(p, us), true, 0) } ?: raw
 
         // Local (canvas) point q to canvas: c + t + R·S·(q - c).
         val cx = cw / 2f
@@ -991,6 +996,8 @@ class Compositor(private val context: Context, private val project: ExportProjec
         }
     }
 
+    private val cinemaGl by lazy { com.graden.editor.CinemaGl(context) }
+
     /** Per clip: its glow copy, history and deflicker state. */
     private val extras = HashMap<Long, com.graden.editor.FrameExtras>()
 
@@ -1088,6 +1095,8 @@ class Compositor(private val context: Context, private val project: ExportProjec
     }
 
     fun release() {
+        runCatching { cinemaGl.release() }
+        project.cinema.values.forEach { it.close() }
         textTex.values.forEach { it.bmp?.recycle() }
         textTex.clear()
         extras.values.forEach { it.release() }

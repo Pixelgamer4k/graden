@@ -221,6 +221,7 @@ private class GlCore(name: String) {
         if (tex != 0) GLES20.glDeleteTextures(1, intArrayOf(tex), 0)
         looks.release()
         extras.release()
+        cinemaGl?.release()
         if (fbo != 0) {
             GLES20.glDeleteFramebuffers(1, intArrayOf(fbo), 0)
             GLES20.glDeleteTextures(1, intArrayOf(fboTex), 0)
@@ -239,6 +240,7 @@ private class GlCore(name: String) {
 
     private var fbW = 1
     private var fbH = 1
+    private var cinemaGl: CinemaGl? = null
     /** The stabilisation for the picture being drawn (null: none), and how its edges are filled. */
     private var stabTrack: StabTrack? = null
     private var stabIndex = -1
@@ -357,6 +359,23 @@ private class GlCore(name: String) {
         if (keepFrames > 0 && (ns < histNs || ns - histNs > 120_000_000L)) extras.resetHistory()
         if (keepFrames == 0) extras.resetHistory()
         glowReady = false
+        // Cinema: the lens goes on the frame first, and the grade reads its result like any other frame.
+        var lensed = 0
+        val cine = v.cinema?.takeIf { still != 0 || hasFrame }
+        if (cine != null) {
+            val rect = v.placement(w, h)
+            val cw = ((rect[2] - rect[0]) / 2f * w).toInt().coerceAtLeast(8)
+            val ch = ((rect[3] - rect[1]) / 2f * h).toInt().coerceAtLeast(8)
+            val us = v.stabClock?.invoke(ns) ?: v.dofUs
+            v.dofUs = us
+            CinemaGl.redraw = { v.redraw() }
+            CinemaGl.settle = { v.removeCallbacks(v.dofSettle); v.postDelayed(v.dofSettle, 200L) }
+            val frame = if (still != 0) still else frameCopy(tex, texM, cw, ch)
+            val r = runCatching { (cinemaGl ?: CinemaGl(v.context.applicationContext).also { cinemaGl = it }).render(frame, cw, ch, still != 0, cine, us, false, CinemaGl.view) }
+                .onFailure { android.util.Log.w("Cinema", "frame not drawn", it) }.getOrDefault(frame)
+            if (r != frame || still == 0) lensed = r
+        }
+        val dofM = if (still != 0) FLIP_Y else IDENTITY_M
         if (needGlow) {
             val rect = v.placement(w, h)
             val gl = layers!!.copyOf()
@@ -366,7 +385,8 @@ private class GlCore(name: String) {
             extras.glowBegin(w, h)
             val pw = (rect[2] - rect[0]) / 2f * w
             val ph = (rect[3] - rect[1]) / 2f * h
-            if (still != 0) drawQuad(still, FLIP_Y, rect, grade, 1f / pw.coerceAtLeast(1f), 1f / ph.coerceAtLeast(1f), still = true, cm = v.cmUniforms, look = look, layers = gl)
+            if (lensed != 0) drawQuad(lensed, dofM, rect, grade, 1f / pw.coerceAtLeast(1f), 1f / ph.coerceAtLeast(1f), still = true, cm = v.cmUniforms, look = look, layers = gl)
+            else if (still != 0) drawQuad(still, FLIP_Y, rect, grade, 1f / pw.coerceAtLeast(1f), 1f / ph.coerceAtLeast(1f), still = true, cm = v.cmUniforms, look = look, layers = gl)
             else drawQuad(tex, texM, rect, grade, 1f / pw.coerceAtLeast(1f), 1f / ph.coerceAtLeast(1f), cm = v.cmUniforms, look = look, layers = gl)
             extras.glowEnd()
             layers = layers.copyOf()
@@ -379,7 +399,12 @@ private class GlCore(name: String) {
         }
         drawnLayers = layers
         fbW = w; fbH = h
-        if (still != 0) {
+        if (lensed != 0) {
+            val rect = v.placement(w, h)
+            val pw = (rect[2] - rect[0]) / 2f * w
+            val ph = (rect[3] - rect[1]) / 2f * h
+            drawQuad(lensed, dofM, rect, grade, 1f / pw.coerceAtLeast(1f), 1f / ph.coerceAtLeast(1f), still = true, cm = v.cmUniforms, look = v.look, layers = layers)
+        } else if (still != 0) {
             // A native frame at rest: the image texture, upright (bitmap rows run top to bottom).
             val rect = v.placement(w, h)
             val pw = (rect[2] - rect[0]) / 2f * w
@@ -530,6 +555,12 @@ class GradedVideoView(context: Context, val key: String) : TextureView(context),
     /** Stabilisation of the clip shown, and the file time (us) of the frame drawn, from its stamp (null: unknown). */
     @Volatile var stab: StabTrack? = null
     @Volatile var stabClock: ((Long) -> Long?)? = null
+    /** The file time of the last frame the lens was drawn on. */
+    @Volatile internal var dofUs = 0L
+    /** Cinema on the clip shown, measured and resolved (null: none). Redraws when it changes. */
+    @Volatile internal var cinema: CinemaRun? = null
+        set(v) { if (field !== v) { field = v; redraw() } }
+    internal val dofSettle = Runnable { redraw() }
 
     /** Sets the stabilisation; redraws when it changed. */
     fun setStab(track: StabTrack?, clock: ((Long) -> Long?)?) {

@@ -23,8 +23,8 @@ android {
         applicationId = "com.graden.editor"
         minSdk = 29
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.3.4-beta"
+        versionCode = 6
+        versionName = "0.4.0-beta"
         // MotionCam RAW decoding is native, on every phone; the software encoders only on 64-bit ARM.
         ndk { abiFilters += if (softenc) listOf("arm64-v8a") else listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
         externalNativeBuild {
@@ -84,6 +84,7 @@ dependencies {
     implementation("androidx.media3:media3-ui:1.8.0")
     implementation("androidx.media3:media3-transformer:1.8.0")
     implementation("androidx.media3:media3-effect:1.8.0")
+    implementation("com.google.ai.edge.litert:litert:1.4.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20231013")
 }

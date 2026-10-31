@@ -247,12 +247,14 @@ fun EditorScreen(vm: EditorViewModel) {
             when {
                 vm.colorOpen -> ColorTopBar(vm)
                 vm.stabOpen -> StabTopBar(vm)
+                vm.cinemaOpen -> CinemaTopBar(vm)
                 else -> HostBar(vm, soon, onClose = { vm.closeProject() }, onSettings = { settingsOpen = true })
             }
             Preview(vm)
             when {
                 vm.colorOpen -> ColorBody(vm, Modifier.weight(1f))
                 vm.stabOpen -> StabBody(vm, Modifier.weight(1f))
+                vm.cinemaOpen -> CinemaBody(vm, Modifier.weight(1f))
                 else -> EditBody(vm, soon) { timelineBounds = it }
             }
         }
@@ -519,7 +521,7 @@ private fun Preview(vm: EditorViewModel) {
     // A square area, the canvas centred in it at its own shape: wide canvases with bars above and below, tall ones (reels)
     // with bars at the sides, so a tall canvas gets the whole height. While grading the scopes and wheels need the room,
     // so the area is wide there.
-    val areaAspect = if (vm.colorOpen || vm.stabOpen) maxOf(canvasAspect, 1.78f) else 1f
+    val areaAspect = if (vm.colorOpen || vm.stabOpen || vm.cinemaOpen) maxOf(canvasAspect, 1.78f) else 1f
     Box(Modifier.fillMaxWidth().aspectRatio(areaAspect).background(Color(0xFF060709))) {
     Box(
         Modifier.align(Alignment.Center).padding(if (canvasAspect >= areaAspect - 0.01f) 0.dp else 4.dp)
@@ -555,6 +557,7 @@ private fun Preview(vm: EditorViewModel) {
             update = {
                 it.setLook(vm.gradeFor(top), topAspect, vm.meta.scaling == "Fill", vm.cmFor(top, native = true), vm.layersFor(top))
                 it.setStab(vm.stabFor(top)) { _ -> vm.stabStillUs(top) }
+                it.cinema = vm.cinemaFor(top)
             },
         )
         // Proxy scrub frame, drawn over the players only while scrubbing or trimming.
@@ -584,6 +587,7 @@ private fun Preview(vm: EditorViewModel) {
                 it.setLook(vm.gradeFor(top), 0f, false, vm.cmFor(top, native = false, scrub = true), vm.layersFor(top))
                 // The scrub decoder stamps each frame with its own time.
                 it.setStab(vm.stabFor(top)) { ns -> ns / 1000L }
+                it.cinema = vm.cinemaFor(top)
             },
         )
         // Texts over the top picture, drawn as the export draws them (same size against the frame).
@@ -592,7 +596,7 @@ private fun Preview(vm: EditorViewModel) {
         val scopeKey by remember { derivedStateOf { vm.scopeKey() } }
         SideEffect { GradeGl.scopeTag = scopeKey }
         // Touching the canvas: select, move, resize, turn and crop pictures. Not while grading.
-        if (!vm.colorOpen && !vm.stabOpen) CanvasOverlay(vm)
+        if (!vm.colorOpen && !vm.stabOpen && !vm.cinemaOpen) CanvasOverlay(vm)
     }
         // Details of the picture on screen: opened from the "i" in the top bar; nothing sits on the canvas otherwise.
         val infoOpen = vm.infoOpen
@@ -634,6 +638,7 @@ private fun Preview(vm: EditorViewModel) {
         }
         if (vm.colorOpen && vm.wipe >= 0f) WipeLine(vm)
         if (vm.colorOpen && vm.secondaryOverlay) SecondaryOverlay(vm)
+        if (vm.cinemaOpen) { CinemaOverlay(vm); CinemaPeek(vm) }
     }
 }
 
@@ -841,6 +846,7 @@ private fun LaneLayers(vm: EditorViewModel, t: com.graden.editor.Track) {
                         // Playing: the exact frame on screen, from the player's record of what it released with that stamp.
                         val clipNow = shownClip
                         it.setStab(vm.stabFor(clipNow)) { ns -> lp.frameForStamp(k, ns) ?: vm.stabStillUs(clipNow) }
+                        it.cinema = vm.cinemaFor(clipNow)
                     },
                 )
             }
@@ -872,6 +878,7 @@ private fun LaneLayers(vm: EditorViewModel, t: com.graden.editor.Track) {
                 update = {
                     it.setLook(vm.gradeFor(here), restAspect, vm.meta.scaling == "Fill", vm.cmFor(here, native = true), vm.layersFor(here))
                     it.setStab(vm.stabFor(here)) { _ -> vm.stabStillUs(here) }
+                    it.cinema = vm.cinemaFor(here)
                 },
             )
         }
@@ -1144,6 +1151,7 @@ private fun Tools(vm: EditorViewModel, soon: (String) -> Unit) {
                 Tool(Lucide.Sparkles, "Effects", tinted = true) { soon("Effects") }
                 Tool(Lucide.Crop, "Crop") { vm.openCrop() }
                 if (video) Tool(Lucide.Stabilize, "Stabilize", tinted = true) { vm.openStab() }
+                if (video) Tool(Lucide.Aperture, "Cinema DOF", tinted = true, width = 70.dp) { vm.openCinema() }
                 Tool(Lucide.AnimIn, "In") { vm.selectedClipId?.let { vm.openFx(it, EditorViewModel.FxSlot.IN) } }
                 Tool(Lucide.AnimOut, "Out") { vm.selectedClipId?.let { vm.openFx(it, EditorViewModel.FxSlot.OUT) } }
             }
@@ -1163,16 +1171,16 @@ private fun Tools(vm: EditorViewModel, soon: (String) -> Unit) {
 }
 
 @Composable
-private fun Tool(icon: ImageVector, label: String, enabled: Boolean = true, tinted: Boolean = false, color: Color = Soft, onClick: () -> Unit) {
+private fun Tool(icon: ImageVector, label: String, enabled: Boolean = true, tinted: Boolean = false, color: Color = Soft, width: androidx.compose.ui.unit.Dp = 54.dp, onClick: () -> Unit) {
     val ink = if (tinted) Palette.Accent else color
     Column(
-        Modifier.width(54.dp).clip(RoundedCornerShape(10.dp)).background(if (tinted) Color(0xFF2A1F15) else Color.Transparent)
+        Modifier.width(width).clip(RoundedCornerShape(10.dp)).background(if (tinted) Color(0xFF2A1F15) else Color.Transparent)
             .clickable(enabled = enabled, onClick = onClick).alpha(if (enabled) 1f else 0.35f).padding(vertical = 5.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Icon(icon, null, tint = ink, modifier = Modifier.size(19.dp))
         Spacer(Modifier.height(3.dp))
-        Text(label, color = ink, fontSize = 10.sp, maxLines = 1)
+        Text(label, color = ink, fontSize = 10.sp, maxLines = 1, softWrap = false)
     }
 }
 

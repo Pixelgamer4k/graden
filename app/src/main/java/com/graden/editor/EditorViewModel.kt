@@ -22,6 +22,8 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
+import com.graden.editor.cinema.FocusEdits
+import androidx.compose.runtime.mutableStateMapOf
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.Executors
@@ -134,7 +136,8 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         val app = getApplication<Application>()
         return com.graden.editor.export.ExportBuild.build(meta, tracks, assets, assets.mapValues { originalOf(it.value) }, mutedTracks, hiddenTracks, norm, output,
             raw = { a, layer -> rawBlock(a, layer) },
-            stab = { c, a, st -> stabTracks[c.id]?.takeIf { it.sig == stabSig(c) }?.track ?: Stabilizer.track(app, a, c.inUs, c.outUs, st) })
+            stab = { c, a, st -> stabTracks[c.id]?.takeIf { it.sig == stabSig(c) }?.track ?: Stabilizer.track(app, a, c.inUs, c.outUs, st) },
+            cinemaRun = { _, a, ci -> CinemaRun.build(app, a.uri, ci) })
     }
 
     /** The clip details panel, opened from the top bar. */
@@ -2943,6 +2946,234 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The clip on the Stabilize page. */
     val stabTarget: Located? get() = stabClipId?.let(::locate)
+
+    // ---- cinema ----------------------------------------------------------------------
+
+    var cinemaClipId by mutableStateOf<Long?>(null)
+        private set
+    val cinemaOpen: Boolean get() = cinemaClipId != null
+    val cinemaTarget: Located? get() = cinemaClipId?.let(::locate)
+    /** Setup or analysis running: 0..1 (null: idle), what it is, and what went wrong last. */
+    var cinemaProgress by mutableStateOf<Float?>(null)
+        private set
+    var cinemaBusy by mutableStateOf("")
+        private set
+    var cinemaError by mutableStateOf<String?>(null)
+    var cinemaInstalled by mutableStateOf(false)
+        private set
+    /** The analysis size: the long edge the picture is measured at. Bigger is finer and slower. */
+    var cinemaEdge by mutableStateOf(1280)
+    var cinemaView by mutableStateOf(0)
+    /** What the AI runs on here: the NPU when this phone supports it, else the CPU; corrected by what really ran. */
+    var cinemaEngine by mutableStateOf(if (CinemaModels.hexagon != null) "NPU" else "CPU")
+        private set
+    /** Where a tap landed, until focus has been worked out for it. */
+    var cinemaPending by mutableStateOf<androidx.compose.ui.geometry.Offset?>(null)
+        private set
+    private val cinemaRuns = mutableStateMapOf<Long, CinemaRun>()
+    private var cinemaStop: java.util.concurrent.atomic.AtomicBoolean? = null
+    private var cinemaResolve: kotlinx.coroutines.Job? = null
+
+    fun openCinema(): Boolean {
+        val l = (selectedClipId?.let(::locate)?.takeIf { tracks.firstOrNull { t -> t.id == it.trackId }?.pictures == true } ?: topVideoAt(playheadUs))
+            ?.takeIf { it.trackId !in lockedTracks } ?: return false
+        val a = assets[l.clip.assetId] ?: return false
+        if (a.isImage) { tell("Cinema works on video clips"); return false }
+        pause()
+        selectedClipId = l.clip.id
+        cinemaClipId = l.clip.id
+        cinemaError = null
+        cinemaInstalled = CinemaModels.installed(getApplication())
+        if (playheadUs < l.clip.startUs || playheadUs >= l.clip.endUs) seek(l.clip.startUs)
+        if (cinemaFor(l.clip) == null) resolveCinema(l.clip)
+        return true
+    }
+
+    /** The page works on the clip under the playhead, as Color does. */
+    fun cinemaFollow() {
+        val l = gradeTarget ?: return
+        if (l.clip.id == cinemaClipId) return
+        val a = assets[l.clip.assetId] ?: return
+        if (a.isImage) return
+        cinemaClipId = l.clip.id
+        selectedClipId = l.clip.id
+        if (cinemaRuns[l.clip.id] == null) resolveCinema(l.clip)
+    }
+
+    fun closeCinema() {
+        gradeEnd()
+        cinemaClipId = null
+        showCinemaView(0)
+    }
+
+    fun showCinemaView(v: Int) { cinemaView = v; CinemaGl.view = v; CinemaGl.redraw?.invoke() }
+
+    /** What the preview and overlay draw from for [c]: null when Cinema is off or the file isn't measured. */
+    fun cinemaFor(c: Clip?): CinemaRun? = if (c?.cinema?.on == true) cinemaRuns[c.id] else null
+
+    /** The run of the clip open on the page, on or not. */
+    val cinemaRun: CinemaRun? get() = cinemaClipId?.let { cinemaRuns[it] }
+
+    fun cinemaUs(c: Clip): Long = stabStillUs(c) ?: c.inUs
+
+    fun setCinema(update: (Cinema) -> Cinema) {
+        val l = cinemaTarget ?: return
+        if (l.trackId in lockedTracks) return
+        val n = update(l.clip.cinema ?: Cinema())
+        if (n == l.clip.cinema) return
+        tracks = withClip(l.clip.id) { listOf(it.copy(cinema = n)) }
+        resolveCinema(locate(l.clip.id)?.clip ?: return)
+    }
+
+    fun setCinemaOnce(update: (Cinema) -> Cinema) {
+        gradeStart()
+        setCinema(update)
+        gradeEnd()
+    }
+
+    /** Applies the clip's lens and focus to its analysis. Cheap: nothing is measured again. */
+    private fun resolveCinema(c: Clip) {
+        val a = assets[c.assetId] ?: return
+        val ci = c.cinema ?: Cinema()
+        cinemaResolve?.cancel()
+        cinemaResolve = viewModelScope.launch {
+            kotlinx.coroutines.delay(60)
+            val run = withContext(Dispatchers.Default) { runCatching { CinemaRun.build(getApplication(), a.uri, ci) }.getOrNull() }
+            if (run != null) {
+                cinemaRuns[c.id] = run
+                cinemaPending = null
+                // A measured file: the lens is ready to use on this clip.
+                if (locate(c.id)?.clip?.cinema == null) tracks = withClip(c.id) { listOf(it.copy(cinema = Cinema())) }
+            }
+        }
+    }
+
+    /** Sets up the engine if needed, then measures the open clip's file, once. */
+    fun analyseCinema() {
+        val l = cinemaTarget ?: return
+        val a = assets[l.clip.assetId] ?: return
+        if (cinemaProgress != null) return
+        val stop = java.util.concurrent.atomic.AtomicBoolean(false); cinemaStop = stop
+        cinemaError = null; cinemaProgress = 0f
+        val app = getApplication<Application>()
+        val edge = cinemaEdge
+        viewModelScope.launch(Dispatchers.Default) {
+            val failure = runCatching {
+                if (!CinemaModels.installed(app)) {
+                    cinemaUi { cinemaBusy = "Setting up Cinema (${CinemaModels.downloadMb} MB, once)" }
+                    CinemaModels.install(app, { p -> cinemaUi { cinemaProgress = p } }, { stop.get() }).getOrThrow()
+                }
+                cinemaUi { cinemaInstalled = true; cinemaBusy = "Analysing"; cinemaProgress = 0f }
+                val s = com.graden.editor.cinema.Settings().also { it.analysisEdge = edge }
+                com.graden.editor.cinema.AiEngine.onNpu = false
+                com.graden.editor.cinema.ClipAnalyzer.run(app, android.net.Uri.parse(a.uri), s, stop) { p, m ->
+                    cinemaUi { cinemaProgress = p / 100f; cinemaBusy = m; cinemaEngine = if (com.graden.editor.cinema.AiEngine.onNpu) "NPU" else "CPU" }
+                }
+            }.exceptionOrNull()
+            withContext(Dispatchers.Main) {
+                cinemaProgress = null
+                if (failure != null) { if (!stop.get()) cinemaError = failure.message ?: "Couldn't analyse this clip"; android.util.Log.w("Cinema", "analysis", failure) }
+                else locate(l.clip.id)?.clip?.let { c ->
+                    if (c.cinema == null) tracks = withClip(c.id) { listOf(it.copy(cinema = Cinema())) }
+                    resolveCinema(locate(c.id)?.clip ?: c)
+                    saveSoon()
+                }
+            }
+        }
+    }
+
+    private fun cinemaUi(f: () -> Unit) { main.post(f) }
+
+    fun cancelCinema() { cinemaStop?.set(true) }
+
+    /**
+     * Tap on subject or place: single follows it and may let go, double holds on to it. Focus arrives at the frame tapped,
+     * so the pull starts earlier by its length ([seconds], else the clip's speed); across a cut, or at the start of the clip,
+     * it is instant.
+     */
+    fun cinemaTap(x: Float, y: Float, strong: Boolean, seconds: Float? = null) {
+        val c = cinemaTarget?.clip ?: return
+        val run = cinemaRun ?: return
+        cinemaPending = androidx.compose.ui.geometry.Offset(x, y)
+        val i = run.index(cinemaUs(c))
+        var hit: com.graden.editor.cinema.FocusTrack.Subject? = null
+        for (v in run.track.candidates[i]) {
+            if (v.score > 1 && x >= v.left && x <= v.right && y >= v.top && y <= v.bottom && (hit == null || (v.right - v.left) * (v.bottom - v.top) < (hit.right - hit.left) * (hit.bottom - hit.top))) hit = v
+        }
+        viewModelScope.launch(Dispatchers.Default) {
+            val d = hit?.d ?: runCatching { run.maps(i).at(x, y) }.getOrDefault(.5f)
+            withContext(Dispatchers.Main) {
+                setCinemaOnce { ci ->
+                    val at = run.cache.times[i]
+                    val j = run.index((at - ((seconds ?: ci.pull) * 1e6f).toLong()).coerceAtLeast(c.inUs))
+                    val calm = j < i && run.cache.scenes[j] == run.cache.scenes[i]
+                    val from = if (calm) run.cache.times[j] else at
+                    val length = (at - from) / 1e6f
+                    val then = if (calm) hit?.let { h -> run.track.candidates[j].firstOrNull { it.id == h.id } } else hit
+                    val k = when {
+                        // The subject as it was when the pull begins, so tracking takes hold of the right one.
+                        then != null -> CinemaKey(from, FocusEdits.TRACK, then.x, then.y, then.d, length, strong)
+                        hit != null -> CinemaKey(at, FocusEdits.TRACK, hit.x, hit.y, hit.d, 0f, strong)
+                        else -> CinemaKey(from, FocusEdits.FIXED, x, y, d, length, true)
+                    }
+                    ci.copy(keys = (ci.keys.filter { it.us < from - 1000 || it.us > at + 1000 } + k).sortedBy { it.us })
+                }
+            }
+        }
+    }
+
+    /** Moves the playhead to file time [us] of the open clip. */
+    fun cinemaSeek(us: Long) {
+        val l = cinemaTarget ?: return
+        seek(l.clip.startUs + ((us - l.clip.inUs) / l.clip.speed).toLong())
+    }
+
+    /** Changes one focus point. */
+    fun cinemaKey(us: Long, update: (CinemaKey) -> CinemaKey) = setCinema { c -> c.copy(keys = c.keys.map { if (it.us == us) update(it) else it }) }
+
+    /**
+     * Moves a focus point in time and sets its length, kept clear of its neighbours. A tracked subject is picked up where it
+     * is at the new time, so it can't lose hold of it. Returns where the point ended up.
+     */
+    fun cinemaMoveKey(us: Long, to: Long, seconds: Float): Long {
+        val c = cinemaTarget?.clip ?: return us
+        val run = cinemaRun ?: return us
+        val keys = c.cinema?.keys ?: return us
+        val n = keys.indexOfFirst { it.us == us }
+        if (n < 0) return us
+        val k = keys[n]
+        val gap = 40_000L
+        val low = keys.getOrNull(n - 1)?.let { it.us + (it.seconds * 1e6f).toLong() + gap } ?: c.inUs
+        val high = (keys.getOrNull(n + 1)?.us?.minus(gap) ?: c.outUs).coerceAtLeast(low)
+        val length = (seconds * 1e6f).toLong().coerceIn(0L, high - low)
+        val i = run.index(to.coerceIn(low, high - length))
+        val time = run.cache.times[i]
+        val was = run.track.candidates[run.index(us)].minByOrNull { kotlin.math.abs(it.x - k.x) + kotlin.math.abs(it.y - k.y) }
+        val then = if (k.mode == FocusEdits.TRACK && was != null) run.track.candidates[i].firstOrNull { it.id == was.id } else null
+        setCinema { ci -> ci.copy(keys = ci.keys.map { if (it.us != us) it else it.copy(us = time, seconds = length / 1e6f, x = then?.x ?: it.x, y = then?.y ?: it.y, depth = then?.d ?: it.depth) }) }
+        return time
+    }
+
+    /** Takes out one focus point, or all of them when [us] is null. */
+    fun cinemaDropKey(us: Long?) = setCinemaOnce { c -> c.copy(keys = if (us == null) emptyList() else c.keys.filter { it.us != us }) }
+
+    /** A focus point here that hands back to automatic focus. */
+    fun cinemaAutoHere() {
+        val c = cinemaTarget?.clip ?: return
+        val run = cinemaRun ?: return
+        val time = run.cache.times[run.index(cinemaUs(c))]
+        setCinemaOnce { ci -> ci.copy(keys = (ci.keys.filter { kotlin.math.abs(it.us - time) > 1000 } + CinemaKey(time, FocusEdits.AUTO, .5f, .5f, .5f, ci.pull, false)).sortedBy { it.us }) }
+    }
+
+    /** Holds focus at a depth from here on. */
+    fun cinemaFixHere(depth: Float) {
+        val c = cinemaTarget?.clip ?: return
+        val run = cinemaRun ?: return
+        val time = run.cache.times[run.index(cinemaUs(c))]
+        setCinema { ci -> ci.copy(keys = (ci.keys.filter { kotlin.math.abs(it.us - time) > 1000 } + CinemaKey(time, FocusEdits.FIXED, .5f, .5f, depth, ci.pull)).sortedBy { it.us }) }
+    }
+
+    fun removeCinema() { setCinemaOnce { Cinema(on = false) }; cinemaTarget?.clip?.let { c -> tracks = withClip(c.id) { listOf(it.copy(cinema = null)) } } }
 
     fun openStab(): Boolean {
         val l = (selectedClipId?.let(::locate)?.takeIf { tracks.firstOrNull { t -> t.id == it.trackId }?.pictures == true } ?: topVideoAt(playheadUs))

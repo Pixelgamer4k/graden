@@ -69,7 +69,7 @@
 
 | Feature | What it means for you |
 |---|---|
-| **Cinema depth of field** | Add real lens blur after shooting: tap to focus, rack focus on the timeline, and choose your bokeh |
+| **Cinema DOF** | Real lens blur after shooting, on the NPU on supported Snapdragon phones: automatic focus, tap or drag to change it, focus changes on the timeline, and lens looks |
 | **Smooth slow motion** | Slow down any clip without stutter, using optical flow and AI that run on your phone |
 | **Shadows, Highlights and Mid/Detail** | The last colour controls matched to Resolve |
 | **Exporting captions as files** | SRT and VTT subtitles, with burned-in captions optional |

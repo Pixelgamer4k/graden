@@ -20,6 +20,17 @@
 
 ## Highlights
 
+**New in 0.4: Cinema DOF**
+- **Real lens blur after shooting**, with the subject found and separated automatically, including fine edges such as hair
+- **Runs on the NPU** on supported Qualcomm Snapdragon phones, about 10 times faster than the CPU; other phones use the CPU
+- **Automatic focus like a phone's cinematic mode**: people, animals and objects are found and followed on their own
+- **Change focus any time**: tap a subject to focus on it, double tap to hold on to it, or drag the gold mark across to
+  pull focus by hand, with the pull as long as your drag
+- **Focus on the timeline**: drag focus changes to move them, set their length and curve, or remove them
+- **See what the lens sees**: hold the eye for the depth map, or the aperture button for what's in focus
+- **Lens looks** (Clean, Vintage, Anamorphic, Dreamy), aperture shapes, highlights, rim and focus breathing
+- Choose the analysis size: faster, or finer. Each file is analysed once, and export matches the preview
+
 **New in 0.3: captions and text**
 - **Auto captions** made on the phone with Whisper (Small or Large v3 Turbo, 99 languages): sentence by sentence, timed
   to the word, laid out like YouTube and Netflix subtitles, on a layer of their own; for the whole project or one clip
@@ -93,6 +104,10 @@
 
 ## Screenshots
 
+| Cinema DOF | Depth map | What's in focus | Lens |
+|:-:|:-:|:-:|:-:|
+| <img src="docs/screenshots/cinema-focus.png" width="200"> | <img src="docs/screenshots/cinema-depth.png" width="200"> | <img src="docs/screenshots/cinema-zone.png" width="200"> | <img src="docs/screenshots/cinema-lens.png" width="200"> |
+
 | Editor | Colour: timeline | Colour: scopes | Colour: primaries |
 |:-:|:-:|:-:|:-:|
 | <img src="docs/screenshots/edit.png" width="200"> | <img src="docs/screenshots/color1.png" width="200"> | <img src="docs/screenshots/color2.png" width="200"> | <img src="docs/screenshots/color3.png" width="200"> |
@@ -109,7 +124,7 @@ hardware encoder. The results and the fixes they led to are in [docs/TESTING.md]
 
 ## Install
 
-1. Download **`Graden-0.3.4-beta.apk`** from the [latest release](https://github.com/Pixelgamer4k/graden/releases).
+1. Download **`Graden-0.4.0-beta.apk`** from the [latest release](https://github.com/Pixelgamer4k/graden/releases).
 2. Open it on your phone and allow installing from this source when Android asks.
 
 Needs **Android 10 or newer**. A recent phone with a capable chip gives the best experience with 4K footage.
@@ -126,13 +141,18 @@ This beta exists to collect feedback, so every report helps:
 - 💡 **Ideas**: [suggest a feature](https://github.com/Pixelgamer4k/graden/issues/new?template=feature_request.yml)
 - 💬 **Questions and general thoughts**: [Discussions](https://github.com/Pixelgamer4k/graden/discussions)
 
-## Known limitations in 0.3
+## Known limitations in 0.4
 
+- Cinema DOF's NPU route supports Snapdragon 8 Gen 1 and newer plus several 7-series chips, and has been tested on one
+  Snapdragon phone so far. Please report how it runs on yours. MediaTek and Exynos phones use the CPU for now, which is
+  much slower and not yet well tested
+- Cinema DOF downloads its engine on first use (about 200 MB on supported Snapdragon phones, 125 MB otherwise), from its
+  official sources. It works on SDR video clips, not still pictures, and the app is larger now, about 134 MB
 - Exporting many layers of 4K footage is slow: rendering is done at full quality, frame by frame
 - 10-bit and HDR export depend on the phone's encoder; where it cannot, the export screen says so
 - The colour wheels follow Resolve's manual but are not yet measured against Resolve the way the colour space
   transform is
-- 0.3.4 is signed with the same key as earlier betas, so it installs over them and keeps your projects
+- 0.4.0 is signed with the same key as earlier betas, so it installs over them and keeps your projects
 - Captions need a 64-bit ARM phone; speaker and music detection need one from about 2019 on (ARMv8.2)
 - GIFs are shown as still pictures for now
 - Captions are drawn into the video; exporting them as a separate subtitle file is planned
@@ -176,7 +196,13 @@ CED (Apache-2.0); its library is built by `tools/audiocpp/build.sh` · fonts fro
 under the SIL Open Font License or Apache-2.0 (licences in `app/src/main/assets/fonts/licenses`), and optionally
 [x264](https://www.videolan.org/developers/x264.html) and [x265](https://www.x265.org/).
 
-Footage in the screenshots is from [Pexels](https://www.pexels.com/), used under the Pexels license.
+Cinema DOF is built on DepthStudio (GPL-3.0), with [Robust Video Matting](https://github.com/PeterL1n/RobustVideoMatting)
+(GPL-3.0), [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) Small (Apache-2.0) and
+[YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) (Apache-2.0), running on [LiteRT](https://github.com/google-ai-edge/LiteRT)
+(Apache-2.0). On Snapdragon phones it also downloads Qualcomm's AI Runtime, which is Qualcomm's own software under its
+own licence and isn't part of this repository or the app. Licences are in `app/src/main/assets/cinema/licenses`.
+
+Footage in the editor and colour screenshots is from [Pexels](https://www.pexels.com/), used under the Pexels license.
 
 ## License
 

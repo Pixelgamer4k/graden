@@ -856,7 +856,7 @@ private fun Timecode(vm: EditorViewModel, modifier: Modifier) {
 // ---- transport and timeline ------------------------------------------------------------------------
 
 @Composable
-private fun ColorTransport(vm: EditorViewModel) {
+internal fun ColorTransport(vm: EditorViewModel) {
     // Everything here is sized from the width of the screen (one unit is 1/400 of it), as the editor's transport is,
     // so the row keeps its proportions on any phone, at any display size or font size, and nothing wraps or crowds.
     androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxWidth()) {
@@ -910,7 +910,7 @@ private class CtGeo(density: Float) {
  * trimmed here.
  */
 @Composable
-private fun ColorTimeline(vm: EditorViewModel, height: androidx.compose.ui.unit.Dp) {
+internal fun ColorTimeline(vm: EditorViewModel, height: androidx.compose.ui.unit.Dp) {
     val view = LocalView.current
     val screen = LocalDensity.current
     val vmNow by rememberUpdatedState(vm)

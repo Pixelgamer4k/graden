@@ -14,6 +14,7 @@
         android:label="Graden"
         android:largeHeap="true"
         android:theme="@style/AppTheme">
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

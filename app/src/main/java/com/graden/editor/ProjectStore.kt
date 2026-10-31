@@ -73,6 +73,7 @@ class ProjectStore(private val dir: File) {
                 .putOpt("cs", c.cs)
                 .putOpt("stab", c.stab?.toJson())
                 .putOpt("cap", c.caption?.let(::captionJson))
+                .putOpt("cine", c.cinema?.toJson())
                 .putOpt("snd", if (c.snd.isDefault) null else JSONObject().put("v", c.snd.volume.toDouble()).put("m", c.snd.muted)
                     .put("n", c.snd.normalize).put("fi", c.snd.fadeInUs).put("fo", c.snd.fadeOutUs).put("p", c.snd.pan.toDouble())
                     .put("b", c.snd.bass.toDouble()).put("mi", c.snd.mid.toDouble()).put("t", c.snd.treble.toDouble()).put("pi", c.snd.pitch.toDouble()))
@@ -98,6 +99,7 @@ class ProjectStore(private val dir: File) {
                 o.optString("cs").ifEmpty { null },
                 Stab.fromJson(o.optJSONObject("stab")),
                 o.optJSONObject("cap")?.let(::readCaption),
+                Cinema.fromJson(o.optJSONObject("cine")),
             )
         }
 
