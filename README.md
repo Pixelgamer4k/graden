@@ -10,6 +10,8 @@
 [![Android](https://img.shields.io/badge/Android-10%2B-3DDC84?logo=android&logoColor=white)](#install)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
+<a href="https://buymeacoffee.com/pixelgamer4k"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="60"></a>
+
 <img src="docs/screenshots/banner.png" alt="Graden: timeline, colour page and export" width="100%">
 
 </div>
