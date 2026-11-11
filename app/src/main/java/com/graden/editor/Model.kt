@@ -122,6 +122,9 @@ data class Track(val id: Int, val video: Boolean, val clips: List<Clip>, val nam
     val pictures: Boolean get() = video && !captions
     val endUs: Long get() = clips.maxOfOrNull { it.endUs } ?: 0L
     fun clipAt(us: Long): Clip? = clips.firstOrNull { us >= it.startUs && us < it.endUs }
+
+    /** The clip whose picture the preview holds at [us]: the one there, or at the very end of a clip, that clip. */
+    fun shownAt(us: Long): Clip? = clipAt(us) ?: clips.lastOrNull { it.endUs == us }
 }
 
 const val MIN_CLIP_US = 100_000L

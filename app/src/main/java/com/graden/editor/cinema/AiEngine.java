@@ -42,8 +42,12 @@ public final class AiEngine implements AutoCloseable {
             File f=model.startsWith("rvm_")?new File(asset(context,model)):com.graden.editor.CinemaModels.model(context,model);Interpreter.Options o=new Interpreter.Options();
             String v=com.graden.editor.CinemaModels.hexagon;
             if(v!=null)try{handle=nOpen(com.graden.editor.CinemaModels.qnnDir(context).getPath(),v,context.getCacheDir().getPath(),model.replace(".tflite",""));}catch(Throwable e){android.util.Log.w("Cinema","no NPU",e);}
-            if(handle!=0){final long h=handle;o.addDelegate(new Delegate(){public long getNativeHandle(){return h;}});onNpu=true;}else o.setNumThreads(Math.max(2,Math.min(7,Runtime.getRuntime().availableProcessors()-1)));
-            run=new Interpreter(f,o);
+            Interpreter r=null;
+            if(handle!=0){final long h=handle;o.addDelegate(new Delegate(){public long getNativeHandle(){return h;}});
+                // Some Hexagon chips (seen on Snapdragon 7 Gen 3) refuse a graph when it is finalised. Then the model runs on the CPU.
+                try{r=new Interpreter(f,o);onNpu=true;}catch(Throwable e){android.util.Log.w("Cinema","NPU refused "+model+", using CPU",e);nClose(handle);handle=0;o=new Interpreter.Options();}}
+            if(r==null){o.setNumThreads(Math.max(2,Math.min(7,Runtime.getRuntime().availableProcessors()-1)));r=new Interpreter(f,o);}
+            run=r;
         }
         public void close(){run.close();if(handle!=0)nClose(handle);handle=0;}
     }

@@ -243,19 +243,35 @@ fun EditorScreen(vm: EditorViewModel) {
     }
 
     Box(Modifier.fillMaxSize().background(Palette.Bg)) {
-        Column(Modifier.fillMaxSize().systemBarsPadding()) {
+        val topBar: @Composable () -> Unit = {
             when {
                 vm.colorOpen -> ColorTopBar(vm)
                 vm.stabOpen -> StabTopBar(vm)
                 vm.cinemaOpen -> CinemaTopBar(vm)
                 else -> HostBar(vm, soon, onClose = { vm.closeProject() }, onSettings = { settingsOpen = true })
             }
-            Preview(vm)
+        }
+        val body: @Composable ColumnScope.() -> Unit = {
             when {
                 vm.colorOpen -> ColorBody(vm, Modifier.weight(1f))
                 vm.stabOpen -> StabBody(vm, Modifier.weight(1f))
                 vm.cinemaOpen -> CinemaBody(vm, Modifier.weight(1f))
                 else -> EditBody(vm, soon) { timelineBounds = it }
+            }
+        }
+        BoxWithConstraints(Modifier.fillMaxSize().systemBarsPadding()) {
+            // A tablet on its side: the picture on the left, as tall as the screen; the tools and timeline beside it.
+            if (maxWidth > maxHeight && maxWidth >= 840.dp) Row(Modifier.fillMaxSize()) {
+                Column(Modifier.weight(1.15f).fillMaxHeight()) {
+                    topBar()
+                    Preview(vm, Modifier.weight(1f).fillMaxWidth())
+                }
+                Box(Modifier.width(1.dp).fillMaxHeight().background(Color(0xFF1C1E24)))
+                Column(Modifier.weight(1f).fillMaxHeight()) { body() }
+            } else Column(Modifier.fillMaxSize()) {
+                topBar()
+                Preview(vm)
+                body()
             }
         }
         if (vm.colorOpen) ColorOverlays(vm)
@@ -512,8 +528,15 @@ private fun BarIcon(icon: ImageVector, label: String, tint: Color = Palette.Text
 
 @OptIn(UnstableApi::class)
 @Composable
-private fun Preview(vm: EditorViewModel) {
+private fun Preview(vm: EditorViewModel, wide: Modifier? = null) {
     com.graden.editor.RecomposeProbe.hit("Preview")
+    if (wide != null) {
+        // The wide layout gives the picture a fixed area; it takes that area's shape.
+        BoxWithConstraints(wide) {
+            PreviewArea(vm, Modifier.fillMaxSize(), maxWidth.value / maxHeight.value.coerceAtLeast(1f))
+        }
+        return
+    }
     // The preview area is the full width and at most square. A wide canvas (16:9, 21:9…) fills the width and the
     // area is just as tall as it needs, so wider shapes take less height. A square or tall canvas (1:1, 4:5, 9:16…)
     // gets the square area and fits inside it, with the space beside it the editor's, not the picture's.
@@ -522,7 +545,13 @@ private fun Preview(vm: EditorViewModel) {
     // with bars at the sides, so a tall canvas gets the whole height. While grading the scopes and wheels need the room,
     // so the area is wide there.
     val areaAspect = if (vm.colorOpen || vm.stabOpen || vm.cinemaOpen) maxOf(canvasAspect, 1.78f) else 1f
-    Box(Modifier.fillMaxWidth().aspectRatio(areaAspect).background(Color(0xFF060709))) {
+    PreviewArea(vm, Modifier.fillMaxWidth().aspectRatio(areaAspect), areaAspect)
+}
+
+@Composable
+private fun PreviewArea(vm: EditorViewModel, area: Modifier, areaAspect: Float) {
+    val canvasAspect = vm.meta.aspect
+    Box(area.background(Color(0xFF060709))) {
     Box(
         Modifier.align(Alignment.Center).padding(if (canvasAspect >= areaAspect - 0.01f) 0.dp else 4.dp)
             .aspectRatio(canvasAspect, matchHeightConstraintsFirst = canvasAspect < areaAspect)
@@ -541,7 +570,7 @@ private fun Preview(vm: EditorViewModel) {
             else if (t.captions && i < topLane) key(t.id) { TextLayer(vm, t) }
         }
         // At rest, the original file's frame covers the proxy the lanes are showing.
-        val top by remember { derivedStateOf { vm.topClip } }
+        val top by remember { derivedStateOf { vm.shownTopClip } }
         val topAsset = top?.let { vm.assets[it.assetId] }
         val topAspect = topAsset?.let { it.width.toFloat() / it.height.coerceAtLeast(1) } ?: (16f / 9f)
         AndroidView(
@@ -779,7 +808,8 @@ private fun LaneLayers(vm: EditorViewModel, t: com.graden.editor.Track) {
         // transition) changes, not on every frame of playback.
         val fx by remember(t, shown) { derivedStateOf { if (shown) vm.laneFxShape(t) else null } }
         val centre by remember(t) { derivedStateOf { vm.centreScale(t) } }
-        val here by remember(t) { derivedStateOf { t.clipAt(vm.playheadUs) } }
+        // At the very end of a clip the held last frame keeps that clip's shape (it was drawn 16:9, stretched).
+        val here by remember(t) { derivedStateOf { t.shownAt(vm.playheadUs) } }
         if (lp != null) Box(Modifier.fillMaxSize()) {
             fx?.backdrop?.let { Box(Modifier.fillMaxSize().background(it)) }
             for (k in 0..1) {

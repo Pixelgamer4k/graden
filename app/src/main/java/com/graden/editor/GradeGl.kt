@@ -827,9 +827,13 @@ internal object ShaderCache {
     @Volatile var ready = false
         private set
 
+    private var started = false
+
     /** Compiles (or loads) the preview's programs on a thread of their own, so the first project opens without a wait. */
     fun warmUp(context: Context) {
         dir = java.io.File(context.cacheDir, "shaders")
+        if (started) return
+        started = true
         Thread({
             runCatching {
                 val d = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
@@ -849,6 +853,6 @@ internal object ShaderCache {
                 EGL14.eglDestroyContext(d, ctx)
             }.onFailure { android.util.Log.w("GradeGl", "shader warm-up failed", it) }
             ready = true
-        }, "shader-warmup").apply { priority = Thread.MIN_PRIORITY }.start()
+        }, "shader-warmup").start()
     }
 }

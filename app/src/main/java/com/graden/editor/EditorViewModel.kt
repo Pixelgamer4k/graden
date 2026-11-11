@@ -465,6 +465,50 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Media shared to Graden from a gallery or file manager: kept in the app's own storage (a share's permission ends
+     * with it), then a new project in the shape of the first picture, with everything shared laid on the timeline.
+     */
+    fun openShared(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val app = getApplication<Application>()
+        viewModelScope.launch {
+            while (!startupReady) kotlinx.coroutines.delay(50)
+            tell(if (uris.size == 1) "Opening shared media…" else "Opening ${uris.size} shared files…")
+            val files = withContext(Dispatchers.IO) {
+                val dir = File(app.filesDir, "shared").apply { mkdirs() }
+                uris.mapNotNull { u ->
+                    runCatching {
+                        val name = MediaProbe.displayName(app, u).replace(Regex("[^A-Za-z0-9._ -]"), "_").ifBlank { "media" }
+                        val f = File(dir, "${System.currentTimeMillis()}_$name")
+                        app.contentResolver.openInputStream(u)!!.use { i -> f.outputStream().use { i.copyTo(it, 1 shl 20) } }
+                        Uri.fromFile(f)
+                    }.onFailure { android.util.Log.w("Graden", "shared file not read", it) }.getOrNull()
+                }
+            }
+            if (files.isEmpty()) { tell("Couldn't read the shared media"); return@launch }
+            val first = withContext(Dispatchers.IO) { files.firstNotNullOfOrNull { u -> MediaProbe.probe(app, u)?.takeIf { !it.isAudio && it.width > 0 } } }
+            var meta = ProjectMeta(ProjectMeta.defaultName(), System.currentTimeMillis())
+            if (first != null) {
+                // The project takes the media's own shape and size (short side up to 4K's), and a video's frame rate.
+                val w = first.width; val h = first.height
+                val short = minOf(w, h).coerceAtMost(2160)
+                val scale = short.toFloat() / minOf(w, h)
+                meta = ProjectMeta.custom(meta.copy(shortSide = short), (w * scale).toInt() / 2 * 2, (h * scale).toInt() / 2 * 2)
+                if (!first.isImage && first.fps in 1f..240f) meta = meta.copy(fps = first.fps)
+            }
+            val id = withContext(Dispatchers.IO) { projects.create(meta) }
+            openProject(id)
+            while (projectId != id) kotlinx.coroutines.delay(30)
+            val before = assets.keys
+            import(files)
+            importJobs.lastOrNull()?.join()
+            importOpen = false
+            files.forEach { u -> assets.values.firstOrNull { it.uri == u.toString() && it.id !in before }?.let(::addAsset) }
+            selectedClipId = null
+        }
+    }
+
     /** Opens a project: everything comes back as it was left, including zoom, lanes and playhead. */
     fun openProject(id: String) {
         if (projectId != null) closeProject()
@@ -2528,6 +2572,10 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     /** The picture on top at the playhead (the one the still and scrub frames stand in for). */
     val topClip: Clip? get() = topVideoAt(playheadUs)?.clip
 
+    /** The top picture the preview holds: as [topClip], and at the very end of a clip still that clip, not none. */
+    val shownTopClip: Clip?
+        get() = topClip ?: tracks.asReversed().firstOrNull { it.pictures && it.id !in hiddenTracks && it.shownAt(playheadUs) != null }?.shownAt(playheadUs)
+
     /** The grade a lane's picture is shown with right now (null: as it is), for the preview. */
     fun gradeFor(c: Clip?): Grade? = if (colorBypass || c == null) null else c.grade
 
@@ -3017,10 +3065,10 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     fun cinemaUs(c: Clip): Long = stabStillUs(c) ?: c.inUs
 
     fun setCinema(update: (Cinema) -> Cinema) {
-        val l = cinemaTarget ?: return
-        if (l.trackId in lockedTracks) return
+        val l = cinemaTarget ?: run { cinemaPending = null; return }
+        if (l.trackId in lockedTracks) { cinemaPending = null; return }
         val n = update(l.clip.cinema ?: Cinema())
-        if (n == l.clip.cinema) return
+        if (n == l.clip.cinema) { cinemaPending = null; return }
         tracks = withClip(l.clip.id) { listOf(it.copy(cinema = n)) }
         resolveCinema(locate(l.clip.id)?.clip ?: return)
     }
@@ -3039,9 +3087,10 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         cinemaResolve = viewModelScope.launch {
             kotlinx.coroutines.delay(60)
             val run = withContext(Dispatchers.Default) { runCatching { CinemaRun.build(getApplication(), a.uri, ci) }.getOrNull() }
+            // Whatever came of it, the "Focusing" tag goes: it stayed up for good when a rebuild failed.
+            cinemaPending = null
             if (run != null) {
                 cinemaRuns[c.id] = run
-                cinemaPending = null
                 // A measured file: the lens is ready to use on this clip.
                 if (locate(c.id)?.clip?.cinema == null) tracks = withClip(c.id) { listOf(it.copy(cinema = Cinema())) }
             }
@@ -3091,13 +3140,16 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
      * so the pull starts earlier by its length ([seconds], else the clip's speed); across a cut, or at the start of the clip,
      * it is instant.
      */
-    fun cinemaTap(x: Float, y: Float, strong: Boolean, seconds: Float? = null) {
+    fun cinemaTap(x: Float, y: Float, strong: Boolean, seconds: Float? = null, subjectId: Int? = null) {
         val c = cinemaTarget?.clip ?: return
         val run = cinemaRun ?: return
         cinemaPending = androidx.compose.ui.geometry.Offset(x, y)
         val i = run.index(cinemaUs(c))
         var hit: com.graden.editor.cinema.FocusTrack.Subject? = null
-        for (v in run.track.candidates[i]) {
+        // A drag ends on the subject whose mark it was let go on, or on the depth right under the finger: it no longer
+        // snaps to any box the finger happens to be inside.
+        if (seconds != null) hit = subjectId?.let { id -> run.track.candidates[i].firstOrNull { it.id == id } }
+        else for (v in run.track.candidates[i]) {
             if (v.score > 1 && x >= v.left && x <= v.right && y >= v.top && y <= v.bottom && (hit == null || (v.right - v.left) * (v.bottom - v.top) < (hit.right - hit.left) * (hit.bottom - hit.top))) hit = v
         }
         viewModelScope.launch(Dispatchers.Default) {

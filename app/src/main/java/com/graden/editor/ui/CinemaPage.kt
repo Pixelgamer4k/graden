@@ -431,7 +431,12 @@ fun CinemaOverlay(vm: EditorViewModel) {
             val cy = if (s.kind == 0 || s.kind in 14..23) s.top * box[3] + max(side * .55f, min(h * .14f, side)) else s.y * box[3]
             return Triple(box[0] + s.x * box[2], box[1] + cy, side)
         }
-        val hover = drag?.let { d -> pic(d, constraints.maxWidth.toFloat(), constraints.maxHeight.toFloat()) }?.let { o -> subjects.filter { o.x in it.left..it.right && o.y in it.top..it.bottom }.minByOrNull { (it.right - it.left) * (it.bottom - it.top) } }
+        // While dragging, the mark follows the finger and takes hold of a subject only when it is over that subject's
+        // own mark, so it is never pulled onto a box the finger merely crosses.
+        val hover = drag?.let { d -> subjects.filter { s -> val (x, y, sd) = mark(s); abs(d.x - x) < sd / 2 + 6 * dpx && abs(d.y - y) < sd / 2 + 6 * dpx }.minByOrNull { s -> val (x, y) = mark(s); abs(d.x - x) + abs(d.y - y) } }
+        val hoverId by rememberUpdatedState(hover?.id)
+        // Only the few strongest other subjects are outlined, so the picture stays clear.
+        val others = subjects.filter { it !== chosen }.take(4)
         val goal = hover?.let(::mark) ?: drag?.let { Triple(it.x, it.y, minSide * 1.25f) } ?: pending?.let { Triple(box[0] + it.x * box[2], box[1] + it.y * box[3], minSide * 1.25f) } ?: chosen?.let(::mark) ?: Triple(box[0] + fx * box[2], box[1] + fy * box[3], minSide * 1.25f)
         val glide = spring<Float>(dampingRatio = .82f, stiffness = 340f)
         val ox by animateFloatAsState(goal.first, glide, label = "fx")
@@ -457,18 +462,20 @@ fun CinemaOverlay(vm: EditorViewModel) {
                 onDragStart = { p -> if ((p - spot).getDistance() < grab) { drag = p; dragFrom = SystemClock.uptimeMillis(); dragSeconds = 0f } },
                 onDragEnd = {
                     val d = drag; drag = null
-                    d?.let { pic(it, size.width.toFloat(), size.height.toFloat()) }?.let { now.cinemaTap(it.x, it.y, false, ((SystemClock.uptimeMillis() - dragFrom) / 1000f).coerceIn(.15f, 5f)) }
+                    val on = hoverId
+                    d?.let { pic(it, size.width.toFloat(), size.height.toFloat()) }?.let { now.cinemaTap(it.x, it.y, false, ((SystemClock.uptimeMillis() - dragFrom) / 1000f).coerceIn(.15f, 5f), on) }
                 },
                 onDragCancel = { drag = null },
                 onDrag = { ch, _ -> if (drag != null) { ch.consume(); drag = ch.position } },
             )
         }) {
-            for (s in subjects) {
-                if (s === chosen) continue
+            for (s in others) {
+                // While dragging, only the subject under the finger keeps its outline.
+                if (dragging && s !== hover) continue
                 val (x, y, sd) = mark(s)
                 val tl = Offset(x - sd / 2, y - sd / 2); val cr = CornerRadius(sd * .16f)
-                drawRoundRect(Color.Black.copy(alpha = .16f), tl, Size(sd, sd), cr, style = Stroke(2.2.dp.toPx()))
-                drawRoundRect(Color.White.copy(alpha = .38f), tl, Size(sd, sd), cr, style = Stroke(1.dp.toPx()))
+                drawRoundRect(Color.Black.copy(alpha = .1f), tl, Size(sd, sd), cr, style = Stroke(2.dp.toPx()))
+                drawRoundRect(Color.White.copy(alpha = .24f), tl, Size(sd, sd), cr, style = Stroke(1.dp.toPx()))
             }
             // Four round corners, each one curve, over a soft shadow so they read on any picture.
             val r = side / 2; val bend = side * .17f; val arm = side * .3f

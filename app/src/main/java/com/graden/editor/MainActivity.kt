@@ -18,6 +18,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         TextFonts.assets = applicationContext.assets
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Phones stay upright; tablets and unfolded foldables turn freely and get the wide layout on their side.
+        requestedOrientation = if (resources.configuration.smallestScreenWidthDp >= 600) android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_USER
+            else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         // Ask for the panel's highest refresh rate so the timeline scrolls at 90/120 Hz where available.
         @Suppress("DEPRECATION") val display = windowManager.defaultDisplay
         val current = display.mode
@@ -26,9 +29,20 @@ class MainActivity : ComponentActivity() {
             .maxByOrNull { it.refreshRate }
             ?.let { best -> window.attributes = window.attributes.apply { preferredDisplayModeId = best.modeId } }
         GradeGl.probeHdr(this)
-        ShaderCache.warmUp(this)
         if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) watchdog()
         setContent { EditorScreen(vm) }
+        if (savedInstanceState == null) shared(intent)
+        // Older Adreno drivers (6xx, 2021) let one shader compile at a time across the whole app. Warming the large
+        // grade shader during launch kept the UI's own first frame waiting until Android closed the app, so the warm-up
+        // starts only once the first frame has reached the screen, and a little after.
+        ShaderCache.dir = java.io.File(cacheDir, "shaders")
+        val root = window.decorView
+        root.viewTreeObserver.registerFrameCommitCallback(object : Runnable {
+            override fun run() {
+                root.viewTreeObserver.unregisterFrameCommitCallback(this)
+                root.postDelayed({ ShaderCache.warmUp(this@MainActivity) }, 600)
+            }
+        })
     }
 
     /**
@@ -37,6 +51,7 @@ class MainActivity : ComponentActivity() {
      */
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
+        if (shared(intent)) return
         // Development builds only: debuggable, or the optimised "fast" build (profileable); never a release.
         val dev = applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0 || applicationInfo.isProfileableByShell
         if (!dev) return
@@ -52,6 +67,32 @@ class MainActivity : ComponentActivity() {
         val ext = getExternalFilesDir(null)?.canonicalPath
         if (f.exists() && (f.canonicalPath.startsWith(filesDir.canonicalPath) || (ext != null && f.canonicalPath.startsWith(ext))))
             vm.import(listOf(android.net.Uri.fromFile(f)))
+    }
+
+    /** Media shared to Graden opens in a new project. True if [intent] was a share. */
+    private fun shared(intent: android.content.Intent?): Boolean {
+        val uris = when (intent?.action) {
+            android.content.Intent.ACTION_SEND -> listOfNotNull(intent.parcelable(android.content.Intent.EXTRA_STREAM))
+            android.content.Intent.ACTION_SEND_MULTIPLE -> intent.parcelables(android.content.Intent.EXTRA_STREAM)
+            else -> return false
+        }
+        vm.openShared(uris)
+        return true
+    }
+
+    @Suppress("DEPRECATION")
+    private fun android.content.Intent.parcelable(key: String): android.net.Uri? =
+        if (android.os.Build.VERSION.SDK_INT >= 33) getParcelableExtra(key, android.net.Uri::class.java) else getParcelableExtra(key)
+
+    @Suppress("DEPRECATION")
+    private fun android.content.Intent.parcelables(key: String): List<android.net.Uri> =
+        (if (android.os.Build.VERSION.SDK_INT >= 33) getParcelableArrayListExtra(key, android.net.Uri::class.java) else getParcelableArrayListExtra(key)).orEmpty()
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // A foldable opened or closed: the same rule as at start.
+        requestedOrientation = if (newConfig.smallestScreenWidthDp >= 600) android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_USER
+            else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
     }
 
     override fun onStop() {
