@@ -444,10 +444,12 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             covers.forEach { thumbs.get(it, 0L) }
             while (elapsed() < 8000) {
                 val got = covers.count { thumbs.has(it, 0L) }
-                startupProgress = 0.35f + 0.35f * (if (covers.isEmpty()) 1f else got / covers.size.toFloat()) + (if (ShaderCache.ready) 0.3f else 0f)
-                if (ShaderCache.ready && got == covers.size) break
+                // The start never waits for the grade shaders: they are made in the background, and the preview shows
+                // the plain picture until they are ready.
+                startupProgress = 0.35f + 0.65f * (if (covers.isEmpty()) 1f else got / covers.size.toFloat())
+                if (got == covers.size) break
                 // Covers that cannot be read do not hold up the start for long.
-                if (ShaderCache.ready && elapsed() > 3000) break
+                if (elapsed() > 1500) break
                 kotlinx.coroutines.delay(30)
             }
             startupProgress = 1f
@@ -2827,6 +2829,25 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         syncLayers(false)
     }
 
+    /**
+     * The Sound page moves on to another clip's sound (picked on its own timeline). Everything changed on the page,
+     * across every clip, stays one undo step, and the cross still puts all of it back.
+     */
+    fun switchSound(id: Long) {
+        val l = locate(id) ?: return
+        if (l.trackId in lockedTracks || soundClipId == id) return
+        pause()
+        soundClipId = id
+        selectedClipId = id
+    }
+
+    /** The clips whose sound can be edited, lane by lane (top lane first): video with sound, and sound clips. */
+    val soundLanes: List<Pair<Track, List<Clip>>>
+        get() = tracks.asReversed().filter { !it.captions }.mapNotNull { t ->
+            val cs = t.clips.filter { c -> assets[c.assetId]?.let { it.hasAudio || it.isAudio } == true }
+            if (cs.isEmpty()) null else t to cs
+        }
+
     /** Plays the clip once, from its start, so the sound settings can be heard in place. */
     fun previewSound() {
         val c = soundClipId?.let(::locate)?.clip ?: return
@@ -3015,6 +3036,8 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     /** What the AI runs on here: the NPU when this phone supports it, else the CPU; corrected by what really ran. */
     var cinemaEngine by mutableStateOf(if (CinemaModels.hexagon != null) "NPU" else "CPU")
         private set
+    /** A foldable's fold, as Android reports it (null on other phones): for the tabletop layout. */
+    var fold by mutableStateOf<Fold?>(null)
     /** Where a tap landed, until focus has been worked out for it. */
     var cinemaPending by mutableStateOf<androidx.compose.ui.geometry.Offset?>(null)
         private set
@@ -4183,3 +4206,6 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         saver.close()
     }
 }
+
+/** A fold across the window: half open or flat, along the width (tabletop) or the height, and where it is in window pixels. */
+data class Fold(val halfOpen: Boolean, val horizontal: Boolean, val top: Int, val bottom: Int)

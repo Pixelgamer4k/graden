@@ -121,8 +121,10 @@ private class GlCore(name: String) {
         val uL = GLES20.glGetUniformLocation(id, "uL")
         val uTime = GLES20.glGetUniformLocation(id, "uTime")
     }
-    private lateinit var video: Prog
-    private lateinit var image: Prog
+    // Null until the grade programs are made (see ShaderCache.warmUp); meanwhile pictures are drawn plain.
+    private var video: Prog? = null
+    private var image: Prog? = null
+    private var seenGeneration = -1
     private lateinit var quad: FloatBuffer
     private val looks = GradeTextures()
     private val extras = FrameExtras()
@@ -169,9 +171,8 @@ private class GlCore(name: String) {
         context = EGL14.eglCreateContext(display, config, EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE), 0)
         pbuffer = EGL14.eglCreatePbufferSurface(display, config, intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
         EGL14.eglMakeCurrent(display, pbuffer, pbuffer, context)
-        video = Prog(ShaderCache.program(GradeShader.VERTEX, GradeShader.FRAGMENT))
-        // The same grade for a plain image texture.
-        image = Prog(ShaderCache.program(GradeShader.VERTEX, GradeShader.IMAGE_FRAGMENT))
+        // The grade programs, when they are made already; picked up later otherwise (see [graded]).
+        graded()
         copyOes = ShaderCache.program(GradeShader.VERTEX, FrameExtras.COPY_OES)
         copy2d = ShaderCache.program(GradeShader.VERTEX, FrameExtras.COPY_2D)
         // On ANGLE (Vulkan underneath: Samsung's Xclipse GPUs, among others) the full grade shader reading a video frame
@@ -298,7 +299,7 @@ private class GlCore(name: String) {
             val h = (1f / texelY).toInt().coerceIn(1, 4096)
             return drawQuad(frameCopy(tex, texM, w, h), IDENTITY_M, rect, grade, texelX, texelY, true, cm, look, layers)
         }
-        val p = if (still) image else video
+        val p = (if (still) image else video) ?: return drawPlain(tex, texM, rect, still)
         GLES20.glUseProgram(p.id)
         looks.bind(p.id, if (grade != null) look else null)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
@@ -317,6 +318,33 @@ private class GlCore(name: String) {
         extras.bindHistory(p.id, keepFrames)
         GLES20.glEnableVertexAttribArray(p.aPos)
         GLES20.glVertexAttribPointer(p.aPos, 2, GLES20.GL_FLOAT, false, 0, quad)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
+    /** True when the grade programs are here; looks for them again only when new ones have been made. */
+    private fun graded(): Boolean {
+        if (video != null && image != null) return true
+        val g = ShaderCache.generation
+        if (g == seenGeneration) return false
+        seenGeneration = g
+        if (video == null) ShaderCache.cached(GradeShader.VERTEX, GradeShader.FRAGMENT).takeIf { it != 0 }?.let { video = Prog(it) }
+        if (image == null) ShaderCache.cached(GradeShader.VERTEX, GradeShader.IMAGE_FRAGMENT).takeIf { it != 0 }?.let { image = Prog(it) }
+        if (video == null || image == null) { if (ShaderCache.ready) ShaderCache.need(); return false }
+        return true
+    }
+
+    /** The picture as it is, placed where it goes: shown only until the grade programs are ready. */
+    private fun drawPlain(tex: Int, texM: FloatArray, rect: FloatArray, still: Boolean) {
+        val p = if (still) copy2d else copyOes
+        GLES20.glUseProgram(p)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(if (still) GLES20.GL_TEXTURE_2D else GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(p, "uSrc"), 0)
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(p, "uTex"), 1, false, texM, 0)
+        GLES20.glUniform4fv(GLES20.glGetUniformLocation(p, "uRect"), 1, rect, 0)
+        val a = GLES20.glGetAttribLocation(p, "aPos")
+        GLES20.glEnableVertexAttribArray(a)
+        GLES20.glVertexAttribPointer(a, 2, GLES20.GL_FLOAT, false, 0, quad)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
 
@@ -339,12 +367,13 @@ private class GlCore(name: String) {
     /** Draws the view: its last frame, graded, placed by its fit/fill rule; then the scope copy if it feeds the scopes. */
     fun draw(v: GradedVideoView, surface: EGLSurface, tex: Int, texM: FloatArray, w: Int, h: Int, hasFrame: Boolean) {
         if (!EGL14.eglMakeCurrent(display, surface, surface, context)) return
+        graded()
         EGL14.eglSwapInterval(display, 0)
         GLES20.glViewport(0, 0, w, h)
         GLES20.glClearColor(0f, 0f, 0f, 0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         val grade = v.gradeUniforms
-        val still = v.stillTex
+        val still = v.shownStill
         // What this grade needs besides the frame: the blurred copy (halation, bloom, deflicker) and earlier frames.
         val look = v.look
         var layers = v.layers
@@ -476,7 +505,7 @@ private class GlCore(name: String) {
         }
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo)
         GLES20.glViewport(0, 0, w, h)
-        val still = v.stillTex
+        val still = v.shownStill
         // In HDR the scopes read the signal as the master has it (its own peak), not rolled off for this screen.
         val x = ColorSpaces.XF_SIZE
         val cm = v.cmUniforms.let { c -> if (c[x + 2] == ColorSpaces.PQG.code.toFloat()) c.copyOf().also { it[x + 5] = maxOf(it[x + 5], GradeGl.masterNits / 203f) } else c }
@@ -517,6 +546,7 @@ internal object GradeCore {
  */
 @SuppressLint("ViewConstructor")
 class GradedVideoView(context: Context, val key: String) : TextureView(context), TextureView.SurfaceTextureListener {
+    init { ShaderCache.watch(this) }
     /** Given the decoder's surface when it is ready (true), and again just before it goes away (false). */
     var onInput: ((Surface, Boolean) -> Unit)? = null
         set(v) {
@@ -549,6 +579,11 @@ class GradedVideoView(context: Context, val key: String) : TextureView(context),
     @Volatile private var stillShown: (() -> Unit)? = null
     /** The native frame's image texture (0: none); set and used on the GL thread. */
     @Volatile internal var stillTex = 0
+    /** A picture the player handed over (a picture clip), until the next video frame; GL thread. */
+    private var pictureTex = 0
+    private var pictureOn = false
+    /** What is drawn as a still: the native frame at rest, else a picture clip's picture. */
+    internal val shownStill: Int get() = if (stillTex != 0) stillTex else if (pictureOn) pictureTex else 0
     /** The stamp of the last video frame this view drew (the time the player released it for display). */
     @Volatile var lastFrameNs = 0L
         private set
@@ -569,7 +604,6 @@ class GradedVideoView(context: Context, val key: String) : TextureView(context),
         stab = track
         redraw()
     }
-    private val stillPaint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
     @Volatile var contentAspect = 0f
         private set
     @Volatile private var fill = false
@@ -636,15 +670,14 @@ class GradedVideoView(context: Context, val key: String) : TextureView(context),
         val c = core ?: return
         c.handler.post {
             if (core !== c) return@post
-            val t = inputTexture ?: return@post
-            val s = glInput ?: return@post
+            if (egl == null) return@post
+            // Kept on the GPU side as a texture, never drawn into the decoder's surface: on some drivers (Exynos, through
+            // ANGLE) a canvas stayed attached to that surface, so the next video never reached it and the picture
+            // showed on every clip after it. The picture is dropped the moment a video frame arrives.
             runCatching {
-                t.setDefaultBufferSize(bmp.width, bmp.height)
-                val cv = s.lockHardwareCanvas()
-                try {
-                    cv.drawColor(android.graphics.Color.BLACK, android.graphics.PorterDuff.Mode.SRC)
-                    cv.drawBitmap(bmp, null, android.graphics.Rect(0, 0, bmp.width, bmp.height), stillPaint)
-                } finally { s.unlockCanvasAndPost(cv) }
+                pictureTex = c.uploadStill(pictureTex, bmp)
+                pictureOn = true
+                drawNow()
             }.onFailure { android.util.Log.w("GradedVideoView", "picture not drawn", it) }
         }
     }
@@ -693,6 +726,7 @@ class GradedVideoView(context: Context, val key: String) : TextureView(context),
                     t.updateTexImage()
                     t.getTransformMatrix(texM)
                     hasFrame = true
+                    pictureOn = false
                     lastFrameNs = t.timestamp
                     drawNow()
                 }
@@ -756,7 +790,7 @@ class GradedVideoView(context: Context, val key: String) : TextureView(context),
  */
 internal object ShaderCache {
     private val lock = Any()
-    private val mem = HashMap<String, Pair<Int, ByteArray>>()
+    private val mem = ConcurrentHashMap<String, Pair<Int, ByteArray>>()
     @Volatile var dir: java.io.File? = null
 
     private fun compile(type: Int, src: String): Int {
@@ -785,8 +819,15 @@ internal object ShaderCache {
     private fun linked(p: Int): Boolean = IntArray(1).also { GLES20.glGetProgramiv(p, GLES20.GL_LINK_STATUS, it, 0) }[0] != 0
 
     /** A linked program for [vs] + [fs] in the current (ES 3) context. */
-    fun program(vs: String, fs: String): Int = synchronized(lock) {
-        val key = Integer.toHexString((vs + fs + GLES20.glGetString(GLES20.GL_RENDERER) + GLES20.glGetString(GLES20.GL_VERSION)).hashCode())
+    fun program(vs: String, fs: String): Int {
+        val key = key(vs, fs)
+        // One lock per program: two different programs can compile at the same time, each in its own context.
+        return synchronized(locks.getOrPut(key) { Any() }) { programLocked(vs, fs, key) }
+    }
+
+    private val locks = ConcurrentHashMap<String, Any>()
+
+    private fun programLocked(vs: String, fs: String, key: String): Int {
         val file = dir?.let { java.io.File(it, "$key.bin") }
         val saved = mem[key] ?: file?.takeIf { it.exists() }?.let { f ->
             runCatching { java.io.DataInputStream(f.inputStream().buffered()).use { val fmt = it.readInt(); fmt to it.readBytes() } }.getOrNull()
@@ -815,44 +856,178 @@ internal object ShaderCache {
                 val bytes = ByteArray(got[0]).also { buf.position(0); buf.get(it) }
                 mem[key] = fmt[0] to bytes
                 file?.let { f ->
+                    // Written aside and renamed: the other process may be reading the folder.
                     f.parentFile?.mkdirs()
-                    java.io.DataOutputStream(f.outputStream().buffered()).use { it.writeInt(fmt[0]); it.write(bytes) }
+                    val part = java.io.File(f.path + ".part" + Process.myPid())
+                    java.io.DataOutputStream(part.outputStream().buffered()).use { it.writeInt(fmt[0]); it.write(bytes) }
+                    if (!part.renameTo(f)) part.delete()
                 }
             }
         }
-        p
+        return p
     }
 
-    /** True once the preview's programs are ready (compiled, or loaded from the cache). */
+    private fun key(vs: String, fs: String) =
+        Integer.toHexString((vs + fs + GLES20.glGetString(GLES20.GL_RENDERER) + GLES20.glGetString(GLES20.GL_VERSION)).hashCode())
+
+    private fun load(saved: Pair<Int, ByteArray>): Int {
+        val p = GLES20.glCreateProgram()
+        val buf = ByteBuffer.allocateDirect(saved.second.size).order(ByteOrder.nativeOrder()).put(saved.second).also { it.position(0) }
+        android.opengl.GLES30.glProgramBinary(p, saved.first, buf, saved.second.size)
+        if (linked(p)) return p
+        GLES20.glDeleteProgram(p)
+        return 0
+    }
+
+    /**
+     * The program for [vs] + [fs] if it is already made (in memory, or saved on disk), else 0. Never compiles and never
+     * waits, so the preview can draw a plain picture meanwhile. Call on a GL thread.
+     */
+    fun cached(vs: String, fs: String): Int {
+        val key = key(vs, fs)
+        mem[key]?.let { s -> load(s).let { if (it != 0) return it } }
+        val f = dir?.let { java.io.File(it, "$key.bin") }?.takeIf { it.exists() } ?: return 0
+        val saved = runCatching { java.io.DataInputStream(f.inputStream().buffered()).use { val fmt = it.readInt(); fmt to it.readBytes() } }.getOrNull() ?: return 0
+        val p = load(saved)
+        if (p != 0) mem[key] = saved
+        return p
+    }
+
+    /**
+     * True once the preview's programs are ready (compiled, or loaded from the cache). The app's start never waits for
+     * this: the preview shows the plain picture until then.
+     */
     @Volatile var ready = false
         private set
+    /** Goes up each time new programs are on disk, so the previews look again. */
+    @Volatile var generation = 0
+        private set
 
+    private var app: Context? = null
     private var started = false
+    private val views = java.util.concurrent.CopyOnWriteArrayList<java.lang.ref.WeakReference<GradedVideoView>>()
 
-    /** Compiles (or loads) the preview's programs on a thread of their own, so the first project opens without a wait. */
-    fun warmUp(context: Context) {
-        dir = java.io.File(context.cacheDir, "shaders")
-        if (started) return
-        started = true
-        Thread({
-            runCatching {
-                val d = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
-                val v = IntArray(2)
-                EGL14.eglInitialize(d, v, 0, v, 1)
-                val configs = arrayOfNulls<EGLConfig>(1)
-                val n = IntArray(1)
-                EGL14.eglChooseConfig(d, intArrayOf(EGL14.EGL_RENDERABLE_TYPE, android.opengl.EGLExt.EGL_OPENGL_ES3_BIT_KHR, EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT, EGL14.EGL_NONE), 0, configs, 0, 1, n, 0)
-                val ctx = EGL14.eglCreateContext(d, configs[0], EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE), 0)
-                val pb = EGL14.eglCreatePbufferSurface(d, configs[0], intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
-                EGL14.eglMakeCurrent(d, pb, pb, ctx)
-                GLES20.glDeleteProgram(program(GradeShader.VERTEX, GradeShader.FRAGMENT))
-                GLES20.glDeleteProgram(program(GradeShader.VERTEX, GradeShader.IMAGE_FRAGMENT))
-                EGL14.eglMakeCurrent(d, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
-                EGL14.eglDestroySurface(d, pb)
-                SatCompTable.forget(ctx)
-                EGL14.eglDestroyContext(d, ctx)
-            }.onFailure { android.util.Log.w("GradeGl", "shader warm-up failed", it) }
-            ready = true
-        }, "shader-warmup").start()
+    /** The source of every preview program; the saved marker names it, so a new version of the app makes them again. */
+    private val sources: String by lazy { Integer.toHexString((GradeShader.VERTEX + GradeShader.FRAGMENT + GradeShader.IMAGE_FRAGMENT).hashCode()) }
+    private fun marker(c: Context) = java.io.File(java.io.File(c.cacheDir, "shaders"), "ready-" + sources)
+    private fun part(c: Context, which: String) = java.io.File(java.io.File(c.cacheDir, "shaders"), "part-$which-" + sources)
+
+    internal fun watch(v: GradedVideoView) { views.removeAll { it.get() == null }; views += java.lang.ref.WeakReference(v) }
+
+    private fun announce() {
+        generation++
+        views.forEach { it.get()?.redraw() }
     }
+
+    /**
+     * Makes sure the preview's programs will exist. They are compiled in a process of their own ([ShaderService]), so
+     * the GPU driver's lock is never held in the app's process: older Adreno drivers let only one shader compile at a
+     * time per process, and a long compile here kept the UI from drawing until Android closed the app. Already made
+     * for this version: nothing to do.
+     */
+    fun warmUp(context: Context) {
+        val c = context.applicationContext
+        app = c
+        dir = java.io.File(c.cacheDir, "shaders")
+        if (marker(c).exists()) { ready = true; return }
+        start(c)
+    }
+
+    /** A preview found its program missing though the marker said ready (a driver update, say): make them again. */
+    fun need() {
+        val c = app ?: return
+        synchronized(views) {
+            if (started) return
+            ready = false
+            marker(c).delete()
+            start(c)
+        }
+    }
+
+    private fun start(c: Context) {
+        synchronized(views) { if (started) return; started = true }
+        val mark = marker(c)
+        val failed = java.io.File(mark.parentFile, "failed")
+        failed.delete()
+        // Bound, not just started: a bound process runs at the app's own priority (an unbound one is treated as
+        // background and given the slow cores: the compile took 32 s instead of 5 s).
+        val conn = object : android.content.ServiceConnection {
+            override fun onServiceConnected(name: android.content.ComponentName?, service: android.os.IBinder?) {}
+            override fun onServiceDisconnected(name: android.content.ComponentName?) {}
+        }
+        // Two processes, one program each: the driver lets only one compile at a time per process, so this halves the wait.
+        val parts = listOf(ShaderService::class.java to part(c, "v"), ShaderImageService::class.java to part(c, "i"))
+        parts.forEach { it.second.delete() }
+        val viaService = parts.all { (cls, _) ->
+            runCatching { c.bindService(android.content.Intent(c, cls), conn, Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT) }.getOrDefault(false)
+        }
+        Thread({
+            // Waits for the other processes; if they can't (they failed, or never ran), compiles here after all.
+            val t0 = SystemClock.uptimeMillis()
+            while (viaService && !parts.all { it.second.exists() } && !failed.exists() && SystemClock.uptimeMillis() - t0 < 180_000) Thread.sleep(150)
+            if (parts.all { it.second.exists() }) { mark.writeText("ok"); parts.forEach { it.second.delete() } }
+            if (viaService) runCatching { c.unbindService(conn) }
+            if (!mark.exists()) compileAll(c)
+            ready = true
+            synchronized(views) { started = false }
+            announce()
+        }, "shader-wait").apply { isDaemon = true }.start()
+    }
+
+    /** Compiles (or loads) the preview's programs in a context of its own, then writes the marker. Blocks. */
+    internal fun compileAll(c: Context, only: String? = null) {
+        dir = java.io.File(c.cacheDir, "shaders")
+        fun one(fs: String): Boolean = runCatching {
+            val d = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+            val v = IntArray(2)
+            EGL14.eglInitialize(d, v, 0, v, 1)
+            val configs = arrayOfNulls<EGLConfig>(1)
+            val n = IntArray(1)
+            EGL14.eglChooseConfig(d, intArrayOf(EGL14.EGL_RENDERABLE_TYPE, android.opengl.EGLExt.EGL_OPENGL_ES3_BIT_KHR, EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT, EGL14.EGL_NONE), 0, configs, 0, 1, n, 0)
+            val ctx = EGL14.eglCreateContext(d, configs[0], EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE), 0)
+            val pb = EGL14.eglCreatePbufferSurface(d, configs[0], intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
+            EGL14.eglMakeCurrent(d, pb, pb, ctx)
+            val p = program(GradeShader.VERTEX, fs)
+            GLES20.glDeleteProgram(p)
+            EGL14.eglMakeCurrent(d, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+            EGL14.eglDestroySurface(d, pb)
+            SatCompTable.forget(ctx)
+            EGL14.eglDestroyContext(d, ctx)
+            p != 0
+        }.onFailure { android.util.Log.w("GradeGl", "shader warm-up failed", it) }.getOrDefault(false)
+        if (only != null) {
+            // One program, in one of the shader processes: its part marker says it is done.
+            val ok = one(if (only == "v") GradeShader.FRAGMENT else GradeShader.IMAGE_FRAGMENT)
+            val f = if (ok) part(c, only) else java.io.File(marker(c).parentFile, "failed")
+            f.parentFile?.mkdirs()
+            f.writeText(if (ok) "ok" else "failed")
+            return
+        }
+        val ok = one(GradeShader.FRAGMENT) && one(GradeShader.IMAGE_FRAGMENT)
+        val mark = marker(c)
+        mark.parentFile?.mkdirs()
+        // Old markers (earlier versions of the shaders) go.
+        mark.parentFile?.listFiles()?.forEach { if (it.name.startsWith("ready-") && it.name != mark.name) it.delete() }
+        if (ok) mark.writeText("ok") else java.io.File(mark.parentFile, "failed").writeText("failed")
+    }
+}
+
+/** Compiles the preview's video program in a process of its own (see [ShaderCache.warmUp]), then ends that process. */
+open class ShaderService : android.app.Service() {
+    protected open val which = "v"
+    override fun onCreate() {
+        super.onCreate()
+        Thread({
+            Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT)
+            ShaderCache.compileAll(applicationContext, which)
+            // The app unbinds once it sees the marker; this process has nothing more to do.
+            Process.killProcess(Process.myPid())
+        }, "shader-compile").start()
+    }
+    override fun onBind(intent: android.content.Intent?): android.os.IBinder = android.os.Binder()
+}
+
+/** The same for the picture program, in a second process, so both compile at once. */
+class ShaderImageService : ShaderService() {
+    override val which = "i"
 }

@@ -1,5 +1,7 @@
 package com.graden.editor.ui
 
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.composed
 import androidx.compose.runtime.rememberUpdatedState
 
 import androidx.compose.ui.graphics.drawscope.rotate
@@ -56,7 +58,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.displayCutoutPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
@@ -81,6 +85,7 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.unit.IntOffset
 import com.graden.editor.MediaAsset
 import kotlin.math.roundToInt
@@ -136,6 +141,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.PathEffect
@@ -203,6 +209,10 @@ fun EditorScreen(vm: EditorViewModel) {
     var dragPos by remember { mutableStateOf(Offset.Zero) }
     var timelineBounds by remember { mutableStateOf(Rect.Zero) }
     var settingsOpen by remember { mutableStateOf(false) }
+    // Where the editor sits in the window (to place a fold), and how much of a tablet's height the timeline takes.
+    var originY by remember { mutableFloatStateOf(0f) }
+    var timelineShare by androidx.compose.runtime.saveable.rememberSaveable { mutableFloatStateOf(0.4f) }
+    var sideShare by androidx.compose.runtime.saveable.rememberSaveable { mutableFloatStateOf(0.42f) }
     // Tapping the Edit tab opens its tools above the tab bar; tapping it again folds them away.
 
     // A light tick when a dragged clip clicks into a slot, a firmer one when it is dropped.
@@ -242,12 +252,43 @@ fun EditorScreen(vm: EditorViewModel) {
         }
     }
 
+    val media: @Composable (Boolean) -> Unit = { docked ->
+            MediaWindow(
+                vm, dragging = dragAsset != null || dragText != null, onImport = import,
+                onDragStart = { a, pos ->
+                    dragAsset = a
+                    dragPos = pos
+                    vm.mediaBoxOpen = false
+                },
+                onTextDragStart = { cap, pos ->
+                    dragText = cap
+                    dragPos = pos
+                    vm.mediaBoxOpen = false
+                },
+                onDrag = { d ->
+                    dragPos += d
+                    hover()
+                },
+                onDragEnd = {
+                    // A file from another project joins this one as it is dropped.
+                    dragAsset?.let { a -> if (vm.drop != null) vm.dropAsset(if (vm.assets[a.id]?.uri == a.uri) a else vm.adopt(a)) }
+                    dragText?.let { if (vm.drop != null) vm.dropText(it) }
+                    vm.clearDrop()
+                    vm.settle()
+                    dragAsset = null
+                    dragText = null
+                },
+                docked = docked,
+            )
+    }
+    var mediaDocked by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxSize().background(Palette.Bg)) {
         val topBar: @Composable () -> Unit = {
             when {
                 vm.colorOpen -> ColorTopBar(vm)
                 vm.stabOpen -> StabTopBar(vm)
                 vm.cinemaOpen -> CinemaTopBar(vm)
+                vm.soundClipId != null -> SoundTopBar(vm)
                 else -> HostBar(vm, soon, onClose = { vm.closeProject() }, onSettings = { settingsOpen = true })
             }
         }
@@ -256,65 +297,151 @@ fun EditorScreen(vm: EditorViewModel) {
                 vm.colorOpen -> ColorBody(vm, Modifier.weight(1f))
                 vm.stabOpen -> StabBody(vm, Modifier.weight(1f))
                 vm.cinemaOpen -> CinemaBody(vm, Modifier.weight(1f))
+                vm.soundClipId != null -> SoundBody(vm, soon, Modifier.fillMaxWidth().weight(1f))
                 else -> EditBody(vm, soon) { timelineBounds = it }
             }
         }
-        BoxWithConstraints(Modifier.fillMaxSize().systemBarsPadding()) {
-            // A tablet on its side: the picture on the left, as tall as the screen; the tools and timeline beside it.
-            if (maxWidth > maxHeight && maxWidth >= 840.dp) Row(Modifier.fillMaxSize()) {
-                Column(Modifier.weight(1.15f).fillMaxHeight()) {
+        BoxWithConstraints(Modifier.fillMaxSize().systemBarsPadding().displayCutoutPadding().onGloballyPositioned { originY = it.positionInWindow().y }) {
+            // The layout follows the window, never the device: rotating, folding, split screen and resizing all just
+            // measure again. Every size is a share of the window with limits, so screens a little bigger or smaller,
+            // or a fold a little off centre, still come out right.
+            val w = maxWidth
+            val h = maxHeight
+            val fold = vm.fold
+            val modes = vm.colorOpen || vm.stabOpen || vm.cinemaOpen || vm.soundClipId != null
+            val shape = when {
+                // Half open with the fold across: the picture above it, the controls below (laptop or flex mode).
+                fold != null && fold.halfOpen && fold.horizontal && h >= 400.dp -> EditorLayout.TABLETOP
+                // A flip phone's cover screen or a tiny window: watching only.
+                w < 480.dp && h < 480.dp -> EditorLayout.MINI
+                // Not tall enough to stack: a phone on its side, or a short split-screen window.
+                h < 480.dp -> EditorLayout.SIDE
+                w < 600.dp -> EditorLayout.PHONE
+                // Open foldables (nearly square) and tablets on their side.
+                w / h >= 0.8f -> EditorLayout.STUDIO
+                // Tablets upright.
+                else -> EditorLayout.TALL
+            }
+            // Stabilize and Cinema bring their own page; Color opens in the tablet layout's side panel instead.
+            val pages = vm.stabOpen || vm.cinemaOpen
+            SideEffect { mediaDocked = (shape == EditorLayout.STUDIO && !pages) || (shape == EditorLayout.SIDE && !modes) }
+            LaunchedEffect(shape, w, h) { android.util.Log.i("GradenLayout", "$shape ${w.value.toInt()}x${h.value.toInt()} dp") }
+            val line = Color(0xFF1C1E24)
+            when (shape) {
+                EditorLayout.PHONE -> Column(Modifier.fillMaxSize()) {
                     topBar()
-                    Preview(vm, Modifier.weight(1f).fillMaxWidth())
+                    Preview(vm)
+                    body()
                 }
-                Box(Modifier.width(1.dp).fillMaxHeight().background(Color(0xFF1C1E24)))
-                Column(Modifier.weight(1f).fillMaxHeight()) { body() }
-            } else Column(Modifier.fillMaxSize()) {
-                topBar()
-                Preview(vm)
-                body()
+                EditorLayout.TALL -> Column(Modifier.fillMaxSize()) {
+                    topBar()
+                    // Upright tablet: the picture as tall as its shape needs at the full width, but never more than half
+                    // the screen (a third while a page like Color needs the room), so the timeline and tools keep theirs.
+                    val need = w / vm.meta.aspect.coerceAtLeast(0.4f) + 8.dp
+                    Preview(vm, Modifier.fillMaxWidth().height(need.coerceIn(h * 0.28f, h * (if (modes) 0.38f else 0.5f))))
+                    body()
+                }
+                EditorLayout.SIDE -> {
+                    // A phone on its side, or any short window, as rounded panes on a darker ground so each part reads on
+                    // its own. Left: the picture, then the playback bar and the timeline. Right: the media (under half)
+                    // and the clip's tools as a grid; an open page (Color, Sound, Stabilize, Cinema) takes the whole right.
+                    val panelW = (w * 0.42f).coerceIn(300.dp, 440.dp)
+                    val hPx = with(LocalDensity.current) { h.toPx() }
+                    Row(Modifier.fillMaxSize().background(Ground).padding(5.dp), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                            Column(Modifier.fillMaxWidth().weight(if (pages) 1f else 1f - sideShare).pane()) {
+                                topBar()
+                                Preview(vm, Modifier.weight(1f).fillMaxWidth())
+                            }
+                            if (!pages) Column(Modifier.fillMaxWidth().weight(sideShare).pane()) {
+                                Toolbar(vm, soon, tools = false, compact = true)
+                                Box(
+                                    Modifier.fillMaxWidth().height(10.dp)
+                                        .resizeBar(hPx, sideShare, 0.28f, 0.62f) { sideShare = it },
+                                    contentAlignment = Alignment.Center,
+                                ) { Box(Modifier.size(32.dp, 3.dp).clip(RoundedCornerShape(2.dp)).background(Color(0xFF3A3D47))) }
+                                Column(Modifier.fillMaxWidth().weight(1f)) { EditBody(vm, soon, tools = false, transport = false) { timelineBounds = it } }
+                            }
+                        }
+                        Column(Modifier.width(panelW).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                            when {
+                                // An open page takes the whole right side, media included; closing it brings them back.
+                                vm.colorOpen -> ColorSidePanel(vm, Modifier.fillMaxSize().pane())
+                                vm.soundClipId != null -> SoundBody(vm, soon, Modifier.fillMaxSize().pane(), strip = false)
+                                pages -> Column(Modifier.fillMaxSize().pane()) { body() }
+                                else -> {
+                                    Box(Modifier.fillMaxWidth().weight(0.45f).pane()) { media(true) }
+                                    ToolPanel(vm, soon, Modifier.fillMaxWidth().weight(0.55f).pane())
+                                }
+                            }
+                        }
+                    }
+                }
+                EditorLayout.MINI -> Column(Modifier.fillMaxSize()) {
+                    Preview(vm, Modifier.weight(1f).fillMaxWidth())
+                    Transport(vm)
+                    Text("Open the phone or make the window bigger to edit", color = Palette.TextDim, fontSize = 11.sp,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(6.dp))
+                }
+                EditorLayout.TABLETOP -> {
+                    val d = LocalDensity.current
+                    val top = with(d) { (fold!!.top - originY).toDp() }.coerceIn(h * 0.3f, h * 0.7f)
+                    val gap = with(d) { (fold!!.bottom - fold.top).toDp() }.coerceIn(0.dp, 48.dp)
+                    Column(Modifier.fillMaxSize()) {
+                        Column(Modifier.fillMaxWidth().height(top)) {
+                            topBar()
+                            Preview(vm, Modifier.weight(1f).fillMaxWidth())
+                        }
+                        Spacer(Modifier.height(gap))
+                        Column(Modifier.fillMaxWidth().weight(1f)) { body() }
+                    }
+                }
+                // Nearly square (an open foldable): side by side would leave the picture small, so Color, Stabilize and
+                // Cinema stack instead, the picture the full width on top.
+                EditorLayout.STUDIO -> if (pages && w / h < 1.3f) Column(Modifier.fillMaxSize()) {
+                    topBar()
+                    Preview(vm, Modifier.fillMaxWidth().height(h * 0.42f))
+                    body()
+                } else if (pages) Row(Modifier.fillMaxSize()) {
+                    // Color, Stabilize and Cinema bring their own timeline: picture left, the page beside it.
+                    Column(Modifier.weight(1f).fillMaxHeight()) {
+                        topBar()
+                        Preview(vm, Modifier.weight(1f).fillMaxWidth())
+                    }
+                    Box(Modifier.width(1.dp).fillMaxHeight().background(line))
+                    Column(Modifier.width((w * 0.42f).coerceIn(340.dp, 560.dp)).fillMaxHeight()) { body() }
+                } else {
+                    Studio(vm, soon, w, h, timelineShare, { timelineShare = it }, topBar, { media(true) }) { timelineBounds = it }
+                }
             }
         }
         if (vm.colorOpen) ColorOverlays(vm)
-        TransitionSheet(vm, Modifier.align(Alignment.BottomCenter))
+        // While a resize bar is held: a line where it will go. The layout itself changes once, when it is let go, so the
+        // picture's video surface is never resized frame by frame (that was what made dragging stutter).
+        Box(Modifier.fillMaxSize().drawBehind {
+            val y = ResizeGhost.y ?: return@drawBehind
+            drawRect(Color.Black.copy(alpha = 0.18f))
+            drawLine(Palette.Accent, Offset(0f, y), Offset(size.width, y), 3.dp.toPx())
+            drawRoundRect(Palette.Accent, Offset(size.width / 2 - 26.dp.toPx(), y - 3.dp.toPx()), androidx.compose.ui.geometry.Size(52.dp.toPx(), 6.dp.toPx()),
+                androidx.compose.ui.geometry.CornerRadius(3.dp.toPx()))
+        })
+        Panel { Box(Modifier.fillMaxSize()) { TransitionSheet(vm, Modifier.align(Alignment.BottomCenter)) } }
         SavedNote(vm, Modifier.align(Alignment.TopCenter))
         if (vm.trimSession != null) TrimPage(vm)
         if (vm.cropSession != null) CropPage(vm, soon)
-        if (vm.soundClipId != null) SoundPage(vm, soon)
-        if (vm.exportOpen) ExportScreen(vm)
-        CaptionSheet(vm)
+        if (vm.exportOpen) Panel { ExportScreen(vm) }
+        Panel { CaptionSheet(vm) }
         CaptionEditDialog(vm)
-        TextPanel(vm)
-        ProjectSheet(settingsOpen, vm.meta, onClose = { settingsOpen = false }, onDone = {
-            settingsOpen = false
-            vm.updateMeta(it)
-        }, modifier = Modifier.align(Alignment.BottomCenter))
-        MediaWindow(
-            vm, dragging = dragAsset != null || dragText != null, onImport = import,
-            onDragStart = { a, pos ->
-                dragAsset = a
-                dragPos = pos
-                vm.mediaBoxOpen = false
-            },
-            onTextDragStart = { cap, pos ->
-                dragText = cap
-                dragPos = pos
-                vm.mediaBoxOpen = false
-            },
-            onDrag = { d ->
-                dragPos += d
-                hover()
-            },
-            onDragEnd = {
-                // A file from another project joins this one as it is dropped.
-                dragAsset?.let { a -> if (vm.drop != null) vm.dropAsset(if (vm.assets[a.id]?.uri == a.uri) a else vm.adopt(a)) }
-                dragText?.let { if (vm.drop != null) vm.dropText(it) }
-                vm.clearDrop()
-                vm.settle()
-                dragAsset = null
-                dragText = null
-            },
-        )
-        ImportWindow(vm)
+        Panel { TextPanel(vm) }
+        Panel { Box(Modifier.fillMaxSize()) {
+            ProjectSheet(settingsOpen, vm.meta, onClose = { settingsOpen = false }, onDone = {
+                settingsOpen = false
+                vm.updateMeta(it)
+            }, modifier = Modifier.align(Alignment.BottomCenter))
+        } }
+        // On a tablet the media sits docked in the layout; the sliding window is the phone's.
+        if (!mediaDocked) Panel { media(false) }
+        Panel { ImportWindow(vm) }
         // The item being dragged out of the media window stays centred under the fingertip, above
         // everything else, and shrinks once it is over a place it can be dropped.
         dragText?.let { cap ->
@@ -354,11 +481,63 @@ fun EditorScreen(vm: EditorViewModel) {
     }
 }
 
+/**
+ * Where a page that slides up (Sound, Media, Export, text, transitions, project settings) sits. On a phone: the whole
+ * width, as designed. On a wide window (tablet, open foldable): a panel down the right edge, at a width a hand can work,
+ * with the picture still in view; on an upright tablet: centred, no wider than a large phone.
+ */
+@Composable
+private fun Panel(content: @Composable () -> Unit) {
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val w = maxWidth
+        val h = maxHeight
+        when {
+            w < 720.dp -> content()
+            w / h >= 0.8f -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopEnd) {
+                Box(Modifier.fillMaxHeight().width((w * 0.4f).coerceIn(380.dp, 520.dp))) { content() }
+            }
+            else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+                Box(Modifier.fillMaxHeight().widthIn(max = 640.dp)) { content() }
+            }
+        }
+    }
+}
+
+/** The darker ground the panes sit on, and a pane: a rounded card a shade lighter, with a hairline edge. */
+private val Ground = Color(0xFF07080A)
+private val PaneShape = RoundedCornerShape(14.dp)
+private fun Modifier.pane(): Modifier = this.clip(PaneShape).background(Color(0xFF131419)).border(1.dp, Color(0xFF26282F), PaneShape)
+
+/** Where the resize line is drawn while a bar is held (window y), or null. */
+private object ResizeGhost { var y by mutableStateOf<Float?>(null) }
+
+/** A bar that sets, live while dragged, how much of [hPx] the part under it takes ([share], within [lo]..[hi]). */
+private fun Modifier.resizeBar(hPx: Float, share: Float, lo: Float, hi: Float, onShare: (Float) -> Unit): Modifier = composed {
+    val now by rememberUpdatedState(share)
+    val set by rememberUpdatedState(onShare)
+    val view = LocalView.current
+    pointerInput(hPx) {
+        var dy = 0f
+        var start = 0f
+        detectDragGestures(
+            onDragStart = { dy = 0f; start = now; view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY) },
+        ) { ch, d ->
+            ch.consume()
+            // Live: the parts resize under the finger as it moves.
+            dy += d.y
+            set((start - dy / hPx).coerceIn(lo, hi))
+        }
+    }
+}
+
+/** How the editor is arranged for the window it has (see EditorScreen). */
+private enum class EditorLayout { PHONE, TALL, SIDE, MINI, TABLETOP, STUDIO }
+
 /** The edit page under the preview: transport, timeline, and the tools for what is selected. */
 @Composable
-private fun ColumnScope.EditBody(vm: EditorViewModel, soon: (String) -> Unit, onTimelineBounds: (Rect) -> Unit) {
+private fun ColumnScope.EditBody(vm: EditorViewModel, soon: (String) -> Unit, tools: Boolean = true, transport: Boolean = true, onTimelineBounds: (Rect) -> Unit) {
     com.graden.editor.RecomposeProbe.hit("EditBody")
-    Transport(vm)
+    if (transport) Transport(vm)
     Box(Modifier.fillMaxWidth().weight(1f).onGloballyPositioned { onTimelineBounds(it.boundsInRoot()) }) {
         TimelineView(vm, Modifier.fillMaxSize())
         if (vm.totalUs == 0L && vm.drop == null) Text(
@@ -367,7 +546,7 @@ private fun ColumnScope.EditBody(vm: EditorViewModel, soon: (String) -> Unit, on
         )
     }
     // One panel only, and only while something is selected: its tools are the ones that make sense for it.
-    AnimatedVisibility(vm.selection != Selection.NONE, enter = expandVertically(spring(0.8f, 500f)) + fadeIn(), exit = shrinkVertically(spring(0.9f, 600f)) + fadeOut()) {
+    AnimatedVisibility(tools && vm.selection != Selection.NONE, enter = expandVertically(spring(0.8f, 500f)) + fadeIn(), exit = shrinkVertically(spring(0.9f, 600f)) + fadeOut()) {
         Tools(vm, soon)
     }
 }
@@ -544,7 +723,7 @@ private fun Preview(vm: EditorViewModel, wide: Modifier? = null) {
     // A square area, the canvas centred in it at its own shape: wide canvases with bars above and below, tall ones (reels)
     // with bars at the sides, so a tall canvas gets the whole height. While grading the scopes and wheels need the room,
     // so the area is wide there.
-    val areaAspect = if (vm.colorOpen || vm.stabOpen || vm.cinemaOpen) maxOf(canvasAspect, 1.78f) else 1f
+    val areaAspect = if (vm.colorOpen || vm.stabOpen || vm.cinemaOpen || vm.soundClipId != null) maxOf(canvasAspect, 1.78f) else 1f
     PreviewArea(vm, Modifier.fillMaxWidth().aspectRatio(areaAspect), areaAspect)
 }
 
@@ -1003,10 +1182,11 @@ private class DeckUnit(val u: androidx.compose.ui.unit.Dp, private val density: 
  *  - the deck: the playback controls truly centred, undo and redo at the right edge.
  */
 @Composable
-private fun TransportRow(vm: EditorViewModel) {
+private fun TransportRow(vm: EditorViewModel, deck: Boolean = true) {
     com.graden.editor.RecomposeProbe.hit("TransportRow")
     BoxWithConstraints(Modifier.fillMaxWidth().background(Color(0xFF111217))) {
-        val k = DeckUnit(maxWidth / 400f, LocalDensity.current)
+        // Capped, so on a tablet or open foldable the deck stays phone-sized instead of growing with the width.
+        val k = DeckUnit(maxWidth.coerceAtMost(440.dp) / 400f, LocalDensity.current)
         Column(Modifier.fillMaxWidth()) {
             Row(
                 Modifier.fillMaxWidth().height(k.dp(26f)).padding(horizontal = k.dp(14f)),
@@ -1022,7 +1202,7 @@ private fun TransportRow(vm: EditorViewModel) {
                 Spacer(Modifier.width(k.dp(6f)))
                 SourceTag(vm, k)
             }
-            Box(Modifier.fillMaxWidth().height(k.dp(56f)).padding(horizontal = k.dp(10f))) {
+            if (deck) Box(Modifier.fillMaxWidth().height(k.dp(56f)).padding(horizontal = k.dp(10f))) {
                 Row(Modifier.align(Alignment.Center), horizontalArrangement = Arrangement.spacedBy(k.dp(10f)), verticalAlignment = Alignment.CenterVertically) {
                     DeckButton(Lucide.PrevCut, "Previous cut", k) { vm.jumpClip(-1) }
                     DeckButton(Lucide.FrameBack, "Back one frame", k) { vm.stepFrames(-1) }
@@ -1046,6 +1226,221 @@ private fun TransportRow(vm: EditorViewModel) {
                 }
             }
             Box(Modifier.fillMaxWidth().height(1.dp).background(Palette.Line))
+        }
+    }
+}
+
+/** Where the player sits in the tablet layout; the Layout button moves it. Kept for next time. */
+private enum class PlayerSpot { CENTER, LEFT, RIGHT, FULL }
+
+/**
+ * The tablet and open-foldable editor, as desktop editors and CapCut Pad have it: the media docked on one side, the
+ * player, and the selected clip's tools beside it; under them one toolbar (clip tools, playback, undo) and the timeline
+ * the full width at the bottom, where the hands are, its height dragged by the bar above it. The Layout button puts the
+ * player in the middle, on the left, on the right, or across the whole top. A tall canvas (a reel) gets a player the
+ * full height of the screen at one side instead. Every width is a share of the window with limits, so any screen fits.
+ */
+@Composable
+private fun Studio(
+    vm: EditorViewModel, soon: (String) -> Unit, w: androidx.compose.ui.unit.Dp, h: androidx.compose.ui.unit.Dp,
+    share: Float, onShare: (Float) -> Unit, topBar: @Composable () -> Unit, media: @Composable () -> Unit, onTimelineBounds: (Rect) -> Unit,
+) {
+    val ctx = LocalContext.current
+    val prefs = remember { ctx.getSharedPreferences("layout", android.content.Context.MODE_PRIVATE) }
+    var spot by remember { mutableStateOf(runCatching { PlayerSpot.valueOf(prefs.getString("player", "CENTER")!!) }.getOrDefault(PlayerSpot.CENTER)) }
+    fun place(p: PlayerSpot) { spot = p; prefs.edit().putString("player", p.name).apply() }
+    // The media and the tools can change sides.
+    var swapped by remember { mutableStateOf(prefs.getBoolean("swapped", false)) }
+    val tall = vm.meta.aspect < 0.8f
+    val line = Color(0xFF1C1E24)
+    // Narrower screens (open foldables) leave out the side panel; its tools move into the toolbar.
+    val roomy = w >= 1000.dp
+    val mediaW = (w * 0.25f).coerceIn(230.dp, 360.dp)
+    val sideW = (w * 0.2f).coerceIn(220.dp, 300.dp)
+    // Color open: its panel takes the side (on a narrower screen, the media's place), wide enough for the wheels.
+    val grading = vm.colorOpen
+    // Sound opens in the same place as Color: the panel, with the picture and the editor's timeline still in view.
+    val sounding = !grading && vm.soundClipId != null
+    val page: @Composable (Modifier) -> Unit = { m -> if (grading) ColorSidePanel(vm, m) else SoundBody(vm, soon, m, strip = false) }
+    val colorW = (w * (if (roomy) 0.28f else 0.44f)).coerceIn(330.dp, 440.dp)
+    val hPx = with(LocalDensity.current) { h.toPx() }
+    var menu by remember { mutableStateOf(false) }
+    // While grading the wheels need the height: the timeline keeps a smaller share unless dragged bigger then.
+    var gradeShare by remember { mutableFloatStateOf(0.42f) }
+    val share = if (grading || sounding) gradeShare else share
+    val onShare: (Float) -> Unit = if (grading || sounding) ({ gradeShare = it }) else onShare
+    // Panes stand apart by the gaps between them now, not by lines.
+    val vline: @Composable () -> Unit = {}
+    val inspector: @Composable () -> Unit = {
+        if (grading || sounding) page(Modifier.width(colorW).fillMaxHeight().pane()) else ToolPanel(vm, soon, Modifier.width(sideW).fillMaxHeight().pane())
+    }
+    // On a narrower screen the media column makes way for Color while grading.
+    val side: @Composable () -> Unit = {
+        if ((grading || sounding) && !roomy) page(Modifier.width(colorW).fillMaxHeight().pane()) else Box(Modifier.width(mediaW).fillMaxHeight().pane()) { media() }
+    }
+    val player: @Composable (Modifier) -> Unit = { m -> Preview(vm, m.pane()) }
+    val bottom: @Composable ColumnScope.() -> Unit = {
+        Toolbar(vm, soon, tools = !roomy)
+        Box(
+            Modifier.fillMaxWidth().height(14.dp).background(Color(0xFF0E0F13))
+                .resizeBar(hPx, share, 0.25f, 0.62f, onShare),
+            contentAlignment = Alignment.Center,
+        ) { Box(Modifier.size(36.dp, 4.dp).clip(RoundedCornerShape(2.dp)).background(Color(0xFF3A3D47))) }
+        Column(Modifier.fillMaxWidth().weight(1f)) { EditBody(vm, soon, tools = false, transport = false, onTimelineBounds = onTimelineBounds) }
+    }
+    Column(Modifier.fillMaxSize()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.weight(1f)) { topBar() }
+            Box {
+                Row(
+                    Modifier.padding(end = 10.dp).clip(RoundedCornerShape(10.dp)).background(Color(0xFF1C1D24)).clickable { menu = true }
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Lucide.SplitView, null, tint = Palette.Text, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Layout", color = Palette.Text, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                }
+                androidx.compose.material3.DropdownMenu(menu, { menu = false }, containerColor = Color(0xFF1C1D24)) {
+                    val options = if (tall) listOf(PlayerSpot.RIGHT to "Player on the right", PlayerSpot.LEFT to "Player on the left")
+                    else listOf(PlayerSpot.CENTER to "Player in the middle", PlayerSpot.LEFT to "Player on the left",
+                        PlayerSpot.RIGHT to "Player on the right", PlayerSpot.FULL to "Player across the top")
+                    for ((p, label) in options) androidx.compose.material3.DropdownMenuItem(
+                        { Text(label, color = if (p == spot) Palette.Accent else Palette.Text, fontSize = 14.sp) },
+                        { place(p); menu = false },
+                        trailingIcon = { if (p == spot) Icon(Lucide.Check, null, tint = Palette.Accent, modifier = Modifier.size(16.dp)) },
+                    )
+                    if (roomy) androidx.compose.material3.DropdownMenuItem(
+                        { Text(if (swapped) "Media left, tools right" else "Tools left, media right", color = Palette.Text, fontSize = 14.sp) },
+                        { swapped = !swapped; prefs.edit().putBoolean("swapped", swapped).apply(); menu = false },
+                        leadingIcon = { Icon(Lucide.ArrowUpDown, null, tint = Palette.TextDim, modifier = Modifier.size(16.dp)) },
+                    )
+                }
+            }
+        }
+        if (tall) {
+            // A reel: the player the full height at one side, at its own shape; everything else beside it.
+            val pw = (h * vm.meta.aspect.coerceAtLeast(0.3f) + 8.dp).coerceAtMost(w * 0.42f)
+            val rest: @Composable RowScope.() -> Unit = {
+                Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Row(Modifier.fillMaxWidth().weight(1f - share), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                        if (roomy && swapped) { inspector(); vline() }
+                        if ((grading || sounding) && !roomy) page(Modifier.weight(1f).fillMaxHeight().pane())
+                        else Box(Modifier.weight(1f).fillMaxHeight().pane()) { media() }
+                        if (roomy && !swapped) { vline(); inspector() }
+                    }
+                    Column(Modifier.fillMaxWidth().weight(share).pane()) { bottom() }
+                }
+            }
+            Row(Modifier.fillMaxSize().background(Ground).padding(5.dp), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                if (spot == PlayerSpot.LEFT) { player(Modifier.width(pw).fillMaxHeight()); vline(); rest() }
+                else { rest(); vline(); player(Modifier.width(pw).fillMaxHeight()) }
+            }
+        } else if (grading || sounding) {
+            // Color or Sound open: the page takes a whole side, top to bottom, so the wheels, scopes and waveform get the
+            // height; the picture and the timeline share the other side, the timeline only under the picture.
+            val pageW = (w * 0.42f).coerceIn(380.dp, 640.dp)
+            val pageSide: @Composable () -> Unit = { page(Modifier.width(pageW).fillMaxHeight().pane()) }
+            Row(Modifier.fillMaxSize().background(Ground).padding(5.dp), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                if (swapped) pageSide()
+                Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    player(Modifier.fillMaxWidth().weight(1f - share))
+                    Column(Modifier.fillMaxWidth().weight(share).pane()) { bottom() }
+                }
+                if (!swapped) pageSide()
+            }
+        } else Column(Modifier.fillMaxSize().background(Ground).padding(5.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            Row(Modifier.fillMaxWidth().weight(1f - share), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                // The two panels in their chosen order (media first, or tools first when swapped).
+                val first: @Composable () -> Unit = if (swapped && roomy) inspector else side
+                val second: (@Composable () -> Unit)? = if (!roomy) null else if (swapped) side else inspector
+                when (spot) {
+                    PlayerSpot.CENTER -> {
+                        first(); vline()
+                        player(Modifier.weight(1f).fillMaxHeight())
+                        second?.let { vline(); it() }
+                    }
+                    PlayerSpot.LEFT -> {
+                        player(Modifier.weight(1f).fillMaxHeight()); vline()
+                        first()
+                        second?.let { vline(); it() }
+                    }
+                    PlayerSpot.RIGHT -> {
+                        first()
+                        second?.let { vline(); it() }
+                        vline(); player(Modifier.weight(1f).fillMaxHeight())
+                    }
+                    PlayerSpot.FULL -> {
+                        player(Modifier.weight(1f).fillMaxHeight())
+                        if (grading || sounding) { vline(); page(Modifier.width(colorW).fillMaxHeight().pane()) }
+                    }
+                }
+            }
+            Column(Modifier.fillMaxWidth().weight(share).pane()) { bottom() }
+        }
+    }
+}
+
+/**
+ * The tools panel: the clip's menu (Color, Effects, Crop, Stabilize, Cinema DOF, Sound, Captions, Speed and the rest),
+ * always in view. Color opens right here in its place, with the timeline still below; the others open their pages.
+ * The project's details are behind the info button in the top bar.
+ */
+@Composable
+private fun ToolPanel(vm: EditorViewModel, soon: (String) -> Unit, modifier: Modifier) {
+    Column(modifier.background(Color(0xFF131419)).verticalScroll(rememberScrollState())) {
+        Text("Tools", color = Palette.Text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 12.dp, top = 9.dp))
+        if (vm.selection != Selection.NONE) Tools(vm, soon, panel = true)
+        else {
+            Text("Tap a clip on the timeline for its tools.", color = Palette.TextDim, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp))
+            Box(
+                Modifier.padding(horizontal = 12.dp).fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Color(0xFF2A1F15))
+                    .clickable { vm.selectAtPlayhead() }.padding(vertical = 11.dp),
+                contentAlignment = Alignment.Center,
+            ) { Text("Select the clip at the playhead", color = Palette.Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold) }
+        }
+    }
+}
+
+/**
+ * The bar over the timeline: the timecode, playback in the middle, undo and redo at the right; with [tools], the
+ * selected clip's tools in a strip above it (when there is no side panel for them).
+ */
+@Composable
+private fun Toolbar(vm: EditorViewModel, soon: (String) -> Unit, tools: Boolean, compact: Boolean = false) {
+    val k = DeckUnit(1.dp, LocalDensity.current)
+    Column(Modifier.fillMaxWidth().background(Color(0xFF111217))) {
+        // No side panel: the clip's tools get their own strip, the full width, as on a phone.
+        if (tools && vm.selection != Selection.NONE) Tools(vm, soon)
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Palette.Line))
+        Row(Modifier.fillMaxWidth().height(if (compact) 44.dp else 58.dp).padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                PlayheadText(vm, Palette.Accent, k)
+                Text("  /  " + vm.tc(vm.totalUs), color = Palette.TextDim.copy(alpha = 0.75f), fontSize = 11.sp, fontFamily = Mono, maxLines = 1, softWrap = false)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (!compact) DeckButton(Lucide.PrevCut, "Previous cut", k) { vm.jumpClip(-1) }
+                DeckButton(Lucide.FrameBack, "Back one frame", k) { vm.stepFrames(-1) }
+                Box(
+                    Modifier.size(if (compact) 36.dp else 46.dp).clip(CircleShape).background(Brush.verticalGradient(listOf(Color(0xFFF59A45), Palette.Accent))).clickable { vm.togglePlay() },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(if (vm.isPlaying) Lucide.Pause else Lucide.Play, if (vm.isPlaying) "Pause" else "Play", tint = Color(0xFF15161C),
+                        modifier = Modifier.padding(start = if (vm.isPlaying) 0.dp else 2.dp).size(20.dp))
+                }
+                DeckButton(Lucide.FrameForward, "Forward one frame", k) { vm.stepFrames(1) }
+                if (!compact) DeckButton(Lucide.NextCut, "Next cut", k) { vm.jumpClip(1) }
+            }
+            Row(Modifier.weight(1f), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+                if (!compact) {
+                    HdrToggle(vm)
+                    Spacer(Modifier.width(6.dp))
+                    SourceTag(vm, k)
+                    Spacer(Modifier.width(6.dp))
+                }
+                DeckButton(Lucide.Undo, "Undo", k, enabled = vm.canUndo, filled = false) { vm.undo() }
+                DeckButton(Lucide.Redo, "Redo", k, enabled = vm.canRedo, filled = false) { vm.redo() }
+            }
         }
     }
 }
@@ -1146,58 +1541,82 @@ private fun TransportIcon(icon: ImageVector, label: String, tint: Color = Soft, 
  * effect-type tools, as in the design.
  */
 @Composable
-private fun Tools(vm: EditorViewModel, soon: (String) -> Unit) {
+private fun Tools(vm: EditorViewModel, soon: (String) -> Unit, panel: Boolean = false) {
     com.graden.editor.RecomposeProbe.hit("Tools")
+    Column(Modifier.fillMaxWidth().background(Color(0xFF131419))) {
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Palette.Line))
+        // On a phone the tools are one strip that scrolls; in a tablet's side panel they wrap into rows.
+        if (panel) Wrap(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp), 4.dp, 6.dp) { ToolItems(vm, soon) }
+        else Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 6.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+        ) { ToolItems(vm, soon) }
+    }
+}
+
+/** Lays its items out left to right, starting a new row when one is full. */
+@Composable
+private fun Wrap(modifier: Modifier, gapX: androidx.compose.ui.unit.Dp, gapY: androidx.compose.ui.unit.Dp, content: @Composable () -> Unit) {
+    androidx.compose.ui.layout.Layout(content, modifier) { items, c ->
+        val gx = gapX.roundToPx(); val gy = gapY.roundToPx()
+        val placed = items.map { it.measure(c.copy(minWidth = 0, minHeight = 0)) }
+        val spots = ArrayList<IntOffset>()
+        var x = 0; var y = 0; var rowH = 0
+        for (p in placed) {
+            if (x > 0 && x + p.width > c.maxWidth) { x = 0; y += rowH + gy; rowH = 0 }
+            spots += IntOffset(x, y)
+            x += p.width + gx
+            rowH = maxOf(rowH, p.height)
+        }
+        layout(c.maxWidth, (y + rowH).coerceAtLeast(c.minHeight)) { placed.forEachIndexed { i, p -> p.place(spots[i]) } }
+    }
+}
+
+@Composable
+private fun ToolItems(vm: EditorViewModel, soon: (String) -> Unit) {
     val kind = vm.selection
     val video = kind == Selection.VIDEO || kind == Selection.SILENT_VIDEO
     val picture = video || kind == Selection.PICTURE
     val sound = kind == Selection.AUDIO || kind == Selection.VIDEO
-    Column(Modifier.fillMaxWidth().background(Color(0xFF131419))) {
-        Box(Modifier.fillMaxWidth().height(1.dp).background(Palette.Line))
-        Row(
-            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 6.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(2.dp),
-        ) {
-            if (kind == Selection.CAPTION) {
-                // A text (caption or title): its words, font, look and animation; split, delete and copy; its length by
-                // its handles on the timeline, its place on the picture by dragging it there.
-                Tool(Lucide.TypeT, "Edit", tinted = true) { vm.selectedClipId?.let { vm.openText(it, 0) } }
-                Tool(Lucide.FontAa, "Font", tinted = true) { vm.selectedClipId?.let { vm.openText(it, 1) } }
-                Tool(Lucide.Palette, "Style", tinted = true) { vm.selectedClipId?.let { vm.openText(it, 2) } }
-                Tool(Lucide.AnimIn, "Animate", tinted = true) { vm.selectedClipId?.let { vm.openText(it, 3) } }
-                val canSplit by remember { derivedStateOf { vm.canSplit } }
-                Tool(Lucide.Split, "Split", enabled = canSplit) { vm.split() }
-                Tool(Lucide.Trash, "Delete", color = Palette.Danger) { vm.deleteSelected() }
-                Tool(Lucide.Copy, "Duplicate") { vm.duplicateSelected() }
-                return@Row
-            }
-            // Trim opens the trim page; a picture has no length of its own to trim, so it just shows its handles.
-            Tool(Lucide.Scissors, "Trim") { if (!vm.openTrim()) vm.selectAtPlayhead() }
-            val canSplit by remember { derivedStateOf { vm.canSplit } }
-            Tool(Lucide.Split, "Split", enabled = canSplit) { vm.split() }
-            Tool(Lucide.Trash, "Delete", color = Palette.Danger) { vm.deleteSelected() }
-            if (picture) {
-                Tool(Lucide.Palette, "Color", tinted = true) { vm.openColor() }
-                Tool(Lucide.Sparkles, "Effects", tinted = true) { soon("Effects") }
-                Tool(Lucide.Crop, "Crop") { vm.openCrop() }
-                if (video) Tool(Lucide.Stabilize, "Stabilize", tinted = true) { vm.openStab() }
-                if (video) Tool(Lucide.Aperture, "Cinema DOF", tinted = true, width = 70.dp) { vm.openCinema() }
-                Tool(Lucide.AnimIn, "In") { vm.selectedClipId?.let { vm.openFx(it, EditorViewModel.FxSlot.IN) } }
-                Tool(Lucide.AnimOut, "Out") { vm.selectedClipId?.let { vm.openFx(it, EditorViewModel.FxSlot.OUT) } }
-            }
-            if (sound) Tool(Lucide.AudioLines, "Sound", tinted = true) { vm.openSound() }
-            if (sound) Tool(Lucide.Captions, "Captions", tinted = true) { vm.pause(); vm.openCaptions(vm.selectedClipId) }
-            // A video's sound copied out onto its own lane; the video keeps its sound until muted on its Sound page.
-            if (kind == Selection.VIDEO) Tool(Lucide.Volume, "Extract") { vm.extractSound() }
-            if (kind != Selection.PICTURE) Tool(Lucide.Gauge, "Speed") { vm.openTrim(bySpeed = true) }
-            Tool(Lucide.Copy, "Duplicate") { vm.duplicateSelected() }
-            // Lit while the clip plays backwards; while its reversed copy is being made, tapping again stops it.
-            if (kind != Selection.PICTURE) {
-                val busy = vm.selectedClipId in vm.reversing
-                Tool(Lucide.RotateCcw, if (busy) "Stop" else "Reverse", color = if (vm.selectedReversed || busy) Palette.Accent else Soft) { vm.reverseSelected() }
-            }
-        }
+    if (kind == Selection.CAPTION) {
+        // A text (caption or title): its words, font, look and animation; split, delete and copy; its length by
+        // its handles on the timeline, its place on the picture by dragging it there.
+        Tool(Lucide.TypeT, "Edit", tinted = true) { vm.selectedClipId?.let { vm.openText(it, 0) } }
+        Tool(Lucide.FontAa, "Font", tinted = true) { vm.selectedClipId?.let { vm.openText(it, 1) } }
+        Tool(Lucide.Palette, "Style", tinted = true) { vm.selectedClipId?.let { vm.openText(it, 2) } }
+        Tool(Lucide.AnimIn, "Animate", tinted = true) { vm.selectedClipId?.let { vm.openText(it, 3) } }
+        val canSplit by remember { derivedStateOf { vm.canSplit } }
+        Tool(Lucide.Split, "Split", enabled = canSplit) { vm.split() }
+        Tool(Lucide.Trash, "Delete", color = Palette.Danger) { vm.deleteSelected() }
+        Tool(Lucide.Copy, "Duplicate") { vm.duplicateSelected() }
+        return
     }
+    // Trim opens the trim page; a picture has no length of its own to trim, so it just shows its handles.
+    Tool(Lucide.Scissors, "Trim") { if (!vm.openTrim()) vm.selectAtPlayhead() }
+    val canSplit by remember { derivedStateOf { vm.canSplit } }
+    Tool(Lucide.Split, "Split", enabled = canSplit) { vm.split() }
+    Tool(Lucide.Trash, "Delete", color = Palette.Danger) { vm.deleteSelected() }
+    if (picture) {
+        Tool(Lucide.Palette, "Color", tinted = true) { vm.openColor() }
+        Tool(Lucide.Sparkles, "Effects", tinted = true) { soon("Effects") }
+        Tool(Lucide.Crop, "Crop") { vm.openCrop() }
+        if (video) Tool(Lucide.Stabilize, "Stabilize", tinted = true) { vm.openStab() }
+        if (video) Tool(Lucide.Aperture, "Cinema DOF", tinted = true, width = 70.dp) { vm.openCinema() }
+        Tool(Lucide.AnimIn, "In") { vm.selectedClipId?.let { vm.openFx(it, EditorViewModel.FxSlot.IN) } }
+        Tool(Lucide.AnimOut, "Out") { vm.selectedClipId?.let { vm.openFx(it, EditorViewModel.FxSlot.OUT) } }
+    }
+    if (sound) Tool(Lucide.AudioLines, "Sound", tinted = true) { vm.openSound() }
+    if (sound) Tool(Lucide.Captions, "Captions", tinted = true) { vm.pause(); vm.openCaptions(vm.selectedClipId) }
+    // A video's sound copied out onto its own lane; the video keeps its sound until muted on its Sound page.
+    if (kind == Selection.VIDEO) Tool(Lucide.Volume, "Extract") { vm.extractSound() }
+    if (kind != Selection.PICTURE) Tool(Lucide.Gauge, "Speed") { vm.openTrim(bySpeed = true) }
+    Tool(Lucide.Copy, "Duplicate") { vm.duplicateSelected() }
+    // Lit while the clip plays backwards; while its reversed copy is being made, tapping again stops it.
+    if (kind != Selection.PICTURE) {
+        val busy = vm.selectedClipId in vm.reversing
+        Tool(Lucide.RotateCcw, if (busy) "Stop" else "Reverse", color = if (vm.selectedReversed || busy) Palette.Accent else Soft) { vm.reverseSelected() }
+    }
+
 }
 
 @Composable

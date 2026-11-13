@@ -177,7 +177,7 @@ fun StabBody(vm: EditorViewModel, modifier: Modifier) {
 private fun StabTransport(vm: EditorViewModel, startUs: Long, endUs: Long) {
     val view = LocalView.current
     BoxWithConstraints(Modifier.fillMaxWidth()) {
-        val u = maxWidth / 400f
+        val u = maxWidth.coerceAtMost(440.dp) / 400f
         Row(Modifier.fillMaxWidth().height(u * 52f).padding(horizontal = u * 10f), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(vm.tc((vm.playheadUs - startUs).coerceAtLeast(0L)), color = Palette.Accent, fontSize = 13.sp, fontFamily = Pro.Mono, maxLines = 1, softWrap = false)

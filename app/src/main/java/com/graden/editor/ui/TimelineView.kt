@@ -368,6 +368,8 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                     }
                     val tracker = VelocityTracker()
                     tracker.addPosition(down.uptimeMillis, down.position)
+                    // When the finger last really moved: a finger that stopped on its spot before lifting means "here".
+                    var lastMoveAt = down.uptimeMillis
                     val cx = size.width / 2f
                     // Lanes are laid out unscrolled, so the touch is shifted into their space.
                     val downInLanes = down.position.copy(y = down.position.y + vm.laneScroll)
@@ -479,6 +481,7 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                                 else -> {
                                     vm.scrubBy((-dx / vm.pxPerSec * 1e6f).toLong())
                                     tracker.addPosition(ch.uptimeMillis, ch.position)
+                                    if (abs(dx) > 0.5f) lastMoveAt = ch.uptimeMillis
                                 }
                             }
                             if (mode != Mode.NONE) ch.consume()
@@ -494,7 +497,10 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                         Mode.REORDER -> vm.reorderEnd()
                         else -> {
                             val v = tracker.calculateVelocity().x
-                            if (!zoomed && abs(v) > 400f) {
+                            // Only a real flick carries on after the finger lifts. Placing the playhead and letting go
+                            // left a little speed that kept the timeline gliding, so cuts landed half a second late.
+                            val still = android.os.SystemClock.uptimeMillis() - lastMoveAt > 60L
+                            if (!zoomed && !still && abs(v) > 380.dp.toPx()) {
                                 fling[0] = scope.launch {
                                     var last = 0f
                                     AnimationState(0f, -v).animateDecay(decay) {

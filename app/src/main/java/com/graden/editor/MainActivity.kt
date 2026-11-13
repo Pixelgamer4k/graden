@@ -8,6 +8,9 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.launch
 import com.graden.editor.ui.EditorScreen
 
 class MainActivity : ComponentActivity() {
@@ -18,9 +21,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         TextFonts.assets = applicationContext.assets
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        // Phones stay upright; tablets and unfolded foldables turn freely and get the wide layout on their side.
-        requestedOrientation = if (resources.configuration.smallestScreenWidthDp >= 600) android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_USER
-            else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        // Every phone, tablet and foldable turns with the screen, as the phone's own auto-rotate setting says; the layout
+        // follows the window's shape (see EditorScreen).
+        requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_USER
+        hideBars(resources.configuration)
         // Ask for the panel's highest refresh rate so the timeline scrolls at 90/120 Hz where available.
         @Suppress("DEPRECATION") val display = windowManager.defaultDisplay
         val current = display.mode
@@ -31,18 +35,20 @@ class MainActivity : ComponentActivity() {
         GradeGl.probeHdr(this)
         if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) watchdog()
         setContent { EditorScreen(vm) }
-        if (savedInstanceState == null) shared(intent)
-        // Older Adreno drivers (6xx, 2021) let one shader compile at a time across the whole app. Warming the large
-        // grade shader during launch kept the UI's own first frame waiting until Android closed the app, so the warm-up
-        // starts only once the first frame has reached the screen, and a little after.
-        ShaderCache.dir = java.io.File(cacheDir, "shaders")
-        val root = window.decorView
-        root.viewTreeObserver.registerFrameCommitCallback(object : Runnable {
-            override fun run() {
-                root.viewTreeObserver.unregisterFrameCommitCallback(this)
-                root.postDelayed({ ShaderCache.warmUp(this@MainActivity) }, 600)
+        // A foldable reports its fold; half open along the width, the picture goes above it and the controls below.
+        lifecycleScope.launch {
+            repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) {
+                androidx.window.layout.WindowInfoTracker.getOrCreate(this@MainActivity).windowLayoutInfo(this@MainActivity).collect { info ->
+                    vm.fold = info.displayFeatures.filterIsInstance<androidx.window.layout.FoldingFeature>().firstOrNull()?.let {
+                        Fold(it.state == androidx.window.layout.FoldingFeature.State.HALF_OPENED,
+                            it.orientation == androidx.window.layout.FoldingFeature.Orientation.HORIZONTAL, it.bounds.top, it.bounds.bottom)
+                    }
+                }
             }
-        })
+        }
+        if (savedInstanceState == null) shared(intent)
+        // The grade shaders are compiled in a process of their own, so nothing waits for them (see ShaderCache.warmUp).
+        ShaderCache.warmUp(this)
     }
 
     /**
@@ -90,9 +96,19 @@ class MainActivity : ComponentActivity() {
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
-        // A foldable opened or closed: the same rule as at start.
-        requestedOrientation = if (newConfig.smallestScreenWidthDp >= 600) android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_USER
-            else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        hideBars(newConfig)
+    }
+
+    /**
+     * The navigation bar is hidden for the editor's room, and on its side the status bar too; a swipe in from the edge
+     * shows them for a moment.
+     */
+    private fun hideBars(config: android.content.res.Configuration) {
+        val c = androidx.core.view.WindowCompat.getInsetsController(window, window.decorView)
+        c.systemBarsBehavior = androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        c.hide(androidx.core.view.WindowInsetsCompat.Type.navigationBars())
+        if (config.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE) c.hide(androidx.core.view.WindowInsetsCompat.Type.statusBars())
+        else c.show(androidx.core.view.WindowInsetsCompat.Type.statusBars())
     }
 
     override fun onStop() {

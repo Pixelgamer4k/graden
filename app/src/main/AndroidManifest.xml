@@ -19,7 +19,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode">
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboard|keyboardHidden|navigation|uiMode">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -33,6 +33,15 @@
                 <data android:mimeType="image/*" />
             </intent-filter>
         </activity>
+        <!-- Compiles the preview's shaders in a process of its own, so the GPU driver never holds up the app's screen. -->
+        <service
+            android:name=".ShaderService"
+            android:exported="false"
+            android:process=":shaders" />
+        <service
+            android:name=".ShaderImageService"
+            android:exported="false"
+            android:process=":shaders2" />
         <service
             android:name=".export.ExportService"
             android:exported="false"

@@ -85,11 +85,13 @@ fun MediaWindow(
     onTextDragStart: (com.graden.editor.Caption, Offset) -> Unit,
     onDrag: (Offset) -> Unit,
     onDragEnd: () -> Unit,
+    docked: Boolean = false,
 ) {
     com.graden.editor.RecomposeProbe.hit("MediaWindow")
-    val shown = vm.mediaBoxOpen && !dragging
+    // Docked (tablets and open foldables): always open in its own column, never sliding or fading.
+    val shown = docked || (vm.mediaBoxOpen && !dragging)
     val p by animateFloatAsState(if (shown) 1f else 0f, spring(dampingRatio = 0.86f, stiffness = 420f), label = "media sheet")
-    androidx.compose.runtime.LaunchedEffect(vm.mediaBoxOpen) { if (vm.mediaBoxOpen) vm.loadOtherMedia() }
+    androidx.compose.runtime.LaunchedEffect(vm.mediaBoxOpen, docked) { if (vm.mediaBoxOpen || docked) vm.loadOtherMedia() }
     // Stay composed during a drag even though invisible: the drag gesture lives in a card of this sheet.
     if (p < 0.004f && !shown && !dragging) return
     // Reversed copies belong to the clips that use them, not to the pool.
@@ -102,12 +104,12 @@ fun MediaWindow(
     val assets = vm.sortMedia(pool.filter { vm.inMediaTab(it, tab) }) { it }
     val others = vm.sortMedia(vm.otherMedia.filter { vm.inMediaTab(it.second, tab) }) { it.second }
     Box(Modifier.fillMaxSize()) {
-        if (shown) Box(
+        if (shown && !docked) Box(
             Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.55f * p.coerceIn(0f, 1f)))
                 .pointerInput(Unit) { detectTapGestures { vm.mediaBoxOpen = false } }
         )
         Column(
-            Modifier.align(Alignment.BottomCenter).fillMaxWidth().fillMaxHeight(0.86f)
+            if (docked) Modifier.fillMaxSize().background(Kit.Sheet) else Modifier.align(Alignment.BottomCenter).fillMaxWidth().fillMaxHeight(0.86f)
                 .graphicsLayer {
                     // Never moved during a drag: the gesture is measured in this sheet's own coordinates. It only fades then.
                     translationY = if (dragging) 0f else (1f - p) * size.height
@@ -119,42 +121,64 @@ fun MediaWindow(
                 .pointerInput(Unit) { detectTapGestures { } } // taps inside must not fall through to the scrim
                 .navigationBarsPadding()
         ) {
-            KGrabber()
+            if (!docked) KGrabber()
             val busy = vm.importQueue.count { !it.failed }
             val optimizing = pool.count { !vm.statusOf(it).ready }
-            KHeader(
-                "Media",
-                when {
-                    busy > 0 -> "Analysing $busy…"
-                    optimizing > 0 -> "Optimising $optimizing for smooth editing…"
-                    pool.isEmpty() -> "Import videos, pictures and sound"
-                    else -> "Hold and drag onto the timeline"
-                },
-                onClose = { vm.mediaBoxOpen = false },
-                trailing = {
-                    Row(
-                        Modifier.padding(end = 8.dp).height(40.dp).shadow(8.dp, CircleShape, ambientColor = Kit.Accent, spotColor = Kit.Accent).clip(CircleShape)
-                            .background(Kit.Primary).border(1.dp, Kit.PrimaryRim, CircleShape).clickable(onClick = onImport).padding(start = 12.dp, end = 16.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Icon(Lucide.Plus, null, tint = Kit.Ink, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Import", color = Kit.Ink, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            if (docked) {
+                // Docked beside the picture: one slim line, the tabs as small chips, import as a round button, so the
+                // files get the room.
+                Row(Modifier.fillMaxWidth().height(40.dp).padding(start = 12.dp, end = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Media", color = Kit.Text, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.width(8.dp))
+                    Row(Modifier.weight(1f).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        for (t in tabs) {
+                            val on = t == tab
+                            Text(t, color = if (on) Kit.Ink else Kit.Dim, fontSize = 11.sp, fontWeight = if (on) FontWeight.SemiBold else FontWeight.Medium, maxLines = 1,
+                                modifier = Modifier.clip(RoundedCornerShape(12.dp)).background(if (on) Kit.Accent else Color(0xFF22232A)).clickable { vm.mediaTab = t }
+                                    .padding(horizontal = 9.dp, vertical = 4.dp))
+                        }
                     }
-                },
-            )
-            KTabs(tabs, tabs.indexOf(tab)) { vm.mediaTab = tabs[it] }
+                    Spacer(Modifier.width(6.dp))
+                    Box(
+                        Modifier.size(30.dp).clip(CircleShape).background(Kit.Primary).clickable(onClick = onImport), contentAlignment = Alignment.Center,
+                    ) { Icon(Lucide.Plus, "Import", tint = Kit.Ink, modifier = Modifier.size(16.dp)) }
+                }
+            } else {
+                KHeader(
+                    "Media",
+                    when {
+                        busy > 0 -> "Analysing $busy…"
+                        optimizing > 0 -> "Optimising $optimizing for smooth editing…"
+                        pool.isEmpty() -> "Import videos, pictures and sound"
+                        else -> "Hold and drag onto the timeline"
+                    },
+                    onClose = if (docked) null else ({ vm.mediaBoxOpen = false }),
+                    trailing = {
+                        Row(
+                            Modifier.padding(end = 8.dp).height(40.dp).shadow(8.dp, CircleShape, ambientColor = Kit.Accent, spotColor = Kit.Accent).clip(CircleShape)
+                                .background(Kit.Primary).border(1.dp, Kit.PrimaryRim, CircleShape).clickable(onClick = onImport).padding(start = 12.dp, end = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(Lucide.Plus, null, tint = Kit.Ink, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Import", color = Kit.Ink, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        }
+                    },
+                )
+                KTabs(tabs, tabs.indexOf(tab)) { vm.mediaTab = tabs[it] }
+            }
             Box(Modifier.fillMaxWidth().height(1.dp).background(Kit.Hair))
             if (tab == "Text") TextSection(vm, onTextDragStart, onDrag, onDragEnd)
             else LazyVerticalGrid(
-                GridCells.Fixed(3), Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 24.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(14.dp),
+                // About three across on a phone; fewer in a narrow docked column, more in a wide one.
+                GridCells.Adaptive(if (docked) 52.dp else 88.dp), Modifier.fillMaxSize(),
+                contentPadding = if (docked) PaddingValues(start = 8.dp, end = 8.dp, top = 2.dp, bottom = 10.dp) else PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 24.dp),
+                horizontalArrangement = Arrangement.spacedBy(if (docked) 5.dp else 10.dp), verticalArrangement = Arrangement.spacedBy(if (docked) 5.dp else 14.dp),
             ) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     Row(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
                         val n = assets.size
-                        Text(if (n == 1) "1 file" else "$n files", color = Kit.Dim, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                        Text(if (n == 1) "1 file" else "$n files", color = Kit.Dim, fontSize = if (docked) 11.sp else 13.sp, modifier = Modifier.weight(1f))
                         SortMenu(vm)
                     }
                 }
@@ -172,16 +196,16 @@ fun MediaWindow(
                 if (assets.isEmpty() && (tab != "All" || vm.importQueue.isEmpty())) item(span = { GridItemSpan(maxLineSpan) }) {
                     Empty(if (pool.isEmpty()) "Nothing here yet" else "No ${tab.lowercase()} in this project", if (pool.isEmpty()) onImport else null)
                 }
-                items(assets, key = { it.id }) { a -> AssetCard(vm, a, null, onDragStart, onDrag, onDragEnd) }
+                items(assets, key = { it.id }) { a -> androidx.compose.runtime.CompositionLocalProvider(LocalCompact provides docked) { AssetCard(vm, a, null, onDragStart, onDrag, onDragEnd) } }
                 if (others.isNotEmpty()) {
                     item(span = { GridItemSpan(maxLineSpan) }) {
                         Column(Modifier.padding(top = 18.dp)) {
                             Box(Modifier.fillMaxWidth().height(1.dp).background(Kit.Hair))
-                            Text("From other projects", color = Kit.Text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 16.dp))
+                            Text("From other projects", color = Kit.Text, fontSize = if (docked) 12.sp else 16.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = if (docked) 8.dp else 16.dp))
                             Text("Drag one in to use it here too", color = Kit.Dim, fontSize = 12.sp)
                         }
                     }
-                    items(others, key = { "o" + it.first + it.second.uri }) { (from, a) -> AssetCard(vm, a, from, onDragStart, onDrag, onDragEnd) }
+                    items(others, key = { "o" + it.first + it.second.uri }) { (from, a) -> androidx.compose.runtime.CompositionLocalProvider(LocalCompact provides docked) { AssetCard(vm, a, from, onDragStart, onDrag, onDragEnd) } }
                 }
             }
         }
@@ -189,6 +213,11 @@ fun MediaWindow(
 }
 
 private val SheetShape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
+/** True inside the docked media column, where everything is drawn smaller so more fits. */
+private val LocalCompact = androidx.compose.runtime.compositionLocalOf { false }
+private val SmallTileShape = RoundedCornerShape(8.dp)
+private val SmallTile = Modifier.fillMaxWidth().aspectRatio(1f).clip(SmallTileShape).background(Color(0xFF0B0B0E)).border(1.dp, Color(0xFF26282F), SmallTileShape)
+
 private val TileShape = RoundedCornerShape(14.dp)
 private val Tile = Modifier.fillMaxWidth().aspectRatio(1f).shadow(6.dp, TileShape, ambientColor = Color.Black, spotColor = Color.Black)
     .clip(TileShape).background(Color(0xFF0B0B0E)).border(1.dp, Kit.Rim, TileShape)
@@ -300,7 +329,9 @@ private fun Draggable(
 
 @Composable
 private fun Label(text: String) {
-    Text(text, color = Kit.Text, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 7.dp))
+    val small = LocalCompact.current
+    Text(text, color = Kit.Text, fontSize = if (small) 10.5.sp else 12.5.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis,
+        modifier = Modifier.padding(top = if (small) 3.dp else 7.dp))
 }
 
 @Composable
@@ -340,9 +371,10 @@ private fun AssetCard(
             }
             .clickable { menu = true }
     ) {
-        Box(Tile) {
+        val small = LocalCompact.current
+        Box(if (small) SmallTile else Tile) {
             if (a.isAudio) Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(Color(0xFF1C3D32), Color(0xFF11211C)))), contentAlignment = Alignment.Center) {
-                Icon(Lucide.Music, null, tint = Palette.AudioLabel, modifier = Modifier.size(28.dp))
+                Icon(Lucide.Music, null, tint = Palette.AudioLabel, modifier = Modifier.size(if (small) 16.dp else 28.dp))
             } else {
                 vm.thumbs.version // recompose when the thumbnail arrives
                 vm.thumbs.get(a, 0L, if (from == null) vm.proxies[a.id] else null)?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
@@ -350,7 +382,7 @@ private fun AssetCard(
             // A soft fade at the foot, so the labels on it always read.
             Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().fillMaxHeight(0.42f).background(Brush.verticalGradient(listOf(Color.Transparent, Color(0x99000000)))))
             // What it is (video, picture, sound), its special kind, and how long.
-            if (!a.isAudio) Box(
+            if (!a.isAudio && !small) Box(
                 Modifier.align(Alignment.BottomStart).padding(6.dp).size(20.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xA6000000)),
                 contentAlignment = Alignment.Center,
             ) { Icon(if (a.isImage && !a.isGif) Lucide.Image else Lucide.Film, null, tint = Color.White, modifier = Modifier.size(12.dp)) }
@@ -359,10 +391,10 @@ private fun AssetCard(
                 val c = when (it) { "RAW" -> Color(0xFFFF6B6B); "GIF" -> Color(0xFFB794F6); else -> Color(0xFFFFC857) }
                 Text(
                     it, color = Kit.Ink, fontSize = 9.5.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 0.5.sp,
-                    modifier = Modifier.align(Alignment.TopStart).padding(6.dp).clip(RoundedCornerShape(6.dp)).background(c).padding(horizontal = 5.dp, vertical = 1.dp),
+                    modifier = Modifier.align(Alignment.TopStart).padding(if (small) 3.dp else 6.dp).clip(RoundedCornerShape(6.dp)).background(c).padding(horizontal = 4.dp, vertical = 0.dp),
                 )
             }
-            if (!a.isImage) Tag(timecode(a.durationUs, a.fps).removePrefix("00:"), Modifier.align(Alignment.BottomEnd).padding(6.dp), mono = true)
+            if (!a.isImage) Tag(timecode(a.durationUs, a.fps).removePrefix("00:"), Modifier.align(Alignment.BottomEnd).padding(if (small) 2.dp else 6.dp), mono = true, small = small)
             if (status?.percent != null) Box(
                 Modifier.align(Alignment.BottomStart).fillMaxWidth(status.percent / 100f).height(3.dp).background(Kit.Accent)
             )
@@ -384,12 +416,15 @@ private fun AssetCard(
                 }
             }
         }
-        Label(a.name)
-        Text(
-            if (from != null) "From $from" else if (status != null && !status.ready) status.text else specs(a),
-            color = if (from != null) Palette.VideoLabel else if (status != null && !status.ready) Kit.Accent else Kit.Dim,
-            fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
-        )
+        // Docked, the tiles stand alone (the name is in the tap menu), so many more fit for quick dragging.
+        if (!LocalCompact.current) {
+            Label(a.name)
+            Text(
+                if (from != null) "From $from" else if (status != null && !status.ready) status.text else specs(a),
+                color = if (from != null) Palette.VideoLabel else if (status != null && !status.ready) Kit.Accent else Kit.Dim,
+                fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
     if (confirmDelete) {
         val used = vm.clipsUsing(a)
@@ -404,9 +439,9 @@ private fun AssetCard(
 }
 
 @Composable
-private fun Tag(text: String, modifier: Modifier, mono: Boolean = false) {
+private fun Tag(text: String, modifier: Modifier, mono: Boolean = false, small: Boolean = false) {
     Text(
-        text, color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.SemiBold, fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default,
+        text, color = Color.White, fontSize = if (small) 8.sp else 10.sp, fontWeight = FontWeight.SemiBold, fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default,
         modifier = modifier.clip(RoundedCornerShape(6.dp)).background(Color(0xA6000000)).padding(horizontal = 5.dp, vertical = 1.dp),
     )
 }

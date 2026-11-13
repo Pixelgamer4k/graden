@@ -1,5 +1,9 @@
 package com.graden.editor.ui
 
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.foundation.layout.requiredHeight
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 
 import com.graden.editor.VEC_SCALE
@@ -269,76 +273,158 @@ fun ColorBody(vm: EditorViewModel, modifier: Modifier) {
         val rests = listOf(0.42f.coerceIn(lo, hi), 0.62f.coerceIn(lo, hi), hi)
         val frac = remember { androidx.compose.animation.core.Animatable(vm.controlsFraction.coerceIn(lo, hi)) }
         var dragging by remember { mutableStateOf(false) }
+        // While the finger is on the bar its position is set straight from the drag (no animation step per move).
+        var live by remember { androidx.compose.runtime.mutableFloatStateOf(frac.value) }
+        // How much of the page the controls are laid out for. It changes only at a rest (or when the finger lets go, to
+        // where the panel is heading), never while it moves, so the wheels and tabs never reflow under the finger.
+        var layoutFrac by remember { androidx.compose.runtime.mutableFloatStateOf(frac.value.coerceIn(lo, hi)) }
         // The scope's size button takes it to the scope-large rest.
         LaunchedEffect(vm.scopeBig) {
-            if (vm.scopeBig) frac.animateTo(rests[0], spring(0.62f, 380f))
+            if (vm.scopeBig) { layoutFrac = rests[0]; frac.animateTo(rests[0], spring(0.62f, 380f)) }
         }
-        val controlsH = total * frac.value.coerceIn(lo, hi)
-        val scopeH = (total - controlsH - 48.dp - 44.dp).coerceAtLeast(0.dp)
         val grip by animateFloatAsState(if (dragging) 1f else 0f, spring(0.6f, 700f), label = "grip")
-        Column(Modifier.fillMaxSize()) {
-            ScopePanel(vm, scopeH)
-            ColorTransport(vm)
-            Box(
-                Modifier.fillMaxWidth().height(18.dp).background(Panel).pointerInput(total) {
-                    val totalPx = with(density) { total.toPx() }
-                    val velocity = androidx.compose.ui.input.pointer.util.VelocityTracker()
-                    var last = frac.value
-                    detectVerticalDragGestures(
-                        onDragStart = {
-                            dragging = true
-                            velocity.resetTracking()
-                            view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                        },
-                        onDragEnd = {
-                            dragging = false
-                            val v = -velocity.calculateVelocity().y / totalPx
-                            // Where a fling would carry it, then the rest nearest that.
-                            val aim = (frac.value + v * 0.18f).coerceIn(lo, hi)
-                            val target = rests.minByOrNull { abs(it - aim) } ?: frac.value
-                            vm.scopeBig = false
-                            vm.controlsFraction = target
-                            scope.launch {
-                                frac.animateTo(target, spring(0.58f, 360f), initialVelocity = v)
-                                view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+        // Where the bar is now: read only while placing (below), so moving it re-places the parts without rebuilding
+        // any of them: the page slides, nothing is composed again.
+        val shownFrac = { (if (dragging) live else frac.value).coerceIn(lo - 0.04f, hi + 0.04f) }
+        androidx.compose.ui.layout.Layout(
+            content = {
+                // 0: the scope or timeline, as tall as the room above the transport.
+                BoxWithConstraints(Modifier.fillMaxSize()) { ScopePanel(vm, (maxHeight - 48.dp).coerceAtLeast(0.dp)) }
+                // 1: the panel's colour under the controls, so a panel pulled taller than its layout shows no gap.
+                Box(Modifier.fillMaxSize().background(Panel))
+                // 2: the controls, at their laid-out height.
+                Controls(vm, Modifier.fillMaxSize())
+                // 3: transport and the drag bar.
+                Column(Modifier.fillMaxWidth()) {
+                    ColorTransport(vm)
+                    Box(
+                        Modifier.fillMaxWidth().height(18.dp).background(Panel).pointerInput(total) {
+                            val totalPx = with(density) { total.toPx() }
+                            val velocity = androidx.compose.ui.input.pointer.util.VelocityTracker()
+                            var last = frac.value
+                            detectVerticalDragGestures(
+                                onDragStart = {
+                                    live = frac.value
+                                    dragging = true
+                                    velocity.resetTracking()
+                                    view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                                },
+                                onDragEnd = {
+                                    val v = -velocity.calculateVelocity().y / totalPx
+                                    // Where a fling would carry it, then the rest nearest that.
+                                    val aim = (live + v * 0.18f).coerceIn(lo, hi)
+                                    val target = rests.minByOrNull { abs(it - aim) } ?: live
+                                    vm.scopeBig = false
+                                    vm.controlsFraction = target
+                                    // The controls take their new size once, now, while the panel glides there.
+                                    layoutFrac = target
+                                    scope.launch {
+                                        frac.snapTo(live)
+                                        dragging = false
+                                        frac.animateTo(target, spring(0.58f, 360f), initialVelocity = v)
+                                        view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                                    }
+                                },
+                                onDragCancel = { scope.launch { frac.snapTo(live); dragging = false } },
+                            ) { change, dy ->
+                                change.consume()
+                                velocity.addPosition(change.uptimeMillis, change.position)
+                                // A little resistance beyond the ends.
+                                var next = live - dy / totalPx
+                                if (next < lo) next = lo - (lo - next) * 0.35f
+                                if (next > hi) next = hi + (next - hi) * 0.35f
+                                for (r in rests) if ((last - r) * (next - r) < 0f) view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                last = next
+                                live = next
                             }
                         },
-                        onDragCancel = { dragging = false },
-                    ) { change, dy ->
-                        change.consume()
-                        velocity.addPosition(change.uptimeMillis, change.position)
-                        // A little resistance beyond the ends.
-                        var next = frac.value - dy / totalPx
-                        if (next < lo) next = lo - (lo - next) * 0.35f
-                        if (next > hi) next = hi + (next - hi) * 0.35f
-                        for (r in rests) if ((last - r) * (next - r) < 0f) view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                        last = next
-                        scope.launch { frac.snapTo(next) }
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Box(
+                            Modifier.width((40 + 22 * grip).dp).height((4 + 1.5f * grip).dp).clip(RoundedCornerShape(3.dp))
+                                .background(androidx.compose.ui.graphics.lerp(Color(0xFF3A3C46), Palette.Accent, grip)),
+                        )
                     }
-                },
-                contentAlignment = Alignment.Center,
-            ) {
-                Box(
-                    Modifier.width((40 + 22 * grip).dp).height((4 + 1.5f * grip).dp).clip(RoundedCornerShape(3.dp))
-                        .background(androidx.compose.ui.graphics.lerp(Color(0xFF3A3C46), Palette.Accent, grip)),
-                )
+                }
+            },
+            modifier = Modifier.fillMaxSize().clipToBounds(),
+        ) { m, c ->
+            val w = c.maxWidth; val h = c.maxHeight
+            val barPx = 18.dp.roundToPx()
+            val mid = m[3].measure(androidx.compose.ui.unit.Constraints(w, w, 0, h))
+            val ctrlTop = (h - h * shownFrac()).toInt().coerceIn(mid.height - barPx, h)
+            val midY = ctrlTop + barPx - mid.height
+            // The controls follow the bar live: re-measured every frame, never rebuilt.
+            val laidOut = h - ctrlTop - barPx
+            val scopeP = m[0].measure(androidx.compose.ui.unit.Constraints.fixed(w, midY.coerceAtLeast(0)))
+            val fill = m[1].measure(androidx.compose.ui.unit.Constraints.fixed(w, (h - ctrlTop - barPx).coerceAtLeast(0)))
+            val ctrl = m[2].measure(androidx.compose.ui.unit.Constraints.fixed(w, laidOut.coerceAtLeast(0)))
+            layout(w, h) {
+                scopeP.place(0, 0)
+                fill.place(0, ctrlTop + barPx)
+                ctrl.place(0, ctrlTop + barPx)
+                mid.place(0, midY)
             }
-            Controls(vm, Modifier.height(controlsH - 18.dp))
         }
+    }
+}
+
+/**
+ * Color on a tablet or open foldable: the scope and the controls in the side panel, while the editor's own timeline
+ * and transport stay where they are below, so grading, scrubbing and editing go on side by side.
+ */
+@Composable
+fun ColorSidePanel(vm: EditorViewModel, modifier: Modifier) {
+    LaunchedEffect(Unit) { vm.colorShowTimeline = false }
+    BoxWithConstraints(modifier.background(Palette.Bg)) {
+        // On a short screen (a phone on its side) the wheels need the height: the scope folds away, one tap brings it back.
+        val short = maxHeight < 440.dp
+        var scope by remember { mutableStateOf(!short) }
+        val scopeH = (maxHeight * (if (short) 0.38f else 0.32f)).coerceIn(110.dp, 340.dp)
+        Column(Modifier.fillMaxSize()) {
+            if (short) Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Pill(if (scope) "Hide scope" else "Show scope", scope) { scope = !scope }
+            }
+            if (scope) ScopePanel(vm, scopeH, timeline = false)
+            Box(Modifier.fillMaxWidth().height(1.dp).background(Color(0xFF1C1E24)))
+            Controls(vm, Modifier.fillMaxWidth().weight(1f))
+        }
+    }
+}
+
+/** A square as big as the smaller side of the space, at most [max]: decided while laying out, never by rebuilding. */
+private fun Modifier.squareFit(max: androidx.compose.ui.unit.Dp): Modifier = layout { m, c ->
+    val side = minOf(c.maxWidth, c.maxHeight, max.roundToPx())
+    val p = m.measure(androidx.compose.ui.unit.Constraints.fixed(side, side))
+    layout(side, side) { p.place(0, 0) }
+}
+
+/**
+ * Holds [content] at the height it had when [frozen] began: the area itself may grow or shrink (it is clipped), but
+ * what is inside is not laid out again until it settles, so nothing jumps or resizes while the bar is being dragged.
+ */
+@Composable
+private fun Frozen(frozen: Boolean, modifier: Modifier, content: @Composable () -> Unit) {
+    BoxWithConstraints(modifier.clipToBounds()) {
+        val keep = remember { arrayOf(maxHeight) }
+        if (!frozen) keep[0] = maxHeight
+        Box(Modifier.fillMaxWidth().requiredHeight(keep[0]).align(Alignment.TopCenter)) { content() }
     }
 }
 
 // ---- scopes ----------------------------------------------------------------------------------------
 
 @Composable
-private fun ScopePanel(vm: EditorViewModel, height: androidx.compose.ui.unit.Dp) {
+private fun ScopePanel(vm: EditorViewModel, height: androidx.compose.ui.unit.Dp, timeline: Boolean = true) {
     val s = vm.scopeSettings
     var menu by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp).padding(top = 6.dp)) {
         Row(Modifier.fillMaxWidth().height(38.dp), verticalAlignment = Alignment.CenterVertically) {
             // The panel shows the timeline or one scope; which scope is picked from a list, so the row never overflows.
-            Pill("Timeline", vm.colorShowTimeline) { vm.colorShowTimeline = true }
-            Spacer(Modifier.width(6.dp))
+            if (timeline) {
+                Pill("Timeline", vm.colorShowTimeline) { vm.colorShowTimeline = true }
+                Spacer(Modifier.width(6.dp))
+            }
             Box {
                 Row(
                     Modifier.clip(RoundedCornerShape(50)).background(if (!vm.colorShowTimeline) Palette.Accent.copy(alpha = 0.18f) else Color(0xFF1A1B21))
@@ -860,7 +946,7 @@ internal fun ColorTransport(vm: EditorViewModel) {
     // Everything here is sized from the width of the screen (one unit is 1/400 of it), as the editor's transport is,
     // so the row keeps its proportions on any phone, at any display size or font size, and nothing wraps or crowds.
     androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxWidth()) {
-        val u = maxWidth / 400f
+        val u = maxWidth.coerceAtMost(440.dp) / 400f
         val density = LocalDensity.current
         fun sp(v: Float) = with(density) { (u * v).toPx().toSp() / fontScale }
         @Composable
@@ -1155,7 +1241,7 @@ private fun clipAt(vm: EditorViewModel, lanes: List<com.graden.editor.Track>, p:
 private val ControlsH = 300.dp
 
 @Composable
-private fun Controls(vm: EditorViewModel, modifier: Modifier) {
+private fun Controls(vm: EditorViewModel, modifier: Modifier, frozen: Boolean = false) {
     var layer by remember { mutableStateOf(Layer.CORRECTION) }
     var tab by remember { mutableIntStateOf(0) }
     var wheels by remember { mutableIntStateOf(0) }
@@ -1179,7 +1265,19 @@ private fun Controls(vm: EditorViewModel, modifier: Modifier) {
             )
             PaletteTabs(listOf("Wheels", "Primaries", "HDR zones", "Log", "Curves", "Hue curves", "Mixer", "Warper", "Slice", "Detail"), tab, marks) { tab = it }
         }
-        BoxWithConstraints(Modifier.fillMaxWidth().weight(1f)) {
+        // All four wheels when there is room, two otherwise; with a margin either side, so a panel being dragged near
+        // the line does not flip between them, and only a crossing rebuilds anything.
+        var fourWheels by remember { mutableStateOf(false) }
+        var rowWheels by remember { mutableStateOf(false) }
+        val hyst = androidx.compose.ui.platform.LocalDensity.current
+        Frozen(frozen, Modifier.fillMaxWidth().weight(1f).onSizeChanged { sz ->
+            val hd = with(hyst) { sz.height.toDp() }
+            if (!fourWheels && hd >= 440.dp) fourWheels = true else if (fourWheels && hd < 400.dp) fourWheels = false
+            // A wide panel (a tablet): the four wheels in one row, as on Resolve's palette.
+            val wd = with(hyst) { sz.width.toDp() }
+            if (!rowWheels && wd >= 540.dp) rowWheels = true else if (rowWheels && wd < 500.dp) rowWheels = false
+        }) {
+        Box(Modifier.fillMaxSize()) {
             if (vm.gradeTarget == null) {
                 Text("No clip under the playhead", color = Palette.TextDim, fontSize = 13.sp, modifier = Modifier.align(Alignment.Center))
             } else if (layer != Layer.CORRECTION) when (layer) {
@@ -1195,7 +1293,9 @@ private fun Controls(vm: EditorViewModel, modifier: Modifier) {
             }
             else when (tab) {
                 // All four wheels when there is room for them, as on Resolve's palette; otherwise two at a time.
-                0 -> if (maxHeight >= 420.dp) Column(Modifier.fillMaxSize().padding(top = 4.dp)) {
+                0 -> if (rowWheels) Column(Modifier.fillMaxSize().padding(top = 6.dp)) {
+                    Wheels(vm, listOf(WheelKind.LIFT, WheelKind.GAMMA, WheelKind.GAIN, WheelKind.OFFSET), big = true)
+                } else if (fourWheels) Column(Modifier.fillMaxSize().padding(top = 4.dp)) {
                     Box(Modifier.weight(1f)) { Wheels(vm, listOf(WheelKind.LIFT, WheelKind.GAMMA)) }
                     Box(Modifier.fillMaxWidth().padding(horizontal = 24.dp).height(1.dp).background(Palette.Line))
                     Box(Modifier.weight(1f)) { Wheels(vm, listOf(WheelKind.GAIN, WheelKind.OFFSET)) }
@@ -1207,7 +1307,7 @@ private fun Controls(vm: EditorViewModel, modifier: Modifier) {
                         Wheels(vm, if (wheels == 0) listOf(WheelKind.LIFT, WheelKind.GAMMA) else listOf(WheelKind.GAIN, WheelKind.OFFSET))
                     }
                 }
-                1 -> Primaries(vm, maxHeight)
+                1 -> Primaries(vm, 0.dp)
                 2 -> ZonesPanel(vm)
                 3 -> LogPanel(vm)
                 4 -> CurvesPalette(vm)
@@ -1217,6 +1317,7 @@ private fun Controls(vm: EditorViewModel, modifier: Modifier) {
                 8 -> SlicePanel(vm)
                 else -> DetailPanel(vm)
             }
+        }
         }
     }
     val target = vm.gradeTarget
@@ -1240,9 +1341,9 @@ private fun Segmented(items: List<String>, selected: Int, onSelect: (Int) -> Uni
 
 /** Two wheels side by side, as big as the room allows. */
 @Composable
-private fun Wheels(vm: EditorViewModel, kinds: List<WheelKind>) {
+private fun Wheels(vm: EditorViewModel, kinds: List<WheelKind>, big: Boolean = false) {
     Row(Modifier.fillMaxSize().padding(horizontal = 4.dp, vertical = 2.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
-        for (k in kinds) key(k) { ColorWheel(vm, k, Modifier.weight(1f).fillMaxHeight()) }
+        for (k in kinds) key(k) { ColorWheel(vm, k, Modifier.weight(1f).fillMaxHeight(), if (big) 220.dp else 112.dp) }
     }
 }
 
@@ -1260,7 +1361,7 @@ private fun hueAt(angle: Double, amount: Float = 0.42f): Color {
 private val ringColors = List(37) { i -> hueAt(-2 * PI * i / 36) }
 
 @Composable
-private fun ColorWheel(vm: EditorViewModel, kind: WheelKind, modifier: Modifier) {
+private fun ColorWheel(vm: EditorViewModel, kind: WheelKind, modifier: Modifier, maxDisc: androidx.compose.ui.unit.Dp = 112.dp) {
     val view = LocalView.current
     val grade = vm.gradeTarget?.clip?.grade ?: Grade()
     val w = kind.of(grade)
@@ -1268,7 +1369,7 @@ private fun ColorWheel(vm: EditorViewModel, kind: WheelKind, modifier: Modifier)
     var active by remember { mutableStateOf(false) }
     val glow by animateFloatAsState(if (active) 1f else 0f, spring(0.8f, 600f), label = "glow")
     Column(modifier.padding(horizontal = 4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        BoxWithConstraints(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+        Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
             // The name and its reset sit in the wheel's top corners, so the disc gets all the height.
             Text(kind.label, color = if (w.isZero) Ink else Palette.Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.align(Alignment.TopStart).padding(start = 2.dp))
             Box(
@@ -1276,9 +1377,10 @@ private fun ColorWheel(vm: EditorViewModel, kind: WheelKind, modifier: Modifier)
                 contentAlignment = Alignment.Center,
             ) { Icon(Lucide.RotateCcw, "Reset ${kind.label}", tint = if (w.isZero) Ink.copy(alpha = 0.25f) else Ink, modifier = Modifier.size(15.dp)) }
             // A moderate disc: big enough for fine moves, small enough to leave room for the timeline and scopes.
-            val d = minOf(maxWidth.value, maxHeight.value, 112f).dp
+            // Sized as it is laid out (the smaller side, at most 112 dp), so the panel can resize live without the
+            // wheel being rebuilt.
             Canvas(
-                Modifier.size(d).pointerInput(kind) {
+                Modifier.squareFit(maxDisc).pointerInput(kind) {
                     // Drag anywhere on the wheel: the puck follows the finger's movement (not its position), at a
                     // gentle rate, so it never jumps and fine moves are easy. A soft click holds it at the centre.
                     // Double tap: back to neutral.
@@ -1304,6 +1406,9 @@ private fun ColorWheel(vm: EditorViewModel, kind: WheelKind, modifier: Modifier)
                             if (e.changes.size > 1) break
                             val dlt = c.positionChange()
                             travel += abs(dlt.x) + abs(dlt.y)
+                            // A touch that starts on the disc is the wheel's from the first move, so the page around it
+                            // (a scroll, the panel's drag bar) can never take it over halfway and make the puck stutter.
+                            if (onDisc) c.consume()
                             if (!engaged) {
                                 if (!onDisc || travel < SLOP_DP * density) continue
                                 engaged = true

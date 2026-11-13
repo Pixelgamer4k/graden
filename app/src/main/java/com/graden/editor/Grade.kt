@@ -594,7 +594,9 @@ vec3 primaries(vec3 src) {
     ty = sContrast(vec3(ty), P.z, P.w).x;
     c = q + R.z * (ty - luma(q));
     float y = luma(c);
-    float ws = 1.0 - smoothstep(0.0, 0.55, y);
+    // Shadows works on the shadows, not on black: it eases to nothing at true black, so the black point stays where
+    // it is (it used to lift it, washing a log grade out after its CST).
+    float ws = (1.0 - smoothstep(0.0, 0.55, y)) * smoothstep(0.0, 0.1, y);
     float wh = smoothstep(0.45, 1.0, y);
     c += Q.z * 0.35 * ws * ws + Q.w * 0.35 * wh * wh;
     if (abs(Q.x) > 0.0001) {
@@ -677,7 +679,9 @@ vec3 logWheels(vec3 c) {
     float ws = 1.0 - smoothstep(uL[22].y - 0.08, uL[22].y + 0.08, y);
     float wh = smoothstep(uL[22].z - 0.08, uL[22].z + 0.08, y);
     float wm = clamp(1.0 - ws - wh, 0.0, 1.0);
-    return mix(c, c + uL[23].rgb * ws + uL[24].rgb * wm + uL[25].rgb * wh, uL[22].w);
+    // The Shadow wheel is held at true black, as the Shadows slider: it shapes the shadows without lifting black.
+    float anchor = smoothstep(0.0, 0.08, y);
+    return mix(c, c + uL[23].rgb * ws * anchor + uL[24].rgb * wm + uL[25].rgb * wh, uL[22].w);
 }
 
 vec3 mixer(vec3 c) {

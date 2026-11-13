@@ -1,5 +1,6 @@
 package com.graden.editor.ui
 
+import androidx.compose.foundation.verticalScroll
 import android.view.LayoutInflater
 import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn
@@ -22,6 +23,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
@@ -119,6 +121,7 @@ fun TrimPage(vm: EditorViewModel) {
     // Which value is being typed in, if any.
     var editing by remember { mutableStateOf<Edit?>(null) }
     val accent = if (speedMode) SpeedBlue else Palette.Accent
+    val side = sidewaysPhone()
 
     Column(
         Modifier.fillMaxSize().background(Color.Black)
@@ -147,8 +150,10 @@ fun TrimPage(vm: EditorViewModel) {
             )
         }
 
+        // The picture above the controls; on a phone on its side, beside them.
+        PictureAndControls(side, Modifier.fillMaxWidth().weight(1f)) {
         // Preview, with the moment shown and the speed (when not 1×) over the picture.
-        Box(Modifier.fillMaxWidth().weight(1f).background(Color.Black), contentAlignment = Alignment.Center) {
+        Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
             if (a.isAudio) Icon(Lucide.Music, null, tint = Palette.AudioLabel, modifier = Modifier.size(56.dp))
             else AndroidView(
                 modifier = Modifier.fillMaxSize(),
@@ -160,9 +165,11 @@ fun TrimPage(vm: EditorViewModel) {
             }
         }
 
+        // On a tablet the controls keep a comfortable width, centred under the picture, instead of spanning the screen.
         Column(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp))
-                .background(Brush.verticalGradient(listOf(Color(0xFF202128), Color(0xFF17181D)))).padding(top = 14.dp, bottom = 6.dp)
+            Modifier.widthIn(max = 760.dp).fillMaxWidth().clip(if (side) RoundedCornerShape(topStart = 22.dp, bottomStart = 22.dp) else RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp))
+                .background(Brush.verticalGradient(listOf(Color(0xFF202128), Color(0xFF17181D))))
+                .then(if (side) Modifier.fillMaxHeight().verticalScroll(rememberScrollState()) else Modifier).padding(top = 14.dp, bottom = 6.dp)
         ) {
             // Mode switch, and which clip of the lane this is.
             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -275,6 +282,7 @@ fun TrimPage(vm: EditorViewModel) {
                 }
             }
             Spacer(Modifier.height(10.dp))
+        }
         }
     }
     editing?.let { e -> NumberEntry(e, vm) { editing = null } }
@@ -825,4 +833,31 @@ private fun LaneStrip(vm: EditorViewModel, onEdge: (Grab) -> Unit, onFine: (Bool
         "Drag to scroll · pinch to zoom · tap a clip to trim it",
         color = Palette.TextDim.copy(alpha = 0.6f), fontSize = 10.sp, modifier = Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center,
     )
+}
+
+/** A phone on its side (or any short, wide window): pages put their controls beside the picture instead of under it. */
+@Composable
+internal fun sidewaysPhone(): Boolean {
+    val c = androidx.compose.ui.platform.LocalConfiguration.current
+    return c.screenWidthDp > c.screenHeightDp && c.screenHeightDp < 500
+}
+
+/**
+ * The picture and a page's controls: upright, the controls under the picture at their own height and the picture
+ * taking the rest; [side], the controls in a panel down the right half, the picture beside them.
+ */
+@Composable
+internal fun PictureAndControls(side: Boolean, modifier: Modifier, content: @Composable () -> Unit) {
+    androidx.compose.ui.layout.Layout(content, modifier) { ms, c ->
+        if (!side) {
+            val b = ms[1].measure(c.copy(minWidth = 0, minHeight = 0))
+            val a = ms[0].measure(androidx.compose.ui.unit.Constraints.fixed(c.maxWidth, (c.maxHeight - b.height).coerceAtLeast(0)))
+            layout(c.maxWidth, c.maxHeight) { a.place(0, 0); b.place((c.maxWidth - b.width) / 2, c.maxHeight - b.height) }
+        } else {
+            val bw = (c.maxWidth * 0.48f).toInt()
+            val b = ms[1].measure(androidx.compose.ui.unit.Constraints(bw, bw, 0, c.maxHeight))
+            val a = ms[0].measure(androidx.compose.ui.unit.Constraints.fixed(c.maxWidth - bw, c.maxHeight))
+            layout(c.maxWidth, c.maxHeight) { a.place(0, 0); b.place(c.maxWidth - bw, 0) }
+        }
+    }
 }

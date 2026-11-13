@@ -1,5 +1,7 @@
 package com.graden.editor.ui
 
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.verticalScroll
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -103,6 +105,7 @@ fun CropPage(vm: EditorViewModel, soon: (String) -> Unit) {
         vm.cropTf = tf.copy(cropL = (1f - wFrac) / 2, cropR = (1f - wFrac) / 2, cropT = (1f - hFrac) / 2, cropB = (1f - hFrac) / 2)
     }
 
+    val side = sidewaysPhone()
     Column(
         Modifier.fillMaxSize().background(Color.Black).clickable(remember { MutableInteractionSource() }, null) {}.systemBarsPadding()
     ) {
@@ -112,8 +115,10 @@ fun CropPage(vm: EditorViewModel, soon: (String) -> Unit) {
             Icon(Lucide.Check, "Apply", tint = Palette.Accent, modifier = Modifier.size(44.dp).clip(CircleShape).clickable { vm.applyCrop() }.padding(10.dp))
         }
 
+        // The picture above the controls; on a phone on its side, beside them.
+        PictureAndControls(side, Modifier.fillMaxWidth().weight(1f)) {
         // The picture, turned and mirrored as it will be, with the crop frame over it.
-        BoxWithConstraints(Modifier.fillMaxWidth().weight(1f).padding(24.dp), contentAlignment = Alignment.Center) {
+        BoxWithConstraints(Modifier.fillMaxSize().padding(if (side) 14.dp else 24.dp), contentAlignment = Alignment.Center) {
             val shownAspect = if (sideways) 1f / pictureAspect else pictureAspect
             val boxW = min(maxWidth.value, maxHeight.value * shownAspect)
             val boxH = boxW / shownAspect
@@ -253,7 +258,7 @@ fun CropPage(vm: EditorViewModel, soon: (String) -> Unit) {
             )
         }
 
-        Column(Modifier.fillMaxWidth().background(Color(0xFF1E1F25)).padding(vertical = 12.dp)) {
+        Column(Modifier.fillMaxWidth().background(Color(0xFF1E1F25)).then(if (side) Modifier.fillMaxHeight().verticalScroll(rememberScrollState()) else Modifier).padding(vertical = 12.dp)) {
             // Shapes
             Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 14.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 for (r in ratios) {
@@ -307,6 +312,7 @@ fun CropPage(vm: EditorViewModel, soon: (String) -> Unit) {
                     Text(label, color = Palette.TextDim, fontSize = 12.sp)
                 }
             }
+        }
         }
     }
 }
