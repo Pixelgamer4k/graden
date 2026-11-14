@@ -3,6 +3,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      backfill:
+        description: Post the previous releases to announcements
+        type: boolean
+        default: false
 permissions: {}
 jobs:
   announce:
@@ -11,7 +16,8 @@ jobs:
       - name: Format and announce release
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+          BACKFILL: ${{ github.event_name == 'workflow_dispatch' && inputs.backfill }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && !inputs.backfill }}
         run: |
           python3 - <<'PYCODE'
           import html
@@ -79,16 +85,23 @@ jobs:
                   event = json.load(event_file)
               dry = os.environ.get('DRY_RUN') == 'true'
               repo = os.environ['GITHUB_REPOSITORY']
-              if dry:
-                  request = urllib.request.Request(f'https://api.github.com/repos/{repo}/releases?per_page=1', headers={'User-Agent': 'Graden-release-announcer', 'Accept': 'application/vnd.github+json'})
+              backfill = os.environ.get('BACKFILL') == 'true'
+              if dry or backfill:
+                  request = urllib.request.Request(f'https://api.github.com/repos/{repo}/releases?per_page=100', headers={'User-Agent': 'Graden-release-announcer', 'Accept': 'application/vnd.github+json'})
                   with urllib.request.urlopen(request) as response:
                       releases = json.load(response)
                   if not releases:
                       raise RuntimeError('No release available for the dry run')
-                  release = releases[0]
+                  releases = list(reversed([r for r in releases if not r.get('draft')])) if backfill else releases[:1]
               else:
-                  release = event['release']
-              messages = pieces(release, repo)
+                  releases = [event['release']]
+              messages = []
+              for release in releases:
+                  batch = pieces(release, repo)
+                  if backfill:
+                      date = (release.get('published_at') or '')[:10]
+                      batch[0]['content'] = '📚 **Earlier release** · ' + date + '\n' + batch[0]['content']
+                  messages.extend(batch)
               url = os.environ['DISCORD_WEBHOOK_URL']
               if not re.fullmatch(r'https://(?:discord(?:app)?\.com)/api/webhooks/\d+/[\w.-]+', url):
                   raise RuntimeError('Webhook secret is missing or is not a Discord webhook URL')
