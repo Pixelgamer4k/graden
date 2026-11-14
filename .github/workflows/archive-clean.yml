@@ -1,0 +1,50 @@
+name: Clean release archive and remove announcement webhook
+on: workflow_dispatch
+permissions: {}
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clean archive and remove hook
+        env:
+          HOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, time, urllib.error, urllib.request
+          ids = ['1571262172208570448','1571262172951220377','1571262174070964224','1571262174519894036','1571262175056760955','1571262176256073909','1571262177090867351','1571262178055688285','1571262178957463774','1571262181947998321','1571262183499763896','1571262184720437338','1571262185575944385','1571262188172218432','1571262188583395349','1571262191741702264','1571262192399945821','1571262195126374431','1571262196133138584','1571262199136125149','1571262199727398992','1571262205343834205','1571262206128160910','1571262211995992104','1571262212897505330','1571262216022401134','1571262216588497036','1571262218824323205','1571262220099387563','1571262221055692860']
+          hook = os.environ['HOOK'].rstrip('/')
+          def request(url, method='GET', payload=None):
+              for attempt in range(5):
+                  try:
+                      data = json.dumps(payload).encode() if payload is not None else None
+                      req = urllib.request.Request(url, data=data, method=method, headers={'Content-Type':'application/json','User-Agent':'Graden-archive-cleanup'})
+                      with urllib.request.urlopen(req) as response:
+                          raw=response.read()
+                          return json.loads(raw) if raw else None
+                  except urllib.error.HTTPError as error:
+                      if error.code == 429 and attempt < 4:
+                          time.sleep(min(float(json.loads(error.read()).get('retry_after',2)),60))
+                          continue
+                      raise RuntimeError(f'Discord cleanup failed: HTTP {error.code}') from None
+                  except Exception:
+                      raise RuntimeError('Discord cleanup request failed') from None
+          for message_id in ids:
+              endpoint=hook+'/messages/'+message_id
+              message=request(endpoint)
+              content=message.get('content','')
+              if not content or any(e.get('type') == 'rich' and e.get('image') for e in message.get('embeds', [])):
+                  continue
+              if 'Release page: https://github.com/Pixelgamer4k/graden/releases/tag/' in content:
+                  cleaned=content
+              else:
+                  cleaned=re.sub(r'(?m)^\s*(?:#{1,6}\s*)?(?:\*\*)?Feedback(?:\*\*)?\s*:?[^\n]*$', '', content)
+                  cleaned=re.sub(r'\s*\(\[#\d+\]\(https?://[^)]+\)\)', '', cleaned)
+                  cleaned=re.sub(r'\[([^\]]+)\]\(https?://[^)]+\)', r'\1', cleaned)
+                  cleaned=re.sub(r'https?://\S+', '', cleaned)
+                  cleaned=re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+              if not cleaned:
+                  raise RuntimeError('Cleanup would empty a release message; stopped')
+              request(endpoint,'PATCH',{'content':cleaned,'flags':4,'allowed_mentions':{'parse':[]}})
+          request(hook,'DELETE')
+          print('Cleaned release text and removed the announcement webhook.')
+          PY
