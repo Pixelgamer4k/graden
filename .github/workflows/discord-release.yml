@@ -34,6 +34,11 @@ jobs:
           
           def pieces(release, repository):
               body = release.get('body') or 'No release notes were provided.'
+              # Omit the optional support paragraph and its linked donation button.
+              body = re.sub(r'(?im)^\s*(?:---\s*\n\s*)?\*\*Enjoying Graden\?\*\*[^\n]*\n?', '', body)
+              body = re.sub(r'<a\b[^>]*href=["\']https?://(?:www\.)?buymeacoffee\.com/[^"\']*["\'][^>]*>.*?</a>', '', body, flags=re.I | re.S)
+              body = re.sub(r'!?\[[^\]]*\]\(https?://(?:www\.)?buymeacoffee\.com/[^)]*\)', '', body, flags=re.I)
+              body = re.sub(r'<img\b[^>]*src=["\']https?://[^"\']*buymeacoffee\.com/[^"\']*["\'][^>]*>', '', body, flags=re.I)
               body = re.sub(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>\s*(<img\b[^>]*>)\s*</a>',
                             lambda m: m.group(2) + '\n[Image link](' + m.group(1) + ')', body, flags=re.I)
               tag = urllib.parse.quote(release['tag_name'], safe='')
