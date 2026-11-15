@@ -12,7 +12,7 @@
 
 ### 💬 Join the Graden community on Discord
 
-<a href="https://discord.gg/7cNxF4NxJ"><img src="https://img.shields.io/badge/Join%20the%20community-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Graden community on Discord" height="44"></a>
+<a href="https://discord.gg/cygs4gAwpx"><img src="https://img.shields.io/badge/Join%20the%20community-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Graden community on Discord" height="44"></a>
 
 Get help, share your edits, report bugs and talk with the developer.
 
