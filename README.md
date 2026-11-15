@@ -10,6 +10,12 @@
 [![Android](https://img.shields.io/badge/Android-10%2B-3DDC84?logo=android&logoColor=white)](#install)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
+### 💬 Join the Graden community on Discord
+
+<a href="https://discord.gg/7cNxF4NxJ"><img src="https://img.shields.io/badge/Join%20the%20community-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Graden community on Discord" height="44"></a>
+
+Get help, share your edits, report bugs and talk with the developer.
+
 <a href="https://buymeacoffee.com/pixelgamer4k"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="60"></a>
 
 <img src="docs/screenshots/banner.png" alt="Graden: timeline, colour page and export" width="100%">
