@@ -1,5 +1,6 @@
 package com.graden.editor.ui
 
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Image
@@ -101,9 +102,15 @@ fun MediaWindow(
         if (pool.any { it.isRaw } || vm.otherMedia.any { it.second.isRaw }) add("MCRAW")
     }
     val tab = vm.mediaTab.takeIf { it in tabs } ?: "All"
-    val assets = vm.sortMedia(pool.filter { vm.inMediaTab(it, tab) }) { it }
+    // The built-in black picture (for gaps and fades) is a tool, not one of the user's files: always last, not counted.
+    val assets = vm.sortMedia(pool.filter { vm.inMediaTab(it, tab) }) { it }.sortedBy { vm.isBuiltIn(it) }
     val others = vm.sortMedia(vm.otherMedia.filter { vm.inMediaTab(it.second, tab) }) { it.second }
-    Box(Modifier.fillMaxSize()) {
+    // Docked in a narrow column (a phone on its side): small tiles without names, so many fit. In a wide panel (a
+    // tablet), the usual tiles with their names.
+    var narrow by remember { mutableStateOf(true) }
+    val dense = docked && narrow
+    val dens = androidx.compose.ui.platform.LocalDensity.current
+    Box(Modifier.fillMaxSize().onSizeChanged { narrow = with(dens) { it.width.toDp() } < 380.dp }) {
         if (shown && !docked) Box(
             Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.55f * p.coerceIn(0f, 1f)))
                 .pointerInput(Unit) { detectTapGestures { vm.mediaBoxOpen = false } }
@@ -130,13 +137,22 @@ fun MediaWindow(
                 Row(Modifier.fillMaxWidth().height(40.dp).padding(start = 12.dp, end = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("Media", color = Kit.Text, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.width(8.dp))
-                    Row(Modifier.weight(1f).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        for (t in tabs) {
-                            val on = t == tab
-                            Text(t, color = if (on) Kit.Ink else Kit.Dim, fontSize = 11.sp, fontWeight = if (on) FontWeight.SemiBold else FontWeight.Medium, maxLines = 1,
-                                modifier = Modifier.clip(RoundedCornerShape(12.dp)).background(if (on) Kit.Accent else Color(0xFF22232A)).clickable { vm.mediaTab = t }
-                                    .padding(horizontal = 9.dp, vertical = 4.dp))
+                    // The chips scroll when they don't fit; a soft fade at each cut edge shows there is more, so a
+                    // chip never looks clipped mid-word.
+                    val chips = rememberScrollState()
+                    Box(Modifier.weight(1f)) {
+                        Row(Modifier.horizontalScroll(chips), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            for (t in tabs) {
+                                val on = t == tab
+                                Text(t, color = if (on) Kit.Ink else Kit.Dim, fontSize = 11.sp, fontWeight = if (on) FontWeight.SemiBold else FontWeight.Medium, maxLines = 1,
+                                    modifier = Modifier.clip(RoundedCornerShape(12.dp)).background(if (on) Kit.Accent else Color(0xFF22232A)).clickable { vm.mediaTab = t }
+                                        .padding(horizontal = 9.dp, vertical = 4.dp))
+                            }
                         }
+                        if (chips.canScrollForward) Box(Modifier.align(Alignment.CenterEnd).width(28.dp).height(24.dp)
+                            .background(Brush.horizontalGradient(listOf(Color.Transparent, Kit.Sheet))))
+                        if (chips.canScrollBackward) Box(Modifier.align(Alignment.CenterStart).width(28.dp).height(24.dp)
+                            .background(Brush.horizontalGradient(listOf(Kit.Sheet, Color.Transparent))))
                     }
                     Spacer(Modifier.width(6.dp))
                     Box(
@@ -171,13 +187,13 @@ fun MediaWindow(
             if (tab == "Text") TextSection(vm, onTextDragStart, onDrag, onDragEnd)
             else LazyVerticalGrid(
                 // About three across on a phone; fewer in a narrow docked column, more in a wide one.
-                GridCells.Adaptive(if (docked) 52.dp else 88.dp), Modifier.fillMaxSize(),
+                GridCells.Adaptive(if (dense) 52.dp else if (docked) 96.dp else 88.dp), Modifier.fillMaxSize(),
                 contentPadding = if (docked) PaddingValues(start = 8.dp, end = 8.dp, top = 2.dp, bottom = 10.dp) else PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 24.dp),
                 horizontalArrangement = Arrangement.spacedBy(if (docked) 5.dp else 10.dp), verticalArrangement = Arrangement.spacedBy(if (docked) 5.dp else 14.dp),
             ) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     Row(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-                        val n = assets.size
+                        val n = assets.count { !vm.isBuiltIn(it) }
                         Text(if (n == 1) "1 file" else "$n files", color = Kit.Dim, fontSize = if (docked) 11.sp else 13.sp, modifier = Modifier.weight(1f))
                         SortMenu(vm)
                     }
@@ -196,7 +212,7 @@ fun MediaWindow(
                 if (assets.isEmpty() && (tab != "All" || vm.importQueue.isEmpty())) item(span = { GridItemSpan(maxLineSpan) }) {
                     Empty(if (pool.isEmpty()) "Nothing here yet" else "No ${tab.lowercase()} in this project", if (pool.isEmpty()) onImport else null)
                 }
-                items(assets, key = { it.id }) { a -> androidx.compose.runtime.CompositionLocalProvider(LocalCompact provides docked) { AssetCard(vm, a, null, onDragStart, onDrag, onDragEnd) } }
+                items(assets, key = { it.id }) { a -> androidx.compose.runtime.CompositionLocalProvider(LocalCompact provides dense) { AssetCard(vm, a, null, onDragStart, onDrag, onDragEnd) } }
                 if (others.isNotEmpty()) {
                     item(span = { GridItemSpan(maxLineSpan) }) {
                         Column(Modifier.padding(top = 18.dp)) {
@@ -205,7 +221,7 @@ fun MediaWindow(
                             Text("Drag one in to use it here too", color = Kit.Dim, fontSize = 12.sp)
                         }
                     }
-                    items(others, key = { "o" + it.first + it.second.uri }) { (from, a) -> androidx.compose.runtime.CompositionLocalProvider(LocalCompact provides docked) { AssetCard(vm, a, from, onDragStart, onDrag, onDragEnd) } }
+                    items(others, key = { "o" + it.first + it.second.uri }) { (from, a) -> androidx.compose.runtime.CompositionLocalProvider(LocalCompact provides dense) { AssetCard(vm, a, from, onDragStart, onDrag, onDragEnd) } }
                 }
             }
         }
@@ -394,7 +410,7 @@ private fun AssetCard(
                     modifier = Modifier.align(Alignment.TopStart).padding(if (small) 3.dp else 6.dp).clip(RoundedCornerShape(6.dp)).background(c).padding(horizontal = 4.dp, vertical = 0.dp),
                 )
             }
-            if (!a.isImage) Tag(timecode(a.durationUs, a.fps).removePrefix("00:"), Modifier.align(Alignment.BottomEnd).padding(if (small) 2.dp else 6.dp), mono = true, small = small)
+            if (!a.isImage) Tag(clipLength(a.durationUs), Modifier.align(Alignment.BottomEnd).padding(if (small) 2.dp else 6.dp), mono = true, small = small)
             if (status?.percent != null) Box(
                 Modifier.align(Alignment.BottomStart).fillMaxWidth(status.percent / 100f).height(3.dp).background(Kit.Accent)
             )
@@ -420,7 +436,8 @@ private fun AssetCard(
         if (!LocalCompact.current) {
             Label(a.name)
             Text(
-                if (from != null) "From $from" else if (status != null && !status.ready) status.text else specs(a),
+                if (from != null) "From $from" else if (status != null && !status.ready) status.text
+                else if (vm.isBuiltIn(a)) "Built in · for gaps and fades" else specs(a),
                 color = if (from != null) Palette.VideoLabel else if (status != null && !status.ready) Kit.Accent else Kit.Dim,
                 fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
@@ -597,6 +614,13 @@ fun ImportWindow(vm: EditorViewModel) {
         yes = "Cancel import", no = "Keep importing",
         onYes = { confirmClose = false; vm.cancelImport() }, onNo = { confirmClose = false },
     )
+}
+
+/** A clip's length as people read it: 0:08, 12:40, 1:02:03 (not a timecode, where 08:00 looks like eight minutes). */
+internal fun clipLength(us: Long): String {
+    val s = ((us + 500_000L) / 1_000_000L).coerceAtLeast(if (us > 0) 1 else 0)
+    val h = s / 3600; val m = (s / 60) % 60; val sec = s % 60
+    return if (h > 0) "%d:%02d:%02d".format(h, m, sec) else "%d:%02d".format(m, sec)
 }
 
 private fun specs(a: MediaAsset): String {

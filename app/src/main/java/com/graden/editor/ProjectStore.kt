@@ -76,7 +76,8 @@ class ProjectStore(private val dir: File) {
                 .putOpt("cine", c.cinema?.toJson())
                 .putOpt("snd", if (c.snd.isDefault) null else JSONObject().put("v", c.snd.volume.toDouble()).put("m", c.snd.muted)
                     .put("n", c.snd.normalize).put("fi", c.snd.fadeInUs).put("fo", c.snd.fadeOutUs).put("p", c.snd.pan.toDouble())
-                    .put("b", c.snd.bass.toDouble()).put("mi", c.snd.mid.toDouble()).put("t", c.snd.treble.toDouble()).put("pi", c.snd.pitch.toDouble()))
+                    .put("b", c.snd.bass.toDouble()).put("mi", c.snd.mid.toDouble()).put("t", c.snd.treble.toDouble()).put("pi", c.snd.pitch.toDouble())
+                    .putOpt("fx", c.snd.fx.toJson()))
         )
     }
 
@@ -92,6 +93,7 @@ class ProjectStore(private val dir: File) {
                     Snd(
                         j.optDouble("v", 1.0).toFloat(), j.optBoolean("m"), j.optBoolean("n"), j.optLong("fi"), j.optLong("fo"),
                         j.optDouble("p").toFloat(), j.optDouble("b").toFloat(), j.optDouble("mi").toFloat(), j.optDouble("t").toFloat(), j.optDouble("pi").toFloat(),
+                        soundFxFromJson(j.optJSONObject("fx")),
                     )
                 } ?: Snd(),
                 o.optDouble("sp", 1.0).toFloat().coerceIn(0.1f, 10f),

@@ -301,27 +301,39 @@ internal fun CurvesPalette(vm: EditorViewModel) {
     val colors = listOf(Color(0xFFE8E9EE), RedC, GreenC, BlueC)
     fun of(c: Curves, i: Int) = when (i) { 0 -> c.y; 1 -> c.r; 2 -> c.g; else -> c.b }
     fun with(c: Curves, i: Int, p: List<CurvePt>) = when (i) { 0 -> c.copy(y = p); 1 -> c.copy(r = p); 2 -> c.copy(g = p); else -> c.copy(b = p) }
-    Column(Modifier.fillMaxSize().padding(horizontal = 10.dp, vertical = 4.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            for (i in 0..3) Chip(names[i], ch == i, dot = colors[i].takeIf { of(cv, i) != Curves.LINE }) { ch = i }
-            Spacer(Modifier.weight(1f))
-            SmallAction("Reset", enabled = of(cv, ch) != Curves.LINE) { vm.gradeOnce { it.copy(curves = with(it.curves, ch, Curves.LINE)) } }
+    val editor = @Composable { m: Modifier ->
+        CurveEditor(
+            vm, of(cv, ch), periodic = false, custom = true, color = colors[ch],
+            others = (0..3).filter { it != ch }.map { of(cv, it) to colors[it] },
+            background = {
+                // A faint ramp along the bottom: input brightness.
+                drawRect(Brush.horizontalGradient(listOf(Color.Black, colors[ch].copy(alpha = 0.55f))), Offset(10.dp.toPx(), size.height - 14.dp.toPx()), Size(size.width - 20.dp.toPx(), 3.dp.toPx()))
+            },
+            set = { gr, p -> gr.copy(curves = with(gr.curves, ch, p)) },
+            get = { gr -> of(gr.curves, ch) },
+            modifier = m,
+        )
+    }
+    androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxSize()) {
+        // A short, wide panel (a phone on its side): the channels down the left, so the curve gets the whole height.
+        if (LocalDense.current && maxWidth > maxHeight * 1.2f) Row(Modifier.fillMaxSize().padding(horizontal = 8.dp, vertical = 4.dp)) {
+            Column(Modifier.width(52.dp).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                for (i in 0..3) Chip(names[i], ch == i, dot = colors[i].takeIf { of(cv, i) != Curves.LINE }) { ch = i }
+                Spacer(Modifier.weight(1f))
+                SmallAction("Reset", enabled = of(cv, ch) != Curves.LINE) { vm.gradeOnce { it.copy(curves = with(it.curves, ch, Curves.LINE)) } }
+            }
+            Spacer(Modifier.width(8.dp))
+            editor(Modifier.weight(1f).fillMaxHeight())
+        } else Column(Modifier.fillMaxSize().padding(horizontal = 10.dp, vertical = 4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                for (i in 0..3) Chip(names[i], ch == i, dot = colors[i].takeIf { of(cv, i) != Curves.LINE }) { ch = i }
+                Spacer(Modifier.weight(1f))
+                SmallAction("Reset", enabled = of(cv, ch) != Curves.LINE) { vm.gradeOnce { it.copy(curves = with(it.curves, ch, Curves.LINE)) } }
+            }
+            Spacer(Modifier.height(6.dp))
+            Row(Modifier.weight(1f)) { editor(Modifier.weight(1f).fillMaxHeight()) }
+            if (!LocalDense.current) Text("Touch the line to add a point · drag to shape · double tap a point to remove", color = Dim, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp))
         }
-        Spacer(Modifier.height(6.dp))
-        Row(Modifier.weight(1f)) {
-            CurveEditor(
-                vm, of(cv, ch), periodic = false, custom = true, color = colors[ch],
-                others = (0..3).filter { it != ch }.map { of(cv, it) to colors[it] },
-                background = {
-                    // A faint ramp along the bottom: input brightness.
-                    drawRect(Brush.horizontalGradient(listOf(Color.Black, colors[ch].copy(alpha = 0.55f))), Offset(10.dp.toPx(), size.height - 14.dp.toPx()), Size(size.width - 20.dp.toPx(), 3.dp.toPx()))
-                },
-                set = { gr, p -> gr.copy(curves = with(gr.curves, ch, p)) },
-                get = { gr -> of(gr.curves, ch) },
-                modifier = Modifier.weight(1f).fillMaxHeight(),
-            )
-        }
-        Text("Touch the line to add a point · drag to shape · double tap a point to remove", color = Dim, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp))
     }
 }
 

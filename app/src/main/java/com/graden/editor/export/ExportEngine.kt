@@ -114,6 +114,10 @@ class ExportEngine(
     private val main = Handler(Looper.getMainLooper())
     private fun ui(block: () -> Unit) = main.post(block)
 
+    /** The picture step has begun (the encoder is being set up), and how many frames have gone through it since. */
+    private var inPicture = false
+    private var framesIn = 0
+
     fun run() {
         val dir = File(context.getExternalFilesDir(null) ?: context.filesDir, "exports").apply { mkdirs() }
         dir.listFiles()?.forEach { it.delete() }
@@ -232,6 +236,7 @@ class ExportEngine(
                 outBuf.clear()
             }
 
+            inPicture = true
             try {
                 when (route) {
                     Route.SURFACE -> {
@@ -324,6 +329,7 @@ class ExportEngine(
                             drain(false)
                         }
                     }
+                    framesIn = n + 1
                     // Stabilised frames: the whole time each took (decode, warp, grade, encode), for their own speed.
                     if (comp.lastStabilised) { stabNs += System.nanoTime() - tf; stabN++ }
                     val now = SystemClock.elapsedRealtime()
@@ -392,8 +398,16 @@ class ExportEngine(
         } catch (e: Throwable) {
             android.util.Log.e("Export", "export failed", e)
             video.delete(); audioFile.delete()
+            // A hardware encoder that is set up and then refuses at once (it is shut down, or stops on its first
+            // frames) is beyond what it can do at this size and rate, whatever it declared. Android's own words for it
+            // ("Invalid to call at Released state") say nothing useful, so it is said plainly.
+            val codecFail = e is IllegalStateException || e is MediaCodec.CodecException
+            val msg = if (inPicture && framesIn < 5 && codecFail && !enc.soft)
+                "This phone's ${enc.label} encoder stopped right away at ${s.width}×${s.height}, ${project.meta.fpsLabel} fps. " +
+                    "It can't encode this size at this frame rate: try a lower resolution, or a project at 30 fps or less."
+            else e.message ?: e.javaClass.simpleName
             ui {
-                ExportJob.error = e.message ?: e.javaClass.simpleName
+                ExportJob.error = msg
                 ExportJob.phase = ExportJob.Phase.FAILED
             }
         } finally {

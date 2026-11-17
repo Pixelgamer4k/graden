@@ -68,6 +68,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
@@ -123,15 +124,16 @@ class Lane(val key: Int, val video: Boolean, val top: Float, val height: Float) 
  * a new video layer opens above the top one, a new audio lane below the last. Lanes keep their
  * height ([scale]d by a vertical pinch); when there are more than fit, they scroll. Positions here are unscrolled.
  */
-fun layoutLanes(heightPx: Float, d: Density, tracks: List<Track>, ghost: Int, scale: Float = 1f): List<Lane> = with(d) {
+fun layoutLanes(heightPx: Float, d: Density, tracks: List<Track>, ghost: Int, scale: Float = 1f, compact: Boolean = false): List<Lane> = with(d) {
     val rows = ArrayList<Pair<Int, Boolean>>()
     if (ghost == NEW_VIDEO) rows += NEW_VIDEO to true
     tracks.asReversed().forEach { rows += it.id to it.video }
     if (ghost == NEW_AUDIO) rows += NEW_AUDIO to false
     val gap = 1.dp.toPx()
-    var y = 40.dp.toPx()
+    var y = (if (compact) 30.dp else 40.dp).toPx()
     rows.map { (key, video) ->
-        val h = (if (video) 54.dp.toPx() else 46.dp.toPx()) * scale
+        // Compact (a landscape window): slimmer lanes with no filmstrip, so about half as many again fit in view.
+        val h = (if (compact) (if (video) 40.dp else 32.dp) else (if (video) 54.dp else 46.dp)).toPx() * scale
         Lane(key, video, y, h).also { y += h + gap }
     }
 }
@@ -228,7 +230,6 @@ private val AudioAltFill = Color(0xFF363F22)
 private val AudioAltEdge = Color(0xFF5F6E38)
 private val PictureFill = Color(0xFF4A3F22)
 private val PictureEdge = Color(0xFF8C7636)
-private val PictureCap = Color(0xFFE0BC55)
 // Label colours: a light tint of each clip kind's own colour.
 private val VideoInk = Color(0xFFB4C8F5)
 private val AudioInk = Color(0xFFA9DCC3)
@@ -250,16 +251,17 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
     val density = LocalDensity.current
     val scope = rememberCoroutineScope()
     val haptics = LocalHapticFeedback.current
-    val g = remember(density) {
+    val compact = vm.timelineCompact
+    val g = remember(density, compact) {
         with(density) {
             Geo(
-                dp = 1.dp.toPx(), rulerH = 34.dp.toPx(), headerW = 46.dp.toPx(), handleW = 18.dp.toPx(), corner = 6.dp.toPx(),
+                dp = 1.dp.toPx(), rulerH = (if (compact) 26.dp else 34.dp).toPx(), headerW = 46.dp.toPx(), handleW = 18.dp.toPx(), corner = 6.dp.toPx(),
                 minTick = 44.dp.toPx(), minPps = 0.02.dp.toPx(), maxPps = 320.dp.toPx(), basePps = 48.dp.toPx(),
             )
         }
     }
     if (vm.pxPerSec <= 0f) vm.pxPerSec = g.basePps
-    vm.snapPx = 10 * g.dp
+    vm.snapPx = 2.5f * g.dp // the magnet catches only when the edge is brought right up to its target
     val decay = remember(density) { splineBasedDecay<Float>(density) }
     val fling = remember { arrayOfNulls<Job>(1) }
     val path = remember { Path() }
@@ -311,7 +313,7 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
     BoxWithConstraints(modifier.clipToBounds()) {
         com.graden.editor.RecomposeProbe.hit("TimelineBox")
         val ghost = vm.drop?.trackId?.takeIf { it < 0 } ?: 0
-        val lanes = layoutLanes(constraints.maxHeight.toFloat(), density, vm.tracks, ghost, vm.laneScale)
+        val lanes = layoutLanes(constraints.maxHeight.toFloat(), density, vm.tracks, ghost, vm.laneScale, vm.timelineCompact)
         val target = remember { arrayOf(lanes) }
         target[0] = lanes
         // More lanes than fit: they scroll up and down under the ruler.
@@ -388,8 +390,8 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                     var zoomed = false
                     scrolled[0] = 0L
                     travel[0] = 0L
-                    // Trimming a V0 clip's left edge already shifts the view itself, so it does not auto-scroll.
-                    val canAutoScroll = !(handle < 0 && vm.selectedClipId?.let(vm::locate)?.trackId == V0)
+                    // Every trim keeps the timeline still under the finger, so every one can auto-scroll at the edges.
+                    val canAutoScroll = true
                     if (handle != 0) {
                         mode = Mode.TRIM
                         vm.trimStart(left = handle < 0)
@@ -407,7 +409,8 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                             }
                             1 -> {
                                 if (junction != null) vm.openFx(junction, EditorViewModel.FxSlot.TRANSITION)
-                                else if (headerLane == null) vm.tapClip(hit)
+                                // A tap on an empty part of a lane is a tap on nothing (it deselects); on a header it does nothing.
+                                else if (!overHeader) vm.tapClip(hit)
                                 return@awaitEachGesture
                             }
                             else -> {
@@ -422,6 +425,9 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                     }
                     var total = 0f
                     var totalY = 0f
+                    // Edge auto-scroll starts only once the finger has been away from the edges and then goes to one:
+                    // a handle picked up near an edge must not set the timeline moving under it.
+                    var edgeArmed = false
                     while (true) {
                         val ev = awaitPointerEvent()
                         val pressed = ev.changes.count { it.pressed }
@@ -452,14 +458,15 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                             if (mode == Mode.TRIM || mode == Mode.MOVE) {
                                 travel[0] = travelUs
                                 dragMode[0] = mode
-                                edgeSpeed.floatValue =
-                                    if (canAutoScroll) edgeScrollSpeed(ch.position.x, g.headerW, size.width.toFloat(), 64 * g.dp, g.dp) else 0f
+                                val speed = if (canAutoScroll) edgeScrollSpeed(ch.position.x, g.headerW, size.width.toFloat(), 64 * g.dp, g.dp) else 0f
+                                if (speed == 0f) edgeArmed = true
+                                edgeSpeed.floatValue = if (edgeArmed) speed else 0f
                             }
                             when (mode) {
                                 Mode.TRIM -> vm.trimDrag(travelUs + scrolled[0])
                                 Mode.MOVE -> {
                                     // The lane under the finger, measured on the layout without the preview lane so it cannot chase itself.
-                                    val rows = layoutLanes(size.height.toFloat(), this, vm.tracks, 0, vm.laneScale)
+                                    val rows = layoutLanes(size.height.toFloat(), this, vm.tracks, 0, vm.laneScale, vm.timelineCompact)
                                     pickLane[0] = laneKeyAt(ch.position.y + vm.laneScroll, rows, 3 * g.dp)
                                     pick.value = ch.position
                                     vm.moveDrag(travelUs + scrolled[0], pickLane[0])
@@ -474,12 +481,12 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                                 Mode.LANES -> vm.scrollLanesBy(-dy)
                                 Mode.REORDER -> {
                                     // Swap once the finger is well inside another lane, so lanes of different heights do not flip back and forth.
-                                    val rows = layoutLanes(size.height.toFloat(), this, vm.tracks, 0, vm.laneScale)
+                                    val rows = layoutLanes(size.height.toFloat(), this, vm.tracks, 0, vm.laneScale, vm.timelineCompact)
                                     val y = ch.position.y + vm.laneScroll
                                     rows.firstOrNull { y >= it.top + it.height * 0.2f && y <= it.bottom - it.height * 0.2f }?.let { vm.reorderOver(it.key) }
                                 }
                                 else -> {
-                                    vm.scrubBy((-dx / vm.pxPerSec * 1e6f).toLong())
+                                    vm.scrubBy((-dx / vm.pxPerSec * 1e6f).toLong(), snap = true)
                                     tracker.addPosition(ch.uptimeMillis, ch.position)
                                     if (abs(dx) > 0.5f) lastMoveAt = ch.uptimeMillis
                                 }
@@ -615,7 +622,8 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                     // Filmstrip pictures from the clip's scrub proxy (tiny, every frame a keyframe, quick to read); a clip
                     // whose pictures have not all arrived yet is recorded again as they land, then stays as it is.
                     var missing = false
-                    val thumb: ((Long) -> androidx.compose.ui.graphics.ImageBitmap?)? = a?.takeIf { !it.isAudio }?.let { asset ->
+                    // No filmstrip on a compact (landscape) timeline: the clip is its colour, name and waveform.
+                    val thumb: ((Long) -> androidx.compose.ui.graphics.ImageBitmap?)? = if (compact) null else a?.takeIf { !it.isAudio }?.let { asset ->
                         val px = vm.proxies[asset.id]
                         if (asset.isImage || px != null) { us -> vm.thumbs.get(asset, us, px).also { if (it == null) missing = true } } else null
                     }
@@ -640,6 +648,8 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                     if (clip.startUs > tR + 5_000_000L) break
                     drawAnimMarks(g, clip, xOf(clip.startUs), xOf(clip.endUs) - 2.5f * g.dp, top + 3 * g.dp, h - 6 * g.dp, usPerPx)
                     val prev = laneClips.getOrNull(ci - 1)?.takeIf { it.endUs == clip.startUs } ?: continue
+                    // A transition already there always shows; the bare "+" is put away while editing (see cutMarksHidden).
+                    if (vm.cutMarksHidden && clip.transition == null) continue
                     val box = junctionBox(g, clip, prev, top, xOf(clip.startUs), usPerPx) ?: continue
                     drawJunction(g, paints, box, clip.transition)
                 }
@@ -701,9 +711,13 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                 val top = (selLane.top.value - sc) + 3 * g.dp
                 val h = selLane.height.value - 6 * g.dp
                 val side = vm.trimSide
-                drawRect(Color.White, Offset(x0, top), Size(x1 - x0, h), style = Stroke(2.5f * g.dp))
-                drawTrimHandle(g, path, true, x0, top, h, side < 0)
-                drawTrimHandle(g, path, false, x1, top, h, side > 0)
+                drawSelection(g, path, x0, x1, top, h, side)
+                // While an edge is pulled: a one-pixel line at its exact time, from the ruler down through every lane,
+                // to line it up against anything (the magnet's guide is drawn over it when it snaps).
+                if (side != 0) {
+                    val ex = if (side < 0) x0 else xOf(sel.startUs + sel.clip.durationUs)
+                    drawLine(Color.White.copy(alpha = 0.9f), Offset(ex, g.rulerH), Offset(ex, size.height), 1f)
+                }
                 if (side != 0) {
                     // While trimming, the clip's length rides above the edge being pulled.
                     val label = "%.1fs".format(sel.clip.durationUs / 1e6)
@@ -732,6 +746,15 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                 drawRoundRect(if (audio) AudioFill else VideoFill, Offset(bx, by), Size(bw, 30 * g.dp), CornerRadius(9 * g.dp))
                 drawRoundRect(Color.White, Offset(bx, by), Size(bw, 30 * g.dp), CornerRadius(9 * g.dp), style = Stroke(1.5f * g.dp))
                 drawIntoCanvas { it.nativeCanvas.drawText(shown, bx + 10 * g.dp, by + 20 * g.dp, paints.name) }
+            }
+
+            // The magnet's guide: a fine white line down through the lanes where an edge or the playhead just snapped.
+            vm.snapGuideUs?.let { gu ->
+                val gx = xOf(gu)
+                if (gx >= g.headerW && gx <= size.width) {
+                    drawLine(Color.White.copy(alpha = 0.18f), Offset(gx, g.rulerH), Offset(gx, size.height), 4 * g.dp)
+                    drawLine(Color.White, Offset(gx, g.rulerH), Offset(gx, size.height), 1.2f * g.dp)
+                }
             }
 
             // Playhead with its timecode
@@ -1031,9 +1054,7 @@ private fun DrawScope.drawClipBlock(
             if (snd.fadeInUs > 0) drawLine(ink, Offset(x0, top + h), Offset(x0 + (snd.fadeInUs / usPerPx).toFloat(), soundTop), 1.3f * g.dp)
             if (snd.fadeOutUs > 0) drawLine(ink, Offset(x1, top + h), Offset(x1 - (snd.fadeOutUs / usPerPx).toFloat(), soundTop), 1.3f * g.dp)
         }
-        // A bright cap on the leading edge: this is where the clip really begins.
-        if (!lifted) drawRect(if (image) PictureCap else if (video) VideoWave else AudioWave, Offset(x0, top), Size(3.5f * g.dp, h))
-        if (w > 44 * g.dp && h > 24 * g.dp && a != null && !lifted) drawIntoCanvas { c ->
+        if (w > 44 * g.dp && h > 20 * g.dp && a != null && !lifted) drawIntoCanvas { c ->
             // The name sits at the clip's start and stays there, small and in a tint of the clip's own colour,
             // so it scrolls away with the clip instead of hanging on screen. The length sits at the clip's end.
             val ink = if (image) PictureInk else if (video) VideoInk else if (alternate) AudioAltInk else AudioInk
@@ -1112,30 +1133,44 @@ private fun DrawScope.drawCaptionBlock(g: Geo, cap: com.graden.editor.Caption, x
     }
 }
 
-private fun DrawScope.drawTrimHandle(g: Geo, path: Path, left: Boolean, edgeX: Float, top: Float, h: Float, active: Boolean) {
-    val w = g.handleW * if (active) 1.25f else 1f
-    val out = 4 * g.dp
-    val r = CornerRadius(9 * g.dp)
-    val zero = CornerRadius.Zero
-    val rect = if (left) Rect(edgeX - w, top - out, edgeX, top + h + out) else Rect(edgeX, top - out, edgeX + w, top + h + out)
-    fun shape(rc: Rect) {
+/**
+ * The selected clip's frame with its two trim handles, drawn as one piece: a rounded frame whose sides are the handles
+ * (each exactly the clip's height, no overhang) and whose top and bottom are fine lines, the handles' inner corners
+ * following the clip's own rounding. A small grip bar sits in each handle; the side being pulled turns accent.
+ */
+private fun DrawScope.drawSelection(g: Geo, path: Path, x0: Float, x1: Float, top: Float, h: Float, side: Int) {
+    val hw = 13 * g.dp                      // handle width (the touch area is wider, see hitHandle)
+    val line = 2 * g.dp                     // frame top and bottom
+    val outerR = CornerRadius(7 * g.dp)
+    val innerR = CornerRadius(min(g.corner, 4 * g.dp))
+    val outer = Rect(x0 - hw, top, x1 + hw, top + h)
+    val inner = Rect(x0, top + line, x1, top + h - line)
+    fun frame(o: Rect, i: Rect) {
         path.rewind()
-        path.addRoundRect(
-            if (left) RoundRect(rc, topLeft = r, bottomLeft = r, topRight = zero, bottomRight = zero)
-            else RoundRect(rc, topLeft = zero, bottomLeft = zero, topRight = r, bottomRight = r)
+        path.fillType = PathFillType.EvenOdd
+        path.addRoundRect(RoundRect(o, outerR))
+        if (i.width > 0f && i.height > 0f) path.addRoundRect(RoundRect(i, innerR))
+    }
+    // A soft shadow under the frame, so it lifts off the clips around it.
+    frame(outer.translate(0f, 1.5f * g.dp).inflate(0.5f * g.dp), inner.translate(0f, 1.5f * g.dp))
+    drawPath(path, Color.Black.copy(alpha = 0.28f))
+    frame(outer, inner)
+    drawPath(path, Color.White)
+    // The handle being pulled, in accent: only its own side of the frame.
+    if (side != 0) {
+        val l = side < 0
+        clipRect(left = if (l) outer.left else x1, right = if (l) x0 else outer.right) { drawPath(path, Palette.Accent) }
+    }
+    path.fillType = PathFillType.NonZero
+    // Grips: a short rounded bar in each handle.
+    val gh = min(14 * g.dp, h * 0.38f)
+    val gw = 2.5f * g.dp
+    for ((cx, active) in listOf((x0 - hw / 2) to (side < 0), (x1 + hw / 2) to (side > 0))) {
+        drawRoundRect(
+            if (active) Color.White else Color(0xFF15161C).copy(alpha = 0.55f),
+            Offset(cx - gw / 2, top + h / 2 - gh / 2), Size(gw, gh), CornerRadius(gw / 2),
         )
     }
-    shape(rect.translate(0f, 2 * g.dp).inflate(g.dp))
-    drawPath(path, Color.Black.copy(alpha = 0.35f))
-    shape(rect)
-    drawPath(path, if (active) Palette.Accent else Color.White)
-    val cx = rect.center.x
-    val cy = rect.center.y
-    val a = 3 * g.dp * if (left) 1f else -1f
-    val b = min(7 * g.dp, h / 5)
-    val ink = Color(0xFF15161C)
-    drawLine(ink, Offset(cx + a, cy - b), Offset(cx - a, cy), 2.4f * g.dp, cap = StrokeCap.Round)
-    drawLine(ink, Offset(cx - a, cy), Offset(cx + a, cy + b), 2.4f * g.dp, cap = StrokeCap.Round)
 }
 
 /**
@@ -1210,6 +1245,7 @@ private fun hitJunction(vm: EditorViewModel, g: Geo, lanes: List<Lane>, cx: Floa
         val track = vm.tracks.firstOrNull { it.id == lane.key } ?: continue
         for (c in track.clips) {
             val prev = track.clips.firstOrNull { it.endUs == c.startUs } ?: continue
+            if (vm.cutMarksHidden && c.transition == null) continue
             val box = junctionBox(g, c, prev, lane.top, cx + ((c.startUs - vm.playheadUs) / usPerPx).toFloat(), usPerPx) ?: continue
             if (box.inflate(slack).contains(p)) return c.id
         }

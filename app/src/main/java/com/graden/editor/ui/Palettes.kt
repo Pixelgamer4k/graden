@@ -82,7 +82,7 @@ private fun gr(vm: EditorViewModel) = vm.gradeTarget?.clip?.grade ?: Grade()
 
 @Composable
 private fun Scroll(content: @Composable () -> Unit) {
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = 6.dp)) { content() }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = if (LocalDense.current) 4.dp else 6.dp)) { content() }
 }
 
 private fun P(label: String, min: Float, max: Float, def: Float, fmt: String, get: (Grade) -> Float, set: (Grade, Float) -> Grade) = Primary(label, min, max, def, fmt, get, set)
@@ -112,8 +112,9 @@ private fun ZoneGraph(vm: EditorViewModel, selected: Int, onSelect: (Int) -> Uni
     val selNow by rememberUpdatedState(selected)
     val pick by rememberUpdatedState(onSelect)
     val lo = -8f; val hi = 8f
+    val dense = LocalDense.current
     Canvas(
-        Modifier.fillMaxWidth().height(116.dp).clip(RoundedCornerShape(12.dp)).background(Pro.Well).border(1.dp, Pro.Line, RoundedCornerShape(12.dp))
+        Modifier.fillMaxWidth().height(if (dense) 70.dp else 116.dp).clip(RoundedCornerShape(12.dp)).background(Pro.Well).border(1.dp, Pro.Line, RoundedCornerShape(12.dp))
             .pointerInput(Unit) {
                 awaitEachGesture {
                     val down = awaitFirstDown()
@@ -129,27 +130,32 @@ private fun ZoneGraph(vm: EditorViewModel, selected: Int, onSelect: (Int) -> Uni
                         if (d < best) { best = d; idx = i }
                     }
                     if (idx < 0) return@awaitEachGesture
-                    pick(idx)
                     var range = zones[idx].range
                     var moved = false
+                    var tapped = true
                     while (true) {
                         val e = awaitPointerEvent()
                         val c = e.changes.firstOrNull() ?: break
                         if (!c.pressed) break
                         val dx = c.positionChange().x
-                        if (!moved && abs(c.position.x - down.position.x) > 8 * density) { moved = true; m.gradeStart(); view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY) }
+                        val ax = abs(c.position.x - down.position.x); val ay = abs(c.position.y - down.position.y)
+                        // Up and down is the page scrolling: let go, changing nothing (not even which zone is chosen).
+                        if (!moved && ay > 10 * density && ay > ax) { tapped = false; break }
+                        if (!moved && ax > 10 * density && ax > ay * 1.4f) {
+                            moved = true; pick(idx); m.gradeStart(); view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                        }
                         if (!moved) continue
                         c.consume()
                         range = (range + dx / w * (hi - lo)).coerceIn(lo, hi)
                         val r = (Math.round(range * 20f) / 20f)
                         m.setGrade { g -> g.copy(zones = g.zones.copy(zones = g.zones.zones.mapIndexed { i, x -> if (i == idx) x.copy(range = r) else x })) }
                     }
-                    if (moved) m.gradeEnd()
+                    if (moved) m.gradeEnd() else if (tapped) pick(idx)
                 }
             },
     ) {
         val pad = 14.dp.toPx(); val w = size.width - 2 * pad
-        val top = 10.dp.toPx(); val bottom = size.height - 18.dp.toPx(); val h = bottom - top
+        val top = 10.dp.toPx(); val bottom = size.height - (if (dense) 8.dp else 18.dp).toPx(); val h = bottom - top
         fun xOf(st: Float) = pad + (st - lo) / (hi - lo) * w
         // Stop grid, mid grey marked.
         for (s in -8..8 step 2) {
@@ -181,7 +187,7 @@ private fun ZoneGraph(vm: EditorViewModel, selected: Int, onSelect: (Int) -> Uni
         }
         drawLine(Color.White.copy(alpha = 0.2f), Offset(pad, bottom), Offset(pad + w, bottom), 1f)
     }
-    Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp)) {
+    if (!dense) Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp)) {
         for (s in listOf("−8", "−4", "grey", "+4", "+8")) Text(s, color = Pro.Dim, fontSize = 10.sp, modifier = Modifier.weight(1f),
             textAlign = when (s) { "−8" -> TextAlign.Start; "+8" -> TextAlign.End; else -> TextAlign.Center })
     }
@@ -191,7 +197,8 @@ private fun ZoneGraph(vm: EditorViewModel, selected: Int, onSelect: (Int) -> Uni
 @Composable
 private fun ZoneChips(vm: EditorViewModel, selected: Int, onSelect: (Int) -> Unit) {
     val z = gr(vm).zones
-    Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+    val dense = LocalDense.current
+    Row(Modifier.fillMaxWidth().padding(vertical = if (dense) 5.dp else 8.dp), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
         for (i in 0..6) {
             val zone = if (i == 6) z.global else z.zones[i]
             val def = if (i == 6) HdrZone() else ZonesLayer.DEFAULTS[i]
@@ -199,16 +206,16 @@ private fun ZoneChips(vm: EditorViewModel, selected: Int, onSelect: (Int) -> Uni
             Column(
                 Modifier.weight(1f).clip(RoundedCornerShape(10.dp)).background(if (on) Color(0xFF2B2219) else Pro.Card)
                     .border(1.dp, if (on) ZoneColours[i].copy(alpha = 0.8f) else Pro.Line, RoundedCornerShape(10.dp))
-                    .clickable { onSelect(i) }.padding(vertical = 6.dp),
+                    .clickable { onSelect(i) }.padding(vertical = if (dense) 3.dp else 6.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Canvas(Modifier.size(22.dp)) {
+                Canvas(Modifier.size(if (dense) 15.dp else 22.dp)) {
                     val r = size.minDimension / 2
                     drawCircle(ZoneColours[i].copy(alpha = 0.25f), r)
                     drawCircle(ZoneColours[i], r, style = Stroke(1.5.dp.toPx()))
                     drawCircle(Color.White, 2.5.dp.toPx(), Offset(center.x + zone.x * r * 0.8f, center.y - zone.y * r * 0.8f))
                 }
-                Text(if (i == 6) "Global" else ZonesLayer.NAMES[i], color = if (on) Pro.Text else Pro.Dim, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Clip, modifier = Modifier.padding(top = 3.dp))
+                Text(if (i == 6) "Global" else ZonesLayer.NAMES[i], color = if (on) Pro.Text else Pro.Dim, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Clip, modifier = Modifier.padding(top = if (dense) 1.dp else 3.dp))
                 Text(if (zone.neutral(def)) "·" else "%+.1f".format(zone.exp), color = if (zone.neutral(def)) Pro.Faint else Palette.Accent, fontSize = 9.sp, fontFamily = Pro.Mono, maxLines = 1)
             }
         }
@@ -238,7 +245,9 @@ internal fun ZonesPanel(vm: EditorViewModel) {
             SectionCard(if (global) "Global" else ZonesLayer.NAMES[i], if (global) "Everything, after the zones" else if (i < 3) "Everything below its range" else "Everything above its range",
                 !zone.neutral(def), onReset = { vm.gradeOnce { g -> with(g) { def } } }) {
                 BoxWithConstraints(Modifier.fillMaxWidth()) {
-                    val wide = maxWidth > 330.dp
+                    val dense = LocalDense.current
+                    val mw = maxWidth
+                    val wide = mw > 330.dp
                     val pad = @Composable { m: Modifier ->
                         Column(m, horizontalAlignment = Alignment.CenterHorizontally) {
                             DiscPad(vm, zone.x, zone.y, Modifier.fillMaxWidth().aspectRatio(1f).padding(4.dp)) { u, v -> { g: Grade -> with(g) { it.copy(x = u, y = v) } } }
@@ -256,7 +265,20 @@ internal fun ZonesPanel(vm: EditorViewModel) {
                             }
                         }
                     }
-                    if (wide) Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (dense && mw > 260.dp) Row(verticalAlignment = Alignment.CenterVertically) {
+                        // Short panel: a small pad beside the sliders, two sliders to a row: the whole zone at a glance.
+                        pad(Modifier.width((mw * 0.3f).coerceIn(84.dp, 130.dp)))
+                        Spacer(Modifier.width(10.dp))
+                        val list = buildList {
+                            add(P("Exposure", -6f, 6f, 0f, "%+.2f", { of(it).exp }) { g, v -> with(g) { it.copy(exp = v) } })
+                            add(P("Saturation", 0f, 4f, 1f, "%.2f", { of(it).sat }) { g, v -> with(g) { it.copy(sat = v) } })
+                            if (!global) {
+                                add(P("Range", -8f, 8f, def.range, "%+.2f", { of(it).range }) { g, v -> with(g) { it.copy(range = v) } })
+                                add(P("Falloff", 0f, 1f, def.falloff, "%.2f", { of(it).falloff }) { g, v -> with(g) { it.copy(falloff = v) } })
+                            }
+                        }
+                        Box(Modifier.weight(1f)) { SliderGrid(vm, list) }
+                    } else if (wide) Row(verticalAlignment = Alignment.CenterVertically) {
                         pad(Modifier.weight(0.8f))
                         Spacer(Modifier.width(12.dp))
                         sliders(Modifier.weight(1.2f))

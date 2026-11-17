@@ -606,6 +606,32 @@ class GradedVideoView(context: Context, val key: String) : TextureView(context),
     }
     @Volatile var contentAspect = 0f
         private set
+    /**
+     * The shape of the video frame being sent to this view now (width / height as shown; NaN: not known), set by the
+     * decoder right before each frame. Drawn frames always take the shape of their own frame: when a view's clip
+     * changes, frames of the old clip are still on their way for a moment, and a shape set from the clip (or applied
+     * with "the next frame") drew them stretched, squeezed into a sliver or blown up at every cut.
+     */
+    @Volatile var frameAspect = Float.NaN
+    /** The shape the clip says (setLook), used for still pictures and when frames carry none. */
+    @Volatile private var lookAspect = 0f
+    /** The clip's shape before the last change: frames of that clip may still be arriving. */
+    @Volatile private var prevLookAspect = 0f
+
+    /**
+     * The shape to draw a frame of shape [r] (from its pixel size) in. A proxy's pixel size is off from its clip's real
+     * shape by encoder rounding and padding; drawn at that, the picture grew or shrank a little whenever the view went
+     * between proxy and original. So the frame's size only tells which clip it belongs to (the current one or the one
+     * before), and that clip's exact shape is used.
+     */
+    private fun shapeOf(r: Float): Float {
+        fun near(a: Float) = a > 0f && kotlin.math.abs(r - a) / a < 0.08f
+        return when {
+            near(lookAspect) -> lookAspect
+            near(prevLookAspect) -> prevLookAspect
+            else -> r
+        }
+    }
     @Volatile private var fill = false
     private var lastGrade: Grade? = null
     internal val lateScope = Runnable { drawNow() }
@@ -624,11 +650,14 @@ class GradedVideoView(context: Context, val key: String) : TextureView(context),
         val ly = if (g == null) null else layers
         val lyChanged = !(ly?.contentEquals(this.layers) ?: (this.layers == null))
         this.layers = ly
-        if (!cmChanged && !lyChanged && g == lastGrade && aspect == contentAspect && fill == this.fill) return
+        if (!cmChanged && !lyChanged && g == lastGrade && aspect == lookAspect && fill == this.fill) return
         lastGrade = g
         look = g
         gradeUniforms = g?.uniforms()
-        contentAspect = aspect
+        if (aspect != lookAspect) prevLookAspect = lookAspect
+        lookAspect = aspect
+        // Video frames bring their own shape; the clip's shape is used for pictures, and until a frame says otherwise.
+        if (pictureOn || frameAspect.isNaN() || !hasFrame) contentAspect = aspect
         this.fill = fill
         redraw()
     }
@@ -676,6 +705,7 @@ class GradedVideoView(context: Context, val key: String) : TextureView(context),
             // showed on every clip after it. The picture is dropped the moment a video frame arrives.
             runCatching {
                 pictureTex = c.uploadStill(pictureTex, bmp)
+                contentAspect = if (lookAspect > 0f) lookAspect else bmp.width.toFloat() / bmp.height.coerceAtLeast(1)
                 pictureOn = true
                 drawNow()
             }.onFailure { android.util.Log.w("GradedVideoView", "picture not drawn", it) }
@@ -725,6 +755,7 @@ class GradedVideoView(context: Context, val key: String) : TextureView(context),
                 runCatching {
                     t.updateTexImage()
                     t.getTransformMatrix(texM)
+                    frameAspect.let { if (!it.isNaN() && it > 0f) contentAspect = shapeOf(it) } // this frame's own clip's shape
                     hasFrame = true
                     pictureOn = false
                     lastFrameNs = t.timestamp
@@ -951,22 +982,31 @@ internal object ShaderCache {
         failed.delete()
         // Bound, not just started: a bound process runs at the app's own priority (an unbound one is treated as
         // background and given the slow cores: the compile took 32 s instead of 5 s).
-        val conn = object : android.content.ServiceConnection {
+        // One connection per process, so each is let go as soon as its own program is saved. (With one connection for
+        // both, the first to finish ended itself while still bound, and Android started it again.)
+        fun conn() = object : android.content.ServiceConnection {
             override fun onServiceConnected(name: android.content.ComponentName?, service: android.os.IBinder?) {}
             override fun onServiceDisconnected(name: android.content.ComponentName?) {}
         }
         // Two processes, one program each: the driver lets only one compile at a time per process, so this halves the wait.
         val parts = listOf(ShaderService::class.java to part(c, "v"), ShaderImageService::class.java to part(c, "i"))
         parts.forEach { it.second.delete() }
-        val viaService = parts.all { (cls, _) ->
-            runCatching { c.bindService(android.content.Intent(c, cls), conn, Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT) }.getOrDefault(false)
+        val conns = parts.map { conn() }
+        val bound = BooleanArray(parts.size)
+        val viaService = parts.indices.all { i ->
+            runCatching { c.bindService(android.content.Intent(c, parts[i].first), conns[i], Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT) }
+                .getOrDefault(false).also { bound[i] = it }
         }
+        fun letGo(i: Int) { if (bound[i]) { bound[i] = false; runCatching { c.unbindService(conns[i]) } } }
         Thread({
             // Waits for the other processes; if they can't (they failed, or never ran), compiles here after all.
             val t0 = SystemClock.uptimeMillis()
-            while (viaService && !parts.all { it.second.exists() } && !failed.exists() && SystemClock.uptimeMillis() - t0 < 180_000) Thread.sleep(150)
+            while (viaService && !parts.all { it.second.exists() } && !failed.exists() && SystemClock.uptimeMillis() - t0 < 180_000) {
+                parts.indices.forEach { if (parts[it].second.exists()) letGo(it) }
+                Thread.sleep(150)
+            }
             if (parts.all { it.second.exists() }) { mark.writeText("ok"); parts.forEach { it.second.delete() } }
-            if (viaService) runCatching { c.unbindService(conn) }
+            parts.indices.forEach { letGo(it) }
             if (!mark.exists()) compileAll(c)
             ready = true
             synchronized(views) { started = false }
@@ -1019,12 +1059,18 @@ open class ShaderService : android.app.Service() {
         super.onCreate()
         Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT)
+            // Done: the app sees the part marker and lets go of this process, which then ends (onUnbind). Ending here,
+            // while still bound, would make Android start it again.
             ShaderCache.compileAll(applicationContext, which)
-            // The app unbinds once it sees the marker; this process has nothing more to do.
-            Process.killProcess(Process.myPid())
         }, "shader-compile").start()
     }
     override fun onBind(intent: android.content.Intent?): android.os.IBinder = android.os.Binder()
+    override fun onUnbind(intent: android.content.Intent?): Boolean {
+        // Nothing holds this process now (the app has its program, or gave up waiting): it ends at once, freeing the GPU
+        // driver's memory, and with no binding left Android does not start it again.
+        android.os.Handler(android.os.Looper.getMainLooper()).post { stopSelf(); Process.killProcess(Process.myPid()) }
+        return false
+    }
 }
 
 /** The same for the picture program, in a second process, so both compile at once. */

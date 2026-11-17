@@ -430,6 +430,15 @@ fun ExportScreen(vm: EditorViewModel) {
                     Spacer(Modifier.width(6.dp))
                     Text(problem, color = Kit.Bad, fontSize = 12.sp, maxLines = 3, lineHeight = 15.sp)
                 }
+                // Not a stop: some encoders do more than they declare. A warning, so a failure isn't a surprise.
+                else if (enc != null && !enc.soft && !enc.supports(s.width, s.height, meta.fps)) Row(Modifier.padding(bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Lucide.Alert, null, tint = Kit.Accent, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        "This phone's encoder may not manage ${s.width}×${s.height} at ${meta.fpsLabel} fps. If the export fails, try a lower resolution or a ${if (meta.fps > 30.5f) "30 fps" else "lower frame rate"} project.",
+                        color = Kit.Accent, fontSize = 12.sp, maxLines = 3, lineHeight = 15.sp,
+                    )
+                }
                 val ok = problem == null && enc != null
                 KPrimary(
                     "Export", enabled = ok,

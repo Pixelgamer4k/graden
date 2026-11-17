@@ -16,12 +16,16 @@ import java.util.concurrent.TimeUnit
  * no codec flush and no decode-from-previous-keyframe, whatever the source codec was.
  * Requests are coalesced so the decoder always works on the newest playhead position.
  */
-class ScrubDecoder(private val onFrame: () -> Unit) {
+class ScrubDecoder(private val onFrame: (String) -> Unit) {
     private val thread = HandlerThread("scrub-decoder").apply { start() }
     private val handler = Handler(thread.looper)
     private val lock = Any()
     private var wantPath: String? = null
     private var wantUs = 0L
+    private var wantAspect = Float.NaN
+    /** Told the shape of each frame (that of the clip it was asked for) right before the frame goes to the surface. */
+    @Volatile var onFrameShape: ((Float) -> Unit)? = null
+    private var shape = Float.NaN
     private var scheduled = false
 
     // Decoder-thread state
@@ -42,10 +46,11 @@ class ScrubDecoder(private val onFrame: () -> Unit) {
         done.await(1, TimeUnit.SECONDS)
     }
 
-    fun show(path: String, sourceUs: Long) {
+    fun show(path: String, sourceUs: Long, aspect: Float = Float.NaN) {
         synchronized(lock) {
             wantPath = path
             wantUs = sourceUs
+            if (!aspect.isNaN()) wantAspect = aspect
             if (scheduled) return
             scheduled = true
         }
@@ -59,11 +64,12 @@ class ScrubDecoder(private val onFrame: () -> Unit) {
             scheduled = false
             p = wantPath ?: return
             t = wantUs
+            shape = wantAspect
         }
         val s = surface ?: return
         try {
             if (codec == null || path != p) open(p, s)
-            if (decode(t)) onFrame()
+            if (decode(t)) onFrame(p) // which file the frame on the surface now comes from
         } catch (e: Exception) {
             releaseCodec()
         }
@@ -109,6 +115,7 @@ class ScrubDecoder(private val onFrame: () -> Unit) {
             }
             val o = c.dequeueOutputBuffer(info, 4000)
             if (o >= 0) {
+                if (!shape.isNaN()) onFrameShape?.invoke(shape)
                 c.releaseOutputBuffer(o, true)
                 if (queued) return true
             }

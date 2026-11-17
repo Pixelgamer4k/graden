@@ -73,6 +73,10 @@ class ExportProject(
     val stabPrepMs: Long = 0L,
     val stabFrames: Long = 0L,
 ) {
+    /** Per clip that auto-ducks: its gain curve over its time on the timeline (see EditorViewModel.duckCurve). */
+    var duck: Map<Long, FloatArray> = emptyMap()
+    /** Steps per second of the duck curves. */
+    var duckRate: Int = 50
     /** Anything other than Rec.709 all the way through. */
     val cmOn: Boolean get() = output != com.graden.editor.ColorSpaces.REC709.code || pipes.values.any { !com.graden.editor.ColorPipe.isOff(it) }
     val totalUs: Long = tracks.maxOfOrNull { it.endUs } ?: 0L

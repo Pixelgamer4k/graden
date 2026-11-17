@@ -309,9 +309,9 @@ fun BoxScope.CanvasOverlay(vm: EditorViewModel) {
                 }
             }
         }
-        // Down the right edge, below the playback meter and out of the way of the picture.
+        // Down the right edge, out of the way of the picture, above the full-screen button in the corner.
         if (sel != null) Column(
-            Modifier.align(Alignment.BottomEnd).padding(end = 8.dp, bottom = 8.dp),
+            Modifier.align(Alignment.BottomEnd).padding(end = 8.dp, bottom = 52.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp), horizontalAlignment = Alignment.End,
         ) {
             Pill("Fit") { vm.fitCanvas() }

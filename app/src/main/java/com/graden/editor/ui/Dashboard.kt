@@ -265,7 +265,7 @@ private fun ProjectCard(vm: EditorViewModel, p: ProjectSummary, onOpen: () -> Un
                 modifier = Modifier.align(Alignment.TopStart).padding(7.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xB3000000)).padding(horizontal = 6.dp, vertical = 2.dp),
             )
             Text(
-                timecode(p.durationUs, p.meta.fps), color = Palette.Text, fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+                clipLength(p.durationUs), color = Palette.Text, fontSize = 10.sp, fontFamily = FontFamily.Monospace,
                 modifier = Modifier.align(Alignment.BottomEnd).padding(7.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xB3000000)).padding(horizontal = 6.dp, vertical = 2.dp),
             )
         }
@@ -321,7 +321,7 @@ private fun ProjectActions(vm: EditorViewModel, p: ProjectSummary?, modifier: Mo
                 Column(Modifier.weight(1f)) {
                     Text(pr.meta.name, color = Kit.Text, fontSize = 17.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text("${pr.meta.width} × ${pr.meta.height} · ${pr.meta.fpsLabel} fps", color = Kit.Dim, fontSize = 12.5.sp, maxLines = 1)
-                    Text("${timecode(pr.durationUs, pr.meta.fps)} · edited ${ago(pr.modified)}", color = Kit.Faint, fontSize = 12.sp, maxLines = 1)
+                    Text("${clipLength(pr.durationUs)} · edited ${ago(pr.modified)}", color = Kit.Faint, fontSize = 12.sp, maxLines = 1)
                 }
                 KIconButton(Lucide.X, "Close", onClose)
             }
@@ -416,6 +416,8 @@ private val LoudnessNotes = listOf("The mix is left as it is", "YouTube, Spotify
  */
 @Composable
 fun ProjectSheet(open: Boolean, initial: ProjectMeta?, onClose: () -> Unit, onDone: (ProjectMeta) -> Unit, modifier: Modifier) {
+    // Back closes the sheet, not the app.
+    androidx.activity.compose.BackHandler(open) { onClose() }
     if (open) Box(Modifier.fillMaxSize().background(Color(0xA6000000)).pointerInput(Unit) { detectTapGestures { onClose() } })
     AnimatedVisibility(open, modifier, enter = slideInVertically { it } + fadeIn(), exit = slideOutVertically { it } + fadeOut()) {
         val start = remember(open) { initial }
@@ -453,7 +455,8 @@ fun ProjectSheet(open: Boolean, initial: ProjectMeta?, onClose: () -> Unit, onDo
         val meta = if (isCustom) ProjectMeta.custom(base, cw, ch) else base
         val summary = "${meta.width} × ${meta.height}  ·  ${meta.ratioLabel}  ·  ${meta.fpsLabel} fps"
         Column(
-            Modifier.fillMaxWidth().fillMaxHeight(0.94f).clip(shape).background(Kit.Sheet).border(1.dp, Kit.Hair, shape)
+            // No wider than a comfortable sheet on a tablet; full width on a phone.
+            Modifier.widthIn(max = 720.dp).fillMaxWidth().fillMaxHeight(0.94f).clip(shape).background(Kit.Sheet).border(1.dp, Kit.Hair, shape)
                 .pointerInput(Unit) { detectTapGestures { } }.navigationBarsPadding().imePadding()
         ) {
             KGrabber()

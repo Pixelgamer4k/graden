@@ -271,19 +271,30 @@ internal fun DiscPad(vm: EditorViewModel, u: Float, v: Float, modifier: Modifier
         modifier.clip(CircleShape).pointerInput(Unit) {
             var lastTap = 0L
             awaitEachGesture {
-                awaitFirstDown().consume()
+                val down = awaitFirstDown()
                 val m = vmNow
                 var pu = uNow; var pv = vNow
                 var moved = 0f
-                m.gradeStart()
+                // A pad moves both ways, so a scroll that starts on it cannot be told apart by direction alone. It takes
+                // over after a short hold (any direction), or at once for a sideways start; a quick up-or-down start is
+                // the page scrolling, and the pad lets go without changing anything.
+                var mine = false
+                var gave = false
                 while (true) {
                     val e = awaitPointerEvent()
                     val c = e.changes.firstOrNull() ?: break
                     if (!c.pressed) break
                     val d = c.positionChange()
-                    c.consume()
                     moved += abs(d.x) + abs(d.y)
-                    if (moved < 6.dp.toPx()) continue
+                    if (!mine) {
+                        val ax = abs(c.position.x - down.position.x); val ay = abs(c.position.y - down.position.y)
+                        val held = c.uptimeMillis - down.uptimeMillis > 180
+                        if (ay > 8.dp.toPx() && ay > ax && !held) { gave = true; break }
+                        if ((ax > 8.dp.toPx() && ax >= ay) || (held && moved > 2.dp.toPx())) {
+                            mine = true; m.gradeStart(); view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                        } else continue
+                    }
+                    c.consume()
                     // Half the speed of the finger, so small moves are precise.
                     pu = (pu + d.x / size.width).coerceIn(-1f, 1f)
                     pv = (pv - d.y / size.height).coerceIn(-1f, 1f)
@@ -291,15 +302,16 @@ internal fun DiscPad(vm: EditorViewModel, u: Float, v: Float, modifier: Modifier
                     if (k > 1f) { pu /= k; pv /= k }
                     m.setGrade(setNow(pu, pv))
                 }
-                if (moved < 6.dp.toPx()) {
+                if (gave) return@awaitEachGesture
+                if (!mine && moved < 6.dp.toPx()) {
                     val now = android.os.SystemClock.uptimeMillis()
                     if (now - lastTap < 320) {
-                        m.setGrade(setNow(0f, 0f))
+                        m.gradeOnce(setNow(0f, 0f))
                         view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                     }
                     lastTap = now
                 }
-                m.gradeEnd()
+                if (mine) m.gradeEnd()
             }
         },
     ) {

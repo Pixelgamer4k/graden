@@ -35,6 +35,14 @@ class LayerPlayer(context: Context, audioOnly: Boolean = false, val probeName: S
         val key: String = "$source|${clip.inUs}|${clip.outUs}|${clip.speed}"
     }
 
+    /**
+     * The id of the clip each player holds (null: none). The preview shapes each player's picture by the clip it really
+     * has, not by the clip under the playhead: at a cut the playhead reaches the next clip a frame or two before the
+     * player showing it does, and the last frame of the old clip must not be drawn in the new one's shape.
+     */
+    private val held = List(2) { androidx.compose.runtime.mutableStateOf<Long?>(null) }
+    fun heldClipId(k: Int): Long? = held[k].value
+
     /** Each player's sound goes through its own processor: gain beyond 100%, pan and equaliser. */
     private val sound = List(2) { SoundProcessor() }
     private val pitch = floatArrayOf(0f, 0f)
@@ -76,6 +84,7 @@ class LayerPlayer(context: Context, audioOnly: Boolean = false, val probeName: S
                     override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                         probe("p$k ERROR ${error.errorCodeName}: ${error.message} -> reloading")
                         loaded[k] = null
+                        held[k].value = null
                     }
                 })
                 // The time of the frame really on screen, so the native frame at rest can be the very same picture.
@@ -171,6 +180,7 @@ class LayerPlayer(context: Context, audioOnly: Boolean = false, val probeName: S
         if (loaded[k] == item.key) return false
         probe("p$k LOAD start=${item.clip.startUs / 1000}ms local=${localUs / 1000}ms")
         loaded[k] = item.key
+        held[k].value = item.clip.id
         if (clipSpeed[k] != item.clip.speed) {
             clipSpeed[k] = item.clip.speed
             players[k].playbackParameters = PlaybackParameters(speed[k] * clipSpeed[k], 2.0.pow(pitch[k] / 12.0).toFloat())
@@ -369,6 +379,7 @@ class LayerPlayer(context: Context, audioOnly: Boolean = false, val probeName: S
         players[k].stop()
         players[k].clearMediaItems()
         loaded[k] = null
+        held[k].value = null
     }
 
     /** True when [current] is loaded and ready to play at once, for starting all lanes together. */

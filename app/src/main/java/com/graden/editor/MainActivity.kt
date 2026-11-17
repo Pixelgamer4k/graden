@@ -6,6 +6,7 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.compose.runtime.remember
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.lifecycle.lifecycleScope
@@ -34,7 +35,14 @@ class MainActivity : ComponentActivity() {
             ?.let { best -> window.attributes = window.attributes.apply { preferredDisplayModeId = best.modeId } }
         GradeGl.probeHdr(this)
         if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) watchdog()
-        setContent { EditorScreen(vm) }
+        setContent {
+            // Graden's own units, independent of the device's display-size and font-size settings: sized from the panel's
+            // real pixel density, so every part has the same physical size on every phone, tablet and foldable.
+            val d = remember(resources.configuration) { appDensity() }
+            androidx.compose.runtime.CompositionLocalProvider(androidx.compose.ui.platform.LocalDensity provides androidx.compose.ui.unit.Density(d, 1f)) {
+                EditorScreen(vm)
+            }
+        }
         // A foldable reports its fold; half open along the width, the picture goes above it and the controls below.
         lifecycleScope.launch {
             repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) {
@@ -103,12 +111,39 @@ class MainActivity : ComponentActivity() {
      * The navigation bar is hidden for the editor's room, and on its side the status bar too; a swipe in from the edge
      * shows them for a moment.
      */
+    /** Full-screen player open: no bars at all, whichever way the phone is turned. */
+    var fullPlayer = false
+
+    /** Back to the editor's usual bars (after full screen hid them all). */
+    fun restoreBars() = hideBars(resources.configuration)
+
     private fun hideBars(config: android.content.res.Configuration) {
         val c = androidx.core.view.WindowCompat.getInsetsController(window, window.decorView)
         c.systemBarsBehavior = androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         c.hide(androidx.core.view.WindowInsetsCompat.Type.navigationBars())
-        if (config.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE) c.hide(androidx.core.view.WindowInsetsCompat.Type.statusBars())
+        if (fullPlayer) c.hide(androidx.core.view.WindowInsetsCompat.Type.statusBars())
+        else if (config.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE) c.hide(androidx.core.view.WindowInsetsCompat.Type.statusBars())
         else c.show(androidx.core.view.WindowInsetsCompat.Type.statusBars())
+    }
+
+    /**
+     * Pixels per dp for Graden's UI, from the panel alone: its measured density (xdpi / ydpi), times a viewing-distance
+     * factor from its physical diagonal. Phones (up to about 7") get 1.06, which keeps a typical phone's look (a 452 dpi
+     * panel gives 3.0, as at display size 480); larger screens, held further away, ease up to 1.38 at 13" and beyond. One
+     * smooth rule for every screen: no device lists, and the display-size and font-size settings play no part. Falls back
+     * to the system density when the panel reports an implausible value (some devices and emulators do).
+     */
+    private fun appDensity(): Float {
+        val m = resources.displayMetrics
+        val real = (m.xdpi + m.ydpi) / 2f
+        val sys = m.densityDpi.toFloat()
+        if (real !in 100f..900f || real / sys !in 0.45f..2.2f) return sys / 160f
+        val px = if (android.os.Build.VERSION.SDK_INT >= 30) windowManager.maximumWindowMetrics.bounds.let { it.width() to it.height() }
+            else android.util.DisplayMetrics().also { @Suppress("DEPRECATION") windowManager.defaultDisplay.getRealMetrics(it) }.let { it.widthPixels to it.heightPixels }
+        val inches = kotlin.math.hypot(px.first / m.xdpi, px.second / m.ydpi)
+        val t = ((inches - 7f) / 6f).coerceIn(0f, 1f)
+        val far = t * t * (3f - 2f * t)
+        return real * (1.06f + 0.32f * far) / 160f
     }
 
     override fun onStop() {

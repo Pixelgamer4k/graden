@@ -18,6 +18,8 @@ Get help, share your edits, report bugs and talk with the developer.
 
 <a href="https://buymeacoffee.com/pixelgamer4k"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="60"></a>
 
+<img src="docs/screenshots/devices.jpg" alt="Graden on a phone, a tablet and an open foldable" width="100%">
+
 <img src="docs/screenshots/banner.png" alt="Graden: timeline, colour page and export" width="100%">
 
 </div>
@@ -132,7 +134,7 @@ hardware encoder. The results and the fixes they led to are in [docs/TESTING.md]
 
 ## Install
 
-1. Download **`Graden-0.4.2-beta.apk`** from the [latest release](https://github.com/Pixelgamer4k/graden/releases).
+1. Download **`Graden-0.5.0-beta.apk`** from the [latest release](https://github.com/Pixelgamer4k/graden/releases).
 2. Open it on your phone and allow installing from this source when Android asks.
 
 Needs **Android 10 or newer**. A recent phone with a capable chip gives the best experience with 4K footage.
@@ -160,7 +162,7 @@ This beta exists to collect feedback, so every report helps:
 - 10-bit and HDR export depend on the phone's encoder; where it cannot, the export screen says so
 - The colour wheels follow Resolve's manual but are not yet measured against Resolve the way the colour space
   transform is
-- 0.4.2 is signed with the same key as earlier betas, so it installs over them and keeps your projects
+- 0.5.0 is signed with the same key as earlier betas, so it installs over them and keeps your projects
 - Captions need a 64-bit ARM phone; speaker and music detection need one from about 2019 on (ARMv8.2)
 - GIFs are shown as still pictures for now
 - Captions are drawn into the video; exporting them as a separate subtitle file is planned

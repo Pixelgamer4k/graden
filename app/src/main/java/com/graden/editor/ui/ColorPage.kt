@@ -58,6 +58,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
@@ -125,6 +126,9 @@ import kotlin.math.sin
 
 private val Ink = Color(0xFFC9CBD3)
 private val Panel = Color(0xFF121318)
+/** The controls' card on the Color page: a shade lighter than the page, rounded at its top, with a hairline edge. */
+private val ControlsCard = Color(0xFF181920)
+private val ControlsShape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp)
 private val Well = Color(0xFF08090C)
 private val RCh = Color(0xFFFF5A52)
 private val GCh = Color(0xFF52E07A)
@@ -175,14 +179,22 @@ fun ColorTopBar(vm: EditorViewModel) {
     BackHandler { vm.closeColor() }
     val target = vm.gradeTarget
     val name = target?.let { vm.assets[it.clip.assetId]?.name } ?: "No clip under the playhead"
+    // In a narrow panel (a phone on its side) the buttons get a little smaller, and if even then the title has no room
+    // it steps aside (the clip's colour space is also on the Colour space card below): it never wraps letter by letter.
+    androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxWidth()) {
+    val narrow = maxWidth < 460.dp
+    val titled = maxWidth >= 380.dp
+    CompositionLocalProvider(LocalIconBox provides if (narrow) 34.dp else 38.dp) {
     Row(
         Modifier.fillMaxWidth().height(50.dp).padding(horizontal = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         RoundIcon(Lucide.X, "Close") { vm.closeColor() }
         var picking by remember { mutableStateOf(false) }
-        Column(Modifier.weight(1f).padding(start = 4.dp)) {
-            Text("Color", color = Palette.Accent, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        if (!titled) Spacer(Modifier.weight(1f))
+        if (titled) Column(Modifier.weight(1f).padding(start = 4.dp)) {
+            Text("Color", color = Palette.Accent, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, softWrap = false,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Clip)
             // What the clip was shot in: tap to set a camera log by hand.
             val clip = target?.clip
             val asset = clip?.let { vm.assets[it.assetId] }
@@ -208,15 +220,21 @@ fun ColorTopBar(vm: EditorViewModel) {
         RoundIcon(Lucide.RotateCcw, "Reset grade", enabled = target?.clip?.grade?.isIdentity == false) { vm.gradeOnce { Grade() } }
         Spacer(Modifier.width(4.dp))
         Box(
-            Modifier.clip(RoundedCornerShape(50)).background(Palette.Accent).clickable { vm.closeColor() }.padding(horizontal = 14.dp, vertical = 7.dp),
-        ) { Text("Done", color = Color.Black, fontSize = 13.sp, fontWeight = FontWeight.SemiBold) }
+            Modifier.clip(RoundedCornerShape(50)).background(Palette.Accent).clickable { vm.closeColor() }
+                .padding(horizontal = if (narrow) 11.dp else 14.dp, vertical = 7.dp),
+        ) { Text("Done", color = Color.Black, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, softWrap = false) }
+    }
+    }
     }
 }
+
+/** The size of the round icon buttons in the Color top bar (smaller in a narrow panel). */
+private val LocalIconBox = androidx.compose.runtime.staticCompositionLocalOf { 38.dp }
 
 @Composable
 private fun RoundIcon(icon: ImageVector, label: String, enabled: Boolean = true, tint: Color = Ink, onClick: () -> Unit) {
     Box(
-        Modifier.size(38.dp).clip(CircleShape).clickable(enabled = enabled, onClick = onClick),
+        Modifier.size(LocalIconBox.current).clip(CircleShape).clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) { Icon(icon, label, tint = if (enabled) tint else tint.copy(alpha = 0.3f), modifier = Modifier.size(19.dp)) }
 }
@@ -291,14 +309,14 @@ fun ColorBody(vm: EditorViewModel, modifier: Modifier) {
                 // 0: the scope or timeline, as tall as the room above the transport.
                 BoxWithConstraints(Modifier.fillMaxSize()) { ScopePanel(vm, (maxHeight - 48.dp).coerceAtLeast(0.dp)) }
                 // 1: the panel's colour under the controls, so a panel pulled taller than its layout shows no gap.
-                Box(Modifier.fillMaxSize().background(Panel))
+                Box(Modifier.fillMaxSize().clip(ControlsShape).background(ControlsCard).border(1.dp, Color(0xFF2A2C35), ControlsShape))
                 // 2: the controls, at their laid-out height.
-                Controls(vm, Modifier.fillMaxSize())
+                Controls(vm, Modifier.fillMaxSize().clip(ControlsShape).border(1.dp, Color(0xFF2A2C35), ControlsShape), card = true)
                 // 3: transport and the drag bar.
                 Column(Modifier.fillMaxWidth()) {
                     ColorTransport(vm)
                     Box(
-                        Modifier.fillMaxWidth().height(18.dp).background(Panel).pointerInput(total) {
+                        Modifier.fillMaxWidth().height(18.dp).pointerInput(total) {
                             val totalPx = with(density) { total.toPx() }
                             val velocity = androidx.compose.ui.input.pointer.util.VelocityTracker()
                             var last = frac.value
@@ -368,6 +386,121 @@ fun ColorBody(vm: EditorViewModel, modifier: Modifier) {
         }
     }
 }
+
+/**
+ * The Color page's upright layout for any page: [top] (given its height) above, the [transport] with a drag bar, and
+ * [controls] below on a card. The bar is dragged live, rests at three places (top nearly hidden, a middle split, top
+ * large) and flicks between them; [fraction] is the share the controls take, kept by the caller.
+ */
+@Composable
+internal fun SplitPage(
+    fraction: Float, onFraction: (Float) -> Unit, modifier: Modifier,
+    top: @Composable (androidx.compose.ui.unit.Dp) -> Unit, controls: @Composable (Modifier) -> Unit, transport: @Composable () -> Unit,
+) {
+    BoxWithConstraints(modifier.fillMaxWidth().background(Palette.Bg)) {
+        val total = maxHeight
+        val density = androidx.compose.ui.platform.LocalDensity.current
+        val view = LocalView.current
+        val scope = rememberCoroutineScope()
+        val minControls = 200.dp
+        val maxControls = (total - 48.dp - 44.dp).coerceAtLeast(minControls)
+        // The rests, as the share of the page the controls take.
+        val lo = (minControls / total).coerceIn(0.2f, 0.6f)
+        val hi = (maxControls / total).coerceIn(lo, 1f)
+        val rests = listOf(0.42f.coerceIn(lo, hi), 0.62f.coerceIn(lo, hi), hi)
+        val frac = remember { androidx.compose.animation.core.Animatable(fraction.coerceIn(lo, hi)) }
+        var dragging by remember { mutableStateOf(false) }
+        // While the finger is on the bar its position is set straight from the drag (no animation step per move).
+        var live by remember { androidx.compose.runtime.mutableFloatStateOf(frac.value) }
+        // How much of the page the controls are laid out for. It changes only at a rest (or when the finger lets go, to
+        // where the panel is heading), never while it moves, so the wheels and tabs never reflow under the finger.
+        var layoutFrac by remember { androidx.compose.runtime.mutableFloatStateOf(frac.value.coerceIn(lo, hi)) }
+        val grip by animateFloatAsState(if (dragging) 1f else 0f, spring(0.6f, 700f), label = "grip")
+        // Where the bar is now: read only while placing (below), so moving it re-places the parts without rebuilding
+        // any of them: the page slides, nothing is composed again.
+        val shownFrac = { (if (dragging) live else frac.value).coerceIn(lo - 0.04f, hi + 0.04f) }
+        androidx.compose.ui.layout.Layout(
+            content = {
+                // 0: the scope or timeline, as tall as the room above the transport.
+                BoxWithConstraints(Modifier.fillMaxSize()) { top(maxHeight) }
+                // 1: the panel's colour under the controls, so a panel pulled taller than its layout shows no gap.
+                Box(Modifier.fillMaxSize().clip(ControlsShape).background(ControlsCard).border(1.dp, Color(0xFF2A2C35), ControlsShape))
+                // 2: the controls, at their laid-out height.
+                controls(Modifier.fillMaxSize().clip(ControlsShape).border(1.dp, Color(0xFF2A2C35), ControlsShape))
+                // 3: transport and the drag bar.
+                Column(Modifier.fillMaxWidth()) {
+                    transport()
+                    Box(
+                        Modifier.fillMaxWidth().height(18.dp).pointerInput(total) {
+                            val totalPx = with(density) { total.toPx() }
+                            val velocity = androidx.compose.ui.input.pointer.util.VelocityTracker()
+                            var last = frac.value
+                            detectVerticalDragGestures(
+                                onDragStart = {
+                                    live = frac.value
+                                    dragging = true
+                                    velocity.resetTracking()
+                                    view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                                },
+                                onDragEnd = {
+                                    val v = -velocity.calculateVelocity().y / totalPx
+                                    // Where a fling would carry it, then the rest nearest that.
+                                    val aim = (live + v * 0.18f).coerceIn(lo, hi)
+                                    val target = rests.minByOrNull { abs(it - aim) } ?: live
+                                    onFraction(target)
+                                    // The controls take their new size once, now, while the panel glides there.
+                                    layoutFrac = target
+                                    scope.launch {
+                                        frac.snapTo(live)
+                                        dragging = false
+                                        frac.animateTo(target, spring(0.58f, 360f), initialVelocity = v)
+                                        view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                                    }
+                                },
+                                onDragCancel = { scope.launch { frac.snapTo(live); dragging = false } },
+                            ) { change, dy ->
+                                change.consume()
+                                velocity.addPosition(change.uptimeMillis, change.position)
+                                // A little resistance beyond the ends.
+                                var next = live - dy / totalPx
+                                if (next < lo) next = lo - (lo - next) * 0.35f
+                                if (next > hi) next = hi + (next - hi) * 0.35f
+                                for (r in rests) if ((last - r) * (next - r) < 0f) view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                last = next
+                                live = next
+                            }
+                        },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Box(
+                            Modifier.width((40 + 22 * grip).dp).height((4 + 1.5f * grip).dp).clip(RoundedCornerShape(3.dp))
+                                .background(androidx.compose.ui.graphics.lerp(Color(0xFF3A3C46), Palette.Accent, grip)),
+                        )
+                    }
+                }
+            },
+            modifier = Modifier.fillMaxSize().clipToBounds(),
+        ) { m, c ->
+            val w = c.maxWidth; val h = c.maxHeight
+            val barPx = 18.dp.roundToPx()
+            val mid = m[3].measure(androidx.compose.ui.unit.Constraints(w, w, 0, h))
+            val ctrlTop = (h - h * shownFrac()).toInt().coerceIn(mid.height - barPx, h)
+            val midY = ctrlTop + barPx - mid.height
+            // The controls follow the bar live: re-measured every frame, never rebuilt.
+            val laidOut = h - ctrlTop - barPx
+            val scopeP = m[0].measure(androidx.compose.ui.unit.Constraints.fixed(w, midY.coerceAtLeast(0)))
+            val fill = m[1].measure(androidx.compose.ui.unit.Constraints.fixed(w, (h - ctrlTop - barPx).coerceAtLeast(0)))
+            val ctrl = m[2].measure(androidx.compose.ui.unit.Constraints.fixed(w, laidOut.coerceAtLeast(0)))
+            layout(w, h) {
+                scopeP.place(0, 0)
+                fill.place(0, ctrlTop + barPx)
+                ctrl.place(0, ctrlTop + barPx)
+                mid.place(0, midY)
+            }
+        }
+    }
+}
+
 
 /**
  * Color on a tablet or open foldable: the scope and the controls in the side panel, while the editor's own timeline
@@ -982,9 +1115,9 @@ internal fun ColorTransport(vm: EditorViewModel) {
 }
 
 /** Geometry of the Color page's timeline, in pixels. */
-private class CtGeo(density: Float) {
+private class CtGeo(density: Float, slim: Boolean = false) {
     val ruler = 22 * density
-    val lane = 44 * density
+    val lane = (if (slim) 32 else 44) * density
     val header = 34 * density
     val gap = 3 * density
 }
@@ -996,21 +1129,25 @@ private class CtGeo(density: Float) {
  * trimmed here.
  */
 @Composable
-internal fun ColorTimeline(vm: EditorViewModel, height: androidx.compose.ui.unit.Dp) {
+internal fun ColorTimeline(vm: EditorViewModel, height: androidx.compose.ui.unit.Dp, sound: Boolean = false) {
     val view = LocalView.current
     val screen = LocalDensity.current
     val vmNow by rememberUpdatedState(vm)
-    val geo = remember(screen) { CtGeo(screen.density) }
+    // The Sound page: the lanes with sound, slimmer so more fit, each clip drawn as its waveform; a tap edits its sound.
+    val geo = remember(screen, sound) { CtGeo(screen.density, slim = sound) }
     val pps = remember { mutableFloatStateOf(with(screen) { 28.dp.toPx() }) }
     val laneScroll = remember { mutableFloatStateOf(0f) }
+    // Sound: every lane with clips (videos without sound too, shown dim), so any clip can be picked, as on Color.
+    fun lanes(v: EditorViewModel) = if (sound) v.tracks.asReversed().filter { !it.captions && it.clips.isNotEmpty() } else lanesOfPictures(v)
     val lanes = lanes(vm)
     val bodyH = height
     val shownLanes = with(screen) { ((height.toPx() - geo.ruler - geo.gap) / geo.lane).toInt() }.coerceIn(1, maxOf(1, lanes.size))
     val maxScroll = ((lanes.size - shownLanes).coerceAtLeast(0) * geo.lane)
-    // The lane of the clip being graded is always brought into view.
-    val target = vm.gradeTarget
-    LaunchedEffect(target?.clip?.id, shownLanes) {
-        val i = lanes.indexOfFirst { it.id == target?.trackId }
+    // The lane of the clip being graded (or worked on in Sound) is always brought into view.
+    val focusId = if (sound) vm.soundClipId else vm.gradeTarget?.clip?.id
+    val focusLane = if (sound) vm.soundClipId?.let(vm::locate)?.trackId else vm.gradeTarget?.trackId
+    LaunchedEffect(focusId, shownLanes) {
+        val i = lanes.indexOfFirst { it.id == focusLane }
         if (i < 0) return@LaunchedEffect
         val top = i * geo.lane
         val sc = laneScroll.floatValue
@@ -1051,7 +1188,7 @@ internal fun ColorTimeline(vm: EditorViewModel, height: androidx.compose.ui.unit
                             val e = if (mode == 0 && !longDone) withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) { awaitPointerEvent() } else awaitPointerEvent()
                             if (e == null) {
                                 // A long press on a clip: into or out of the group graded together.
-                                clipAt(v, lanes(v), down.position, size.width.toFloat(), pps.floatValue, laneScroll.floatValue, geo)?.let {
+                                if (!sound) clipAt(v, lanes(v), down.position, size.width.toFloat(), pps.floatValue, laneScroll.floatValue, geo)?.let {
                                     v.toggleGradeGroup(it)
                                     view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                                 }
@@ -1100,9 +1237,9 @@ internal fun ColorTimeline(vm: EditorViewModel, height: androidx.compose.ui.unit
                         }
                         if (mode == 1) v.scrubEnd()
                         if (mode == 0 && !longDone) {
-                            // A tap: the clip under the finger becomes the one graded.
+                            // A tap: the clip under the finger becomes the one graded (or, in Sound, the one worked on).
                             clipAt(v, lanes(v), down.position, size.width.toFloat(), pps.floatValue, laneScroll.floatValue, geo)?.let {
-                                v.gradeClip(it)
+                                if (sound) v.switchSound(it) else v.gradeClip(it)
                                 view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                             }
                         }
@@ -1111,6 +1248,7 @@ internal fun ColorTimeline(vm: EditorViewModel, height: androidx.compose.ui.unit
         ) {
             val dp = density
             vm.thumbs.version // redraw as filmstrip pictures arrive
+            if (sound) vm.waves.version // and as waveforms do
             val areaL = geo.header
             val cx = areaL + (size.width - areaL) / 2f
             val ph = vm.playheadUs
@@ -1134,8 +1272,8 @@ internal fun ColorTimeline(vm: EditorViewModel, height: androidx.compose.ui.unit
                     t += stepUs
                 }
             }
-            val targetId = vm.gradeTarget?.clip?.id
-            val group = vm.gradeGroup
+            val targetId = focusId
+            val group = if (sound) emptySet() else vm.gradeGroup
             val r = CornerRadius(7 * dp)
             clipRect(top = geo.ruler) {
                 for ((i, lane) in lanes.withIndex()) {
@@ -1153,10 +1291,27 @@ internal fun ColorTimeline(vm: EditorViewModel, height: androidx.compose.ui.unit
                             val on = c.id == targetId
                             val inGroup = c.id in group
                             val a = vm.assets[c.assetId]
-                            val base = if (a?.isImage == true) Color(0xFF4A3D70) else Color(0xFF22324F)
+                            val audible = a != null && (a.hasAudio || a.isAudio)
+                            val base = if (sound) (if (!audible) Color(0xFF1C1D23) else if (a?.isAudio == true) Color(0xFF16352B) else Color(0xFF1B2A44))
+                                else if (a?.isImage == true) Color(0xFF4A3D70) else Color(0xFF22324F)
                             drawRoundRect(base, Offset(x0, top), Size(w, h), r)
+                            // Sound: the clip's waveform as it will be heard (its level and mute), in the lane's colour.
+                            if (sound && audible && a != null) vm.waves.get(a)?.let { peaks ->
+                                val ink = if (c.id == targetId) Color(0xFF6EE7B7) else if (a.isAudio) Color(0xFF4FB38C) else Color(0xFF6F96D8)
+                                val mid = top + h / 2
+                                val sx = xOf(c.startUs)
+                                var x = max(x0, areaL) + 1f
+                                while (x < x1 - 1f) {
+                                    val us = c.inUs + ((x - sx) / px * 1e6f * c.speed).toLong()
+                                    val i = (us * com.graden.editor.WaveformCache.PEAKS_PER_SEC / 1_000_000L).toInt().coerceIn(0, peaks.size - 1)
+                                    val v = (peaks[i].toInt() and 0xFF) / 255f * (if (c.snd.muted) 0f else c.snd.volume.coerceAtMost(1.5f))
+                                    val half = max(0.5f * dp, min(1f, v) * (h / 2 - 3 * dp))
+                                    drawLine(ink, Offset(x, mid - half), Offset(x, mid + half), 1.4f * dp)
+                                    x += 2.5f * dp
+                                }
+                            }
                             // Filmstrip from the scrub proxy, in the file's own shape.
-                            if (a != null && !a.isAudio && a.width > 0 && w > 12 * dp) {
+                            if (!sound && a != null && !a.isAudio && a.width > 0 && w > 12 * dp) {
                                 val proxy = vm.proxies[a.id]
                                 val tw = (h * a.width / a.height.toFloat()).coerceAtLeast(16 * dp)
                                 val path = androidx.compose.ui.graphics.Path().apply { addRoundRect(androidx.compose.ui.geometry.RoundRect(x0, top, x0 + w, top + h, r)) }
@@ -1182,8 +1337,8 @@ internal fun ColorTimeline(vm: EditorViewModel, height: androidx.compose.ui.unit
                             else if (inGroup) drawRoundRect(Palette.Accent.copy(alpha = 0.8f), Offset(x0, top), Size(w, h), r, style = Stroke(1.5f * dp))
                             else drawRoundRect(Color.White.copy(alpha = 0.10f), Offset(x0, top), Size(w, h), r, style = Stroke(dp))
                             var nameX = max(x0, areaL) + 7 * dp
-                            // Graded: a small orange dot before the name.
-                            if (!c.grade.isIdentity && w > 16 * dp) {
+                            // Graded (or, in Sound, its sound changed): a small orange dot before the name.
+                            if ((if (sound) !c.snd.isDefault else !c.grade.isIdentity) && w > 16 * dp) {
                                 drawCircle(Palette.Accent, 3.5f * dp, Offset(nameX + 3.5f * dp, top + 10 * dp))
                                 nameX += 11 * dp
                             }
@@ -1209,7 +1364,7 @@ internal fun ColorTimeline(vm: EditorViewModel, height: androidx.compose.ui.unit
             drawPath(tri, Palette.Accent)
         }
         // Grouped clips: how many, and a way out, in the ruler's corner.
-        if (vm.gradeGroup.isNotEmpty()) Row(
+        if (!sound && vm.gradeGroup.isNotEmpty()) Row(
             Modifier.align(Alignment.TopEnd).padding(3.dp).clip(RoundedCornerShape(50)).background(Color(0xE61C1D24))
                 .clickable { vm.clearGradeGroup() }.padding(horizontal = 9.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -1220,7 +1375,7 @@ internal fun ColorTimeline(vm: EditorViewModel, height: androidx.compose.ui.unit
     }
 }
 
-private fun lanes(vm: EditorViewModel) = vm.tracks.filter { it.pictures }.reversed()
+private fun lanesOfPictures(vm: EditorViewModel) = vm.tracks.filter { it.pictures }.reversed()
 
 /** Which clips are under the playhead on every picture lane, to feel each cut while scrubbing. */
 private fun cutsUnder(vm: EditorViewModel): List<Long?> = vm.tracks.filter { it.pictures }.map { it.clipAt(vm.playheadUs)?.id }
@@ -1241,13 +1396,13 @@ private fun clipAt(vm: EditorViewModel, lanes: List<com.graden.editor.Track>, p:
 private val ControlsH = 300.dp
 
 @Composable
-private fun Controls(vm: EditorViewModel, modifier: Modifier, frozen: Boolean = false) {
+private fun Controls(vm: EditorViewModel, modifier: Modifier, frozen: Boolean = false, card: Boolean = false) {
     var layer by remember { mutableStateOf(Layer.CORRECTION) }
     var tab by remember { mutableIntStateOf(0) }
     var wheels by remember { mutableIntStateOf(0) }
     var picking by remember { mutableStateOf(false) }
-    Column(modifier.fillMaxWidth().background(Panel)) {
-        Box(Modifier.fillMaxWidth().height(1.dp).background(Palette.Line))
+    Column(modifier.fillMaxWidth().background(if (card) ControlsCard else Panel)) {
+        if (!card) Box(Modifier.fillMaxWidth().height(1.dp).background(Palette.Line))
         // MCRAW only for MotionCam RAW clips: another clip under the playhead goes back to the grade.
         val isRaw = vm.gradeTarget?.clip?.let { vm.assets[it.assetId] }?.isRaw == true
         if (layer == Layer.RAW && !isRaw) layer = Layer.CORRECTION
@@ -1268,15 +1423,19 @@ private fun Controls(vm: EditorViewModel, modifier: Modifier, frozen: Boolean = 
         // All four wheels when there is room, two otherwise; with a margin either side, so a panel being dragged near
         // the line does not flip between them, and only a crossing rebuilds anything.
         var fourWheels by remember { mutableStateOf(false) }
+        // A short controls area (a phone on its side, a short window): every palette goes compact (see LocalDense).
+        var dense by remember { mutableStateOf(false) }
         var rowWheels by remember { mutableStateOf(false) }
         val hyst = androidx.compose.ui.platform.LocalDensity.current
         Frozen(frozen, Modifier.fillMaxWidth().weight(1f).onSizeChanged { sz ->
             val hd = with(hyst) { sz.height.toDp() }
             if (!fourWheels && hd >= 440.dp) fourWheels = true else if (fourWheels && hd < 400.dp) fourWheels = false
+            if (!dense && hd < 380.dp) dense = true else if (dense && hd > 420.dp) dense = false
             // A wide panel (a tablet): the four wheels in one row, as on Resolve's palette.
             val wd = with(hyst) { sz.width.toDp() }
             if (!rowWheels && wd >= 540.dp) rowWheels = true else if (rowWheels && wd < 500.dp) rowWheels = false
         }) {
+        CompositionLocalProvider(LocalDense provides dense) {
         Box(Modifier.fillMaxSize()) {
             if (vm.gradeTarget == null) {
                 Text("No clip under the playhead", color = Palette.TextDim, fontSize = 13.sp, modifier = Modifier.align(Alignment.Center))
@@ -1317,6 +1476,7 @@ private fun Controls(vm: EditorViewModel, modifier: Modifier, frozen: Boolean = 
                 8 -> SlicePanel(vm)
                 else -> DetailPanel(vm)
             }
+        }
         }
         }
     }

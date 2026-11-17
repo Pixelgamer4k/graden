@@ -838,8 +838,11 @@ private fun LaneStrip(vm: EditorViewModel, onEdge: (Grab) -> Unit, onFine: (Bool
 /** A phone on its side (or any short, wide window): pages put their controls beside the picture instead of under it. */
 @Composable
 internal fun sidewaysPhone(): Boolean {
+    // From the window itself (in Graden's own units), not the system's configuration: any clearly wide window, a
+    // phone on its side or a tablet in landscape, gets the controls beside the picture.
+    // (Only the window's shape is used, which no display setting changes.)
     val c = androidx.compose.ui.platform.LocalConfiguration.current
-    return c.screenWidthDp > c.screenHeightDp && c.screenHeightDp < 500
+    return c.screenWidthDp > c.screenHeightDp * 1.15f
 }
 
 /**

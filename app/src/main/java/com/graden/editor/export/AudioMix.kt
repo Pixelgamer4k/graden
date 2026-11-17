@@ -44,6 +44,8 @@ private class Segment(
     val fadeOutFrom: Long?,
     val xfadeUs: Long,
     val norm: Float,
+    val duck: FloatArray?,
+    val duckRate: Int,
 ) {
     /** Gain at timeline time [us], exactly as the preview computes it. */
     fun gain(us: Long): Float {
@@ -54,6 +56,12 @@ private class Segment(
         if (sn.fadeOutUs > 0) e *= ((clip.endUs - us).toFloat() / sn.fadeOutUs).coerceIn(0f, 1f)
         fadeInFrom?.let { e *= ((us - it).toFloat() / xfadeUs).coerceIn(0f, 1f) }
         fadeOutFrom?.let { e *= (1f - (us - it).toFloat() / xfadeUs).coerceIn(0f, 1f) }
+        duck?.takeIf { it.isNotEmpty() }?.let { d ->
+            val pos = (us - clip.startUs).toDouble() * duckRate / 1e6
+            val i = pos.toInt().coerceIn(0, d.size - 1); val j = (i + 1).coerceAtMost(d.size - 1)
+            val f = (pos - i).toFloat().coerceIn(0f, 1f)
+            e *= d[i] + (d[j] - d[i]) * f
+        }
         return e
     }
 }
@@ -91,7 +99,7 @@ private fun segments(p: ExportProject): List<Segment> {
                 }
             }
             val end = start + ((srcOut - srcIn) / c.speed).toLong()
-            out += Segment(path, a, c, srcIn, srcOut, start, end, fadeInFrom, fadeOutFrom, xf, p.normGain[c.id] ?: 1f)
+            out += Segment(path, a, c, srcIn, srcOut, start, end, fadeInFrom, fadeOutFrom, xf, p.normGain[c.id] ?: 1f, p.duck[c.id], p.duckRate)
         }
     }
     return out.sortedBy { it.startUs }
@@ -116,7 +124,9 @@ private class SegmentReader(context: Context, val seg: Segment, private val rate
     /** Stereo frames ready to be mixed. */
     private var fifo = FloatArray(0)
     private var fifoLen = 0
-    private val eq = Eq(seg.clip.snd, rate)
+    private val chain = com.graden.editor.FxChain(rate)
+    /** Frames the chain delays the sound by: the first ones out are dropped, so it lines up with the picture. */
+    private var skip = chain.latencyFor(seg.clip.snd.fx)
 
     init {
         val path = seg.path
@@ -249,8 +259,16 @@ private class SegmentReader(context: Context, val seg: Segment, private val rate
         push(f)
     }
 
-    private fun push(stereo: FloatArray) {
-        eq.apply(stereo, inCh == 2)
+    private fun push(input: FloatArray) {
+        val sn = seg.clip.snd
+        var stereo = input
+        val n0 = stereo.size / 2
+        chain.process(stereo, n0, sn.bass, sn.mid, sn.treble, sn.pan, sn.fx, monoSource = inCh == 1)
+        if (skip > 0) {
+            val drop = minOf(skip, n0)
+            skip -= drop
+            stereo = stereo.copyOfRange(drop * 2, stereo.size)
+        }
         val frames = stereo.size / 2
         if ((fifoLen + frames) * 2 > fifo.size) fifo = fifo.copyOf(maxOf(fifo.size * 2, (fifoLen + frames) * 2 + 8192))
         System.arraycopy(stereo, 0, fifo, fifoLen * 2, stereo.size)
@@ -262,68 +280,6 @@ private class SegmentReader(context: Context, val seg: Segment, private val rate
         runCatching { dec.release() }
         runCatching { ex.release() }
         runCatching { sonic.reset() }
-    }
-}
-
-/** The preview's three-band equaliser and pan (SoundProcessor), on float stereo. */
-private class Eq(private val snd: Snd, rate: Int) {
-    private val on = snd.bass != 0f || snd.mid != 0f || snd.treble != 0f
-    private val b = Array(3) { FloatArray(5) }
-    private val z = Array(3) { FloatArray(4) }
-
-    init {
-        shelf(b[0], 200f, snd.bass, rate.toFloat(), true)
-        peak(b[1], 1000f, snd.mid, 1f, rate.toFloat())
-        shelf(b[2], 4000f, snd.treble, rate.toFloat(), false)
-    }
-
-    fun apply(x: FloatArray, stereoSource: Boolean) {
-        val left = if (snd.pan > 0f) 1f - snd.pan else 1f
-        val right = if (snd.pan < 0f) 1f + snd.pan else 1f
-        val panOn = stereoSource && snd.pan != 0f
-        if (!on && !panOn) return
-        var i = 0
-        while (i < x.size) {
-            for (c in 0..1) {
-                var v = x[i + c]
-                if (on) for (k in 0..2) {
-                    val q = b[k]
-                    val y = q[0] * v + z[k][c * 2]
-                    z[k][c * 2] = q[1] * v - q[3] * y + z[k][c * 2 + 1]
-                    z[k][c * 2 + 1] = q[2] * v - q[4] * y
-                    v = y
-                }
-                if (panOn) v *= if (c == 0) left else right
-                x[i + c] = v
-            }
-            i += 2
-        }
-    }
-
-    private fun set(o: FloatArray, b0: Double, b1: Double, b2: Double, a0: Double, a1: Double, a2: Double) {
-        o[0] = (b0 / a0).toFloat(); o[1] = (b1 / a0).toFloat(); o[2] = (b2 / a0).toFloat(); o[3] = (a1 / a0).toFloat(); o[4] = (a2 / a0).toFloat()
-    }
-
-    private fun peak(o: FloatArray, f: Float, db: Float, q: Float, rate: Float) {
-        val a = 10.0.pow(db / 40.0)
-        val w = 2 * PI * f / rate
-        val al = sin(w) / (2 * q)
-        set(o, 1 + al * a, -2 * cos(w), 1 - al * a, 1 + al / a, -2 * cos(w), 1 - al / a)
-    }
-
-    private fun shelf(o: FloatArray, f: Float, db: Float, rate: Float, low: Boolean) {
-        val a = 10.0.pow(db / 40.0)
-        val w = 2 * PI * f / rate
-        val c = cos(w)
-        val al = sin(w) / 2 * sqrt(2.0)
-        val s = 2 * sqrt(a) * al
-        if (low) set(o,
-            a * ((a + 1) - (a - 1) * c + s), 2 * a * ((a - 1) - (a + 1) * c), a * ((a + 1) - (a - 1) * c - s),
-            (a + 1) + (a - 1) * c + s, -2 * ((a - 1) + (a + 1) * c), (a + 1) + (a - 1) * c - s,
-        ) else set(o,
-            a * ((a + 1) + (a - 1) * c + s), -2 * a * ((a - 1) + (a + 1) * c), a * ((a + 1) + (a - 1) * c - s),
-            (a + 1) - (a - 1) * c + s, 2 * ((a - 1) - (a + 1) * c), (a + 1) - (a - 1) * c - s,
-        )
     }
 }
 

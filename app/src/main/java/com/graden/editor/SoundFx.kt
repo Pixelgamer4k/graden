@@ -29,74 +29,66 @@ data class Snd(
     val mid: Float = 0f,
     val treble: Float = 0f,
     val pitch: Float = 0f,
+    val fx: SoundFxSet = SoundFxSet(),
 ) {
     val isDefault: Boolean get() = this == Snd()
 }
 
 /**
- * The sound one player puts out right now: an overall [gain] (volume, fades, mute, normalising,
- * crossfade and lane mute all multiplied together), plus the clip's pan and equaliser.
+ * The sound one player puts out right now: an overall [gain] (volume, fades, mute, normalising, ducking, crossfade and
+ * lane mute all multiplied together), plus the clip's pan, equaliser and effects.
  */
-data class SoundNow(val gain: Float = 1f, val pan: Float = 0f, val bass: Float = 0f, val mid: Float = 0f, val treble: Float = 0f)
+data class SoundNow(
+    val gain: Float = 1f, val pan: Float = 0f, val bass: Float = 0f, val mid: Float = 0f, val treble: Float = 0f,
+    val fx: SoundFxSet = SoundFxSet(),
+)
 
 /**
- * Applies a [SoundNow] to a player's 16-bit sound: three-band equaliser (low shelf at 200 Hz, a bell
- * at 1 kHz, high shelf at 4 kHz), pan, and gain. Gain may go above 1 (the player's own volume
- * cannot), with hard limiting at full scale. Gain changes are ramped across each buffer, so moving a
- * slider or a fade never clicks.
+ * Applies a [SoundNow] to a player's 16-bit sound through the clip's [FxChain] (the same chain the export uses), then its
+ * gain, ramped across each buffer so nothing clicks, and the same soft ceiling as the export. Always puts out stereo, so
+ * a mono clip can be panned.
  */
 @OptIn(UnstableApi::class)
 class SoundProcessor : BaseAudioProcessor() {
     @Volatile var target = SoundNow()
 
     private var gainNow = 1f
-    private var applied: SoundNow? = null
-    private val bands = Array(3) { Biquad() }
-    // Filter state per band per channel (up to 8 channels).
-    private val z1 = Array(3) { FloatArray(8) }
-    private val z2 = Array(3) { FloatArray(8) }
+    private var chain: FxChain? = null
+    private var inCh = 2
+    private var work = FloatArray(0)
 
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
         if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT) throw AudioProcessor.UnhandledAudioFormatException(inputAudioFormat)
-        return inputAudioFormat
+        inCh = inputAudioFormat.channelCount.coerceIn(1, 8)
+        if (chain == null || inputAudioFormat.sampleRate != rateNow) { chain = FxChain(inputAudioFormat.sampleRate); rateNow = inputAudioFormat.sampleRate }
+        return AudioProcessor.AudioFormat(inputAudioFormat.sampleRate, 2, C.ENCODING_PCM_16BIT)
     }
+    private var rateNow = 0
 
     override fun queueInput(inputBuffer: ByteBuffer) {
         val n = inputBuffer.remaining()
         if (n == 0) return
-        val out = replaceOutputBuffer(n)
-        val t = target
-        val ch = inputAudioFormat.channelCount.coerceIn(1, 8)
-        val rate = inputAudioFormat.sampleRate.toFloat()
-        if (applied == null || applied!!.bass != t.bass || applied!!.mid != t.mid || applied!!.treble != t.treble) {
-            bands[0].lowShelf(200f, t.bass, rate)
-            bands[1].peak(1000f, t.mid, 1f, rate)
-            bands[2].highShelf(4000f, t.treble, rate)
-        }
-        applied = t
-        val eq = t.bass != 0f || t.mid != 0f || t.treble != 0f
-        // Constant-power-ish pan: the far side is turned down, the near side left alone.
-        val left = if (t.pan > 0f) 1f - t.pan else 1f
-        val right = if (t.pan < 0f) 1f + t.pan else 1f
-        val inBuf = inputBuffer.order(ByteOrder.nativeOrder())
+        val ch = inCh
         val frames = n / 2 / ch
+        val out = replaceOutputBuffer(frames * 4)
+        val t = target
+        val inBuf = inputBuffer.order(ByteOrder.nativeOrder())
+        if (work.size < frames * 2) work = FloatArray(frames * 2)
+        val x = work
+        for (f in 0 until frames) {
+            val base = inBuf.position()
+            val l = inBuf.getShort(base).toFloat() / 32768f
+            val r = if (ch > 1) inBuf.getShort(base + 2).toFloat() / 32768f else l
+            inBuf.position(base + ch * 2)
+            x[f * 2] = l; x[f * 2 + 1] = r
+        }
+        val needs = t.fx.processing || t.pan != 0f || t.bass != 0f || t.mid != 0f || t.treble != 0f
+        if (needs) chain?.process(x, frames, t.bass, t.mid, t.treble, t.pan, t.fx, monoSource = ch == 1)
         val g0 = gainNow
         val g1 = t.gain
         for (f in 0 until frames) {
             val g = g0 + (g1 - g0) * (f + 1) / frames
-            for (c in 0 until ch) {
-                var x = inBuf.short.toFloat() / 32768f
-                if (eq) for (b in 0..2) {
-                    val q = bands[b]
-                    val y = q.b0 * x + z1[b][c]
-                    z1[b][c] = q.b1 * x - q.a1 * y + z2[b][c]
-                    z2[b][c] = q.b2 * x - q.a2 * y
-                    x = y
-                }
-                if (ch == 2) x *= if (c == 0) left else right
-                x *= g
-                out.putShort((x.coerceIn(-1f, 0.99997f) * 32768f).toInt().toShort())
-            }
+            for (c in 0..1) out.putShort((FxChain.softClip(x[f * 2 + c] * g).coerceIn(-1f, 0.99997f) * 32768f).toInt().toShort())
         }
         gainNow = g1
         inputBuffer.position(inputBuffer.limit())
@@ -104,45 +96,6 @@ class SoundProcessor : BaseAudioProcessor() {
     }
 
     override fun onFlush() {
-        for (b in 0..2) {
-            z1[b].fill(0f)
-            z2[b].fill(0f)
-        }
-    }
-
-    /** One biquad section (RBJ cookbook), normalised so a0 = 1. */
-    private class Biquad {
-        var b0 = 1f; var b1 = 0f; var b2 = 0f; var a1 = 0f; var a2 = 0f
-
-        private fun set(b0: Double, b1: Double, b2: Double, a0: Double, a1: Double, a2: Double) {
-            this.b0 = (b0 / a0).toFloat(); this.b1 = (b1 / a0).toFloat(); this.b2 = (b2 / a0).toFloat()
-            this.a1 = (a1 / a0).toFloat(); this.a2 = (a2 / a0).toFloat()
-        }
-
-        fun peak(f: Float, db: Float, q: Float, rate: Float) {
-            val a = 10.0.pow(db / 40.0)
-            val w = 2 * PI * f / rate
-            val al = sin(w) / (2 * q)
-            set(1 + al * a, -2 * cos(w), 1 - al * a, 1 + al / a, -2 * cos(w), 1 - al / a)
-        }
-
-        fun lowShelf(f: Float, db: Float, rate: Float) = shelf(f, db, rate, low = true)
-
-        fun highShelf(f: Float, db: Float, rate: Float) = shelf(f, db, rate, low = false)
-
-        private fun shelf(f: Float, db: Float, rate: Float, low: Boolean) {
-            val a = 10.0.pow(db / 40.0)
-            val w = 2 * PI * f / rate
-            val c = cos(w)
-            val al = sin(w) / 2 * sqrt(2.0)
-            val s = 2 * sqrt(a) * al
-            if (low) set(
-                a * ((a + 1) - (a - 1) * c + s), 2 * a * ((a - 1) - (a + 1) * c), a * ((a + 1) - (a - 1) * c - s),
-                (a + 1) + (a - 1) * c + s, -2 * ((a - 1) + (a + 1) * c), (a + 1) + (a - 1) * c - s,
-            ) else set(
-                a * ((a + 1) + (a - 1) * c + s), -2 * a * ((a - 1) + (a + 1) * c), a * ((a + 1) + (a - 1) * c - s),
-                (a + 1) - (a - 1) * c + s, 2 * ((a - 1) - (a + 1) * c), (a + 1) - (a - 1) * c - s,
-            )
-        }
+        chain?.reset()
     }
 }

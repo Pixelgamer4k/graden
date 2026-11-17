@@ -28,6 +28,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.Executors
 import kotlin.math.abs
+import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 
@@ -137,12 +138,21 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         return com.graden.editor.export.ExportBuild.build(meta, tracks, assets, assets.mapValues { originalOf(it.value) }, mutedTracks, hiddenTracks, norm, output,
             raw = { a, layer -> rawBlock(a, layer) },
             stab = { c, a, st -> stabTracks[c.id]?.takeIf { it.sig == stabSig(c) }?.track ?: Stabilizer.track(app, a, c.inUs, c.outUs, st) },
-            cinemaRun = { _, a, ci -> CinemaRun.build(app, a.uri, ci) })
+            cinemaRun = { _, a, ci -> CinemaRun.build(app, a.uri, ci) }).also { p ->
+            p.duck = tracks.flatMap { it.clips }.filter { it.snd.fx.duckOn }.associate { it.id to duckCurve(it) }
+            p.duckRate = duckRate
+        }
     }
 
     /** The clip details panel, opened from the top bar. */
     var infoOpen by mutableStateOf(false)
     /** How far the lanes are scrolled up, in pixels, and how far they can go; both kept by the timeline. */
+    /**
+     * The timeline in its compact form: set by the editor whenever its window is wider than tall (a phone on its side,
+     * a tablet or open foldable in landscape). Slimmer lanes and ruler, and no filmstrip pictures, so more lanes fit.
+     */
+    var timelineCompact by mutableStateOf(false)
+
     /** Lane height multiplier, changed by pinching up and down on the timeline. */
     private var _laneScale by mutableFloatStateOf(1f)
     var laneScale: Float
@@ -166,6 +176,34 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         }
     /** Snap distance in pixels, set by the timeline from the screen density. */
     var snapPx = 24f
+    /** Where the magnet has just pulled something (a clip edge being moved or trimmed, or the playhead): the timeline
+     *  draws a guide line there, as other editors do, so it is clear what lined up with what. Null when nothing is held. */
+    var snapGuideUs by mutableStateOf<Long?>(null)
+        private set
+    private var lastGuide = -1L
+
+    /** Shows the guide at [edge] (null hides it), with a tick each time it lands on a new edge. */
+    private fun guide(edge: Long?) {
+        if (edge != null && edge != lastGuide) hapticTick++
+        lastGuide = edge ?: -1L
+        snapGuideUs = edge
+    }
+
+    /**
+     * The nearest edge to [us] within the snap distance: the timeline's start and end, the playhead (unless
+     * [withPlayhead] is false) and both ends of every clip, except clip [exceptId] and, if given, the clips of lane
+     * [exceptLane] (they are moving with the edit). Null if none is near, or the magnet is off.
+     */
+    private fun nearEdge(us: Long, exceptId: Long?, exceptLane: Int? = null, withPlayhead: Boolean = true, playhead: Long = playheadUs): Long? {
+        if (!snapEnabled || pxPerSec <= 0f) return null
+        var best: Long? = null
+        var bestD = (snapPx / pxPerSec * 1e6f).toLong()
+        fun consider(e: Long) { val d = abs(e - us); if (e >= 0 && d < bestD) { bestD = d; best = e } }
+        consider(0L)
+        if (withPlayhead) consider(playhead)
+        for (t in tracks) if (t.id != exceptLane) for (c in t.clips) if (c.id != exceptId) { consider(c.startUs); consider(c.endUs) }
+        return best
+    }
     var drop by mutableStateOf<DropTarget?>(null)
         private set
 
@@ -222,7 +260,27 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private val main = Handler(Looper.getMainLooper())
     val thumbs = ThumbnailCache(app)
     val waves = WaveformCache(app)
-    val scrub = ScrubDecoder { main.post { if (proxyActive) showProxy = true } }
+    val scrub = ScrubDecoder { path ->
+        main.post {
+            if (proxyActive) showProxy = true
+        }
+    }
+
+    /** The clip whose frame the scrub picture is showing now (for its grade), set with its shape. */
+    var scrubClip by mutableStateOf<Clip?>(null)
+        private set
+
+    /** Asks the scrub decoder for [path] at [sourceUs]; its shape and look follow once its frame is on screen. */
+    /**
+     * Asks the scrub decoder for [path] at [sourceUs], and gives the scrub picture that clip's shape, place and look. The
+     * picture view itself holds a new shape back until that clip's first frame is on it (see GradedVideoView).
+     */
+    private fun scrubShow(path: String, sourceUs: Long, aspect: Float, tf: Tf, clip: Clip?) {
+        overlayAspect = aspect
+        scrubTf = tf
+        scrubClip = clip
+        scrub.show(path, sourceUs, aspect)
+    }
     private val layers = HashMap<Int, LayerPlayer>()
 
     /**
@@ -729,7 +787,9 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** The built-in Black picture: part of every project, so it cannot be deleted. */
-    fun isBuiltIn(a: MediaAsset) = a.uri == blackUri()
+    // Asked for every tile on every frame: compare against the path, never touch the disk here.
+    private val blackPath by lazy { Uri.fromFile(File(getApplication<Application>().filesDir, "black.png")).toString() }
+    fun isBuiltIn(a: MediaAsset) = a.uri == blackPath
 
     // ---- the media box: sections, order, and the media of other projects -----------------------------------
 
@@ -926,7 +986,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         colourProbes
         if (c == null) return null
         val a = assets[c.assetId] ?: return null
-        val proxy = if (native) null else if (scrub) proxies[a.id] else playProxies[a.id]
+        val proxy = if (native) null else if (scrub) proxies[a.id] else if (nativePlayback) null else playProxies[a.id]
         val sdrProxy = proxy != null && !proxy.endsWith("h.mp4")
         // An SDR proxy of an HDR clip was tone-mapped to Rec.709 when it was made.
         val input = if (a.isImage || (sdrProxy && a.hdr)) ColorSpaces.REC709 else ColorSpaces.inputOf(c, a)
@@ -1215,13 +1275,13 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The landing spot on [target] for a clip wanting to start at [wantUs]: snapped, then moved clear of other clips. */
     private fun slot(target: Int, wantUs: Long, durationUs: Long, exceptClip: Long?): DropTarget {
-        if (target == V0) return cut(wantUs, durationUs, exceptClip)
+        if (target == V0) { guide(null); return cut(wantUs, durationUs, exceptClip) }
         val others = (tracks.firstOrNull { it.id == target }?.clips ?: emptyList()).filter { it.id != exceptClip }
         val raw = wantUs.coerceAtLeast(0L)
         val snapped = snap(raw, durationUs, exceptClip)
         // Tick when entering a different lane or clicking onto a different snap edge.
         val slotId = if (snapped != raw) snapped else -1L
-        if (target != lastDropLane || (slotId >= 0 && slotId != lastDropSlot)) hapticTick++
+        if (target != lastDropLane) hapticTick++
         lastDropLane = target
         lastDropSlot = slotId
         val (start, push) = landing(others, snapped, durationUs)
@@ -1314,6 +1374,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun clearDrop() {
+        guide(null)
         drop = null
         lastDropLane = Int.MIN_VALUE
         lastDropSlot = -1L
@@ -1360,8 +1421,9 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Pulls [startUs] onto a nearby edge (timeline start, playhead, other clips) by either end of the clip. */
     private fun snap(startUs: Long, durationUs: Long, excludeId: Long?): Long {
-        if (!snapEnabled || pxPerSec <= 0f) return startUs
+        if (!snapEnabled || pxPerSec <= 0f) { guide(null); return startUs }
         var best = startUs
+        var bestEdge: Long? = null
         var bestDistance = (snapPx / pxPerSec * 1e6f).toLong()
         fun consider(edge: Long) {
             for (candidate in longArrayOf(edge, edge - durationUs)) {
@@ -1369,6 +1431,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
                 if (candidate >= 0 && d < bestDistance) {
                     bestDistance = d
                     best = candidate
+                    bestEdge = edge
                 }
             }
         }
@@ -1378,6 +1441,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             consider(c.startUs)
             consider(c.endUs)
         }
+        guide(bestEdge)
         return best
     }
 
@@ -1422,6 +1486,74 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         val right = c.copy(id = nextClipId++, inUs = cutSrc, startUs = c.startUs + local, transition = null, animIn = null, snd = c.snd.copy(fadeInUs = 0L))
         commit(withClip(c.id) { listOf(it.copy(outUs = cutSrc, animOut = null, snd = it.snd.copy(fadeOutUs = 0L)), right) })
         selectedClipId = right.id
+    }
+
+    // ---- remove silence ----------------------------------------------------------------------------------------------
+
+    /**
+     * The quiet stretches of clip [id] that Remove silence would cut, in source time: every run below [thresholdDb]
+     * (from the waveform's 20 ms peaks) at least [minMs] long, shortened by [padMs] at each end so words keep their
+     * breath. Empty while the waveform is still being read.
+     */
+    fun silences(id: Long, thresholdDb: Float, minMs: Float, padMs: Float): List<LongRange> {
+        val c = locate(id)?.clip ?: return emptyList()
+        val a = assets[c.assetId] ?: return emptyList()
+        val peaks = waves.get(a) ?: run { waves.request(a); return emptyList() }
+        val rate = WaveformCache.PEAKS_PER_SEC
+        val th = 10f.pow(thresholdDb / 20f) * 255f
+        val i0 = (c.inUs * rate / 1_000_000L).toInt().coerceIn(0, peaks.size)
+        val i1 = (c.outUs * rate / 1_000_000L).toInt().coerceIn(i0, peaks.size)
+        val out = ArrayList<LongRange>()
+        val pad = (padMs * 1000).toLong()
+        var start = -1
+        for (i in i0..i1) {
+            val quiet = i < i1 && (peaks[i].toInt() and 0xFF) < th
+            if (quiet && start < 0) start = i
+            if (!quiet && start >= 0) {
+                val s0 = start * 1_000_000L / rate; val s1 = i * 1_000_000L / rate
+                // A silence at the very start or end of the clip is cut right to the edge.
+                val a0 = if (start <= i0) c.inUs else s0 + pad
+                val a1 = if (i >= i1) c.outUs else s1 - pad
+                if (s1 - s0 >= (minMs * 1000).toLong() && a1 - a0 > 20_000L) out += a0..a1
+                start = -1
+            }
+        }
+        return out
+    }
+
+    /** Cuts [silences] out of clip [id]: one undo step. On V0 everything after closes up. Returns how many were cut. */
+    fun removeSilences(id: Long, thresholdDb: Float, minMs: Float, padMs: Float): Int {
+        val l = locate(id) ?: return 0
+        if (l.trackId in lockedTracks) return 0
+        val c = l.clip
+        val cuts = silences(id, thresholdDb, minMs, padMs)
+        if (cuts.isEmpty()) return 0
+        // The parts that stay, in source time.
+        val keep = ArrayList<Pair<Long, Long>>()
+        var from = c.inUs
+        for (r in cuts) { if (r.first > from) keep += from to r.first; from = r.last }
+        if (c.outUs > from) keep += from to c.outUs
+        val pieces = ArrayList<Clip>()
+        var at = c.startUs
+        for ((k, p) in keep.withIndex()) {
+            if (p.second - p.first < MIN_CLIP_US / 2) continue
+            val first = k == 0; val last = k == keep.size - 1
+            val piece = c.copy(
+                id = if (pieces.isEmpty()) c.id else nextClipId++, inUs = p.first, outUs = p.second, startUs = at,
+                transition = if (first) c.transition else null, animIn = if (first) c.animIn else null, animOut = if (last) c.animOut else null,
+                snd = c.snd.copy(fadeInUs = if (first) c.snd.fadeInUs else 0L, fadeOutUs = if (last) c.snd.fadeOutUs else 0L),
+            )
+            pieces += piece
+            at += piece.durationUs
+        }
+        if (pieces.isEmpty()) return 0
+        val removedUs = c.durationUs - pieces.sumOf { it.durationUs }
+        var next = withClip(c.id) { pieces }
+        if (l.trackId == V0) next = ripple(next.map { t -> if (t.id != V0) t else t.copy(clips = pack(t.clips)) }, c.endUs, -removedUs)
+        commit(next)
+        if (soundClipId != null) soundClipId = pieces.first().id
+        selectedClipId = pieces.first().id
+        return cuts.size
     }
 
     fun deleteSelected() {
@@ -1645,10 +1777,32 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun sourceOf(a: MediaAsset): String? {
         if (a.isAudio || a.isImage) return originalOf(a)
+        // Proxy turned off: the original plays, however heavy. A fast phone (or a light clip) keeps up; a slow one drops
+        // frames, but the picture is always the real one.
+        if (nativePlayback) return originalOf(a)
         playProxies[a.id]?.let { return Uri.fromFile(File(it)).toString() }
         proxies[a.id]?.let { return Uri.fromFile(File(it)).toString() }
         return null
     }
+
+    /**
+     * Play the original files instead of the edit proxies (remembered on this phone). Off by default: proxies keep
+     * any phone smooth. On, playback is the real picture in real time, dropping frames where the phone can't keep up.
+     * Scrubbing still uses the light scrub proxy, and export always reads the originals either way.
+     */
+    var nativePlayback by mutableStateOf(getApplication<Application>().getSharedPreferences("playback", 0).getBoolean("native", false))
+        private set
+
+    fun chooseNativePlayback(on: Boolean) {
+        if (on == nativePlayback) return
+        nativePlayback = on
+        getApplication<Application>().getSharedPreferences("playback", 0).edit().putBoolean("native", on).apply()
+        itemStamp = null // every lane's item names its source: build them again and reload the players
+        syncLayers(true)
+    }
+
+    /** The picture alone, filling the screen (opened from the corner of the preview). */
+    var fullscreen by mutableStateOf(false)
 
     /** What the preview's pictures come from right now, for the small indicator beside the timecode. */
     enum class Source { SCRUB, EDIT, NATIVE, OPTIMIZING }
@@ -1657,6 +1811,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         get() {
             optimizingHere?.let { (_, pct) -> return Source.OPTIMIZING to ("Optimizing" + (pct?.let { " $it%" } ?: "")) }
             if (scrubbing && showProxy) return Source.SCRUB to "Scrub proxy"
+            if (nativePlayback && !scrubbing) return Source.NATIVE to (if (isPlaying) "Native · live" else "Native")
             if (isPlaying || scrubbing) return Source.EDIT to "Edit proxy"
             // At rest: how many of the video pictures on screen are already the originals' own frames.
             var visible = 0
@@ -1679,6 +1834,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     /** The clip on screen at the playhead is still waiting for its edit proxy: (asset name, percent or null). */
     val optimizingHere: Pair<String, Int?>?
         get() {
+            if (nativePlayback) return null // the original plays: nothing to wait for
             for (t in tracks) if (t.pictures && t.id !in hiddenTracks) {
                 val c = t.clipAt(playheadUs) ?: continue
                 val a = assets[c.assetId] ?: continue
@@ -1764,11 +1920,98 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     /** What clip [c] sounds like at the playhead: volume, fades, mute and normalising, with its pan and equaliser. */
     private fun soundOf(c: Clip): SoundNow {
         val sn = c.snd
+        // The Sound page on "current sound": only the clip being worked on is heard (a joined run of the same file
+        // that contains it counts as it). On "global sound" everything plays, as it will in the export.
+        soundClipId?.takeIf { !soundHearAll || hearingClip }?.let { id ->
+            val s = soundSolo
+            val its = c.id == id || (s != null && c.assetId == s.assetId && c.startUs <= s.startUs && c.endUs >= s.endUs)
+            if (!its) return SoundNow(0f, sn.pan, sn.bass, sn.mid, sn.treble, sn.fx)
+        }
         var env = 1f
         if (sn.fadeInUs > 0) env *= ((playheadUs - c.startUs).toFloat() / sn.fadeInUs).coerceIn(0f, 1f)
         if (sn.fadeOutUs > 0) env *= ((c.endUs - playheadUs).toFloat() / sn.fadeOutUs).coerceIn(0f, 1f)
         val gain = if (sn.muted) 0f else sn.volume * env * (if (sn.normalize) normalizeGain(c) else 1f)
-        return SoundNow(gain, sn.pan, sn.bass, sn.mid, sn.treble)
+        return SoundNow(gain * duckGain(c, playheadUs), sn.pan, sn.bass, sn.mid, sn.treble, sn.fx)
+    }
+
+    // ---- auto-duck ------------------------------------------------------------------------------------------------
+
+    private var duckStamp: Int? = null
+    private val duckCurves = HashMap<Long, FloatArray>()
+
+    /** Steps per second of a duck curve (the waveform's own rate). */
+    private val duckRate = WaveformCache.PEAKS_PER_SEC
+
+    /** Clip [c]'s auto-duck gain at timeline time [us] (1 when it does not duck), as the preview and the export use it. */
+    fun duckGain(c: Clip, us: Long): Float {
+        if (!c.snd.fx.duckOn) return 1f
+        val curve = duckCurve(c)
+        if (curve.isEmpty()) return 1f
+        val pos = (us - c.startUs).toDouble() * duckRate / 1e6
+        val i = pos.toInt().coerceIn(0, curve.size - 1)
+        val j = (i + 1).coerceAtMost(curve.size - 1)
+        val f = (pos - i).toFloat().coerceIn(0f, 1f)
+        return curve[i] + (curve[j] - curve[i]) * f
+    }
+
+    /**
+     * Clip [c]'s duck curve over its time on the timeline, [duckRate] steps a second: the other clips' sound (from their
+     * waveforms, at their own levels, any lane not muted, other ducking clips not counted) looked at a little ahead, so
+     * the clip is already down when the voice starts; gliding down and back up over the fade time.
+     */
+    fun duckCurve(c: Clip): FloatArray {
+        // Rebuilt only when something it depends on changes (where clips are and how loud, their sound files, mutes);
+        // dragging an equaliser or effect slider does not touch it.
+        var stamp = mutedTracks.hashCode() * 31 + waves.version
+        for (t in tracks) for (o in t.clips) {
+            stamp = stamp * 31 + o.id.hashCode(); stamp = stamp * 31 + o.startUs.hashCode(); stamp = stamp * 31 + o.inUs.hashCode()
+            stamp = stamp * 31 + o.outUs.hashCode(); stamp = stamp * 31 + o.speed.hashCode(); stamp = stamp * 31 + o.snd.volume.hashCode()
+            stamp = stamp * 31 + o.snd.muted.hashCode(); stamp = stamp * 31 + o.snd.fx.duckOn.hashCode()
+            if (o.snd.fx.duckOn) { stamp = stamp * 31 + o.snd.fx.duckDb.hashCode(); stamp = stamp * 31 + o.snd.fx.duckThreshold.hashCode(); stamp = stamp * 31 + o.snd.fx.duckFadeMs.hashCode() }
+        }
+        if (duckStamp != stamp) { duckStamp = stamp; duckCurves.clear() }
+        duckCurves[c.id]?.let { return it }
+        val fx = c.snd.fx
+        val steps = (c.durationUs * duckRate / 1_000_000L).toInt() + 2
+        val others = tracks.filter { it.id !in mutedTracks && !it.captions }.flatMap { it.clips }.filter { o ->
+            o.id != c.id && !o.snd.muted && !o.snd.fx.duckOn && o.endUs > c.startUs && o.startUs < c.endUs &&
+                assets[o.assetId]?.let { it.hasAudio || it.isAudio } == true
+        }
+        val threshold = 10f.pow(fx.duckThreshold / 20f)
+        val down = 10f.pow(fx.duckDb / 20f)
+        val look = (fx.duckFadeMs / 2 / 1000f * duckRate).toInt()
+        val present = BooleanArray(steps)
+        for (o in others) {
+            val a = assets[o.assetId] ?: continue
+            val peaks = waves.get(a)
+            if (peaks == null) { waves.request(a); continue }
+            for (k in 0 until steps) {
+                if (present[k]) continue
+                val us = c.startUs + k * 1_000_000L / duckRate
+                if (us < o.startUs || us >= o.endUs) continue
+                val src = o.inUs + ((us - o.startUs) * o.speed).toLong()
+                val i = (src * duckRate / 1_000_000L).toInt().coerceIn(0, peaks.size - 1)
+                val lev = (peaks[i].toInt() and 0xFF) / 255f * o.snd.volume
+                if (lev > threshold) present[k] = true
+            }
+        }
+        // Held open across short gaps between words (300 ms), then looked ahead and smoothed.
+        val hold = (0.3f * duckRate).toInt()
+        val held = BooleanArray(steps)
+        var last = -10_000
+        for (k in 0 until steps) { if (present[k]) last = k; held[k] = k - last <= hold }
+        val out = FloatArray(steps)
+        val stepMs = 1000f / duckRate
+        val a = (stepMs / fx.duckFadeMs.coerceAtLeast(stepMs)).coerceIn(0f, 1f)
+        var g = 1f
+        for (k in 0 until steps) {
+            val ahead = held[(k + look).coerceAtMost(steps - 1)] || held[k]
+            val target = if (ahead) down else 1f
+            g += (target - g) * a
+            out[k] = g
+        }
+        duckCurves[c.id] = out
+        return out
     }
 
     private val normCache = HashMap<String, Float>()
@@ -1952,7 +2195,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         // Only when that one picture fills the canvas as it is: the still covers the whole canvas, so with a
         // placed or cropped layer, or with more than one layer showing, it would hide what is underneath.
         val layersShowing = tracks.count { it.pictures && it.id !in hiddenTracks && it.clipAt(playheadUs) != null }
-        if (top == null || a == null || a.isImage || a.id !in playProxies || tracks.any { it.pictures && laneFx(it) != null } ||
+        if (top == null || a == null || a.isImage || nativePlayback || a.id !in playProxies || tracks.any { it.pictures && laneFx(it) != null } ||
             !top.clip.tf.isIdentity || layersShowing > 1
         ) {
             stillWanted = false
@@ -2006,6 +2249,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         if (isPlaying) shownFrameTime()?.let { playheadUs = it.coerceIn(0L, totalUs) }
         isPlaying = false
         stopAtUs = Long.MAX_VALUE
+        hearingClip = false
         saveSoon()
         layers.values.forEach { it.pause() }
         updateStill()
@@ -2099,16 +2343,29 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private var lastScrubSync = 0L
     private var scrubLane = 0
 
+    /** Where the finger has taken the playhead, before the magnet pulls it onto a cut (see [scrubBy]). */
+    private var scrubRaw = 0L
+
     fun scrubStart() {
         if (scrubbing) return
         pause()
+        scrubRaw = playheadUs
         scrubbing = true
         updateStill()
     }
 
-    fun scrubBy(deltaUs: Long): Boolean {
+    /**
+     * Moves the playhead by [deltaUs]. With [snap] (the finger dragging the timeline), the magnet pulls it onto a cut
+     * nearby: the finger's own position is kept apart ([scrubRaw]), so the playhead lets go again as the finger moves
+     * on, and the two never drift apart.
+     */
+    fun scrubBy(deltaUs: Long, snap: Boolean = false): Boolean {
         val t0 = System.nanoTime()
-        val target = (playheadUs + deltaUs).coerceIn(0L, totalUs)
+        val raw = ((if (snap) scrubRaw else playheadUs) + deltaUs).coerceIn(0L, totalUs)
+        scrubRaw = raw
+        val edge = if (snap) nearEdge(raw, null, withPlayhead = false)?.let { if (it == 0L || it > totalUs) null else it } else null
+        if (snap) guide(edge)
+        val target = edge ?: raw
         val moved = target != playheadUs
         playheadUs = target
         var fallback = false
@@ -2143,16 +2400,21 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private fun showScrubFrame(us: Long): Boolean {
         // In a transition the lanes draw the blend themselves; a single scrub frame would hide it.
         if (tracks.any { it.pictures && laneFxAt(it, us) }) return false
+        // Only where one picture fills the frame alone. With layers on top of each other, the lanes draw themselves:
+        // a single scrub frame for the top one, swapping between layers at their cuts, made the layer below jump (it
+        // was the scrub frame one moment and that lane's own player the next) and the top one zoom in and out.
+        val showing = tracks.count { it.pictures && it.id !in hiddenTracks && it.clipAt(us) != null }
+        if (showing > 1) return false
         val top = topVideoAt(us) ?: return false
-        scrubTf = top.clip.tf
         val p = proxies[top.clip.assetId] ?: return false
-        assets[top.clip.assetId]?.let { overlayAspect = it.width.toFloat() / it.height }
+        val aspect = assets[top.clip.assetId]?.let { it.width.toFloat() / it.height } ?: overlayAspect
         proxyActive = true
-        scrub.show(p, top.clip.srcAt((us - top.startUs).coerceIn(0L, top.clip.durationUs - 1)))
+        scrubShow(p, top.clip.srcAt((us - top.startUs).coerceIn(0L, top.clip.durationUs - 1)), aspect, top.clip.tf, top.clip)
         return true
     }
 
     fun scrubEnd() {
+        guide(null)
         if (!scrubbing) return
         scrubbing = false
         settle()
@@ -2187,7 +2449,15 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     fun tapClip(clipId: Long?) {
         selectedClipId = if (clipId == null || clipId == selectedClipId) null else clipId
+        cutMarksHidden = false
     }
+
+    /**
+     * The "+" marks on the cuts are put away once a clip is moved or trimmed (they sit right where the handles and
+     * edges are, so they get in the way); they come back with the next tap anywhere on the timeline.
+     */
+    var cutMarksHidden by mutableStateOf(false)
+        private set
 
     // ---- trimming ------------------------------------------------------------------
 
@@ -2197,6 +2467,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     fun trimStart(left: Boolean) {
         val l = selectedClipId?.let(::locate) ?: return
+        cutMarksHidden = true
         val a = assetOf(l.clip) ?: return
         pause()
         trimOrig = l
@@ -2207,30 +2478,43 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         updateStill()
         trimProxy = proxies[a.id]
         trimProxy?.let {
-            overlayAspect = a.width.toFloat() / a.height
             proxyActive = true
-            scrub.show(it, if (left) l.clip.inUs else l.clip.outUs - 1)
+            scrubShow(it, if (left) l.clip.inUs else l.clip.outUs - 1, a.width.toFloat() / a.height, l.clip.tf, l.clip)
         }
     }
 
     /** [deltaUs] is the total finger travel since the trim began. The other edge stays where it is. */
-    fun trimDrag(deltaUs: Long) {
+    fun trimDrag(fingerUs: Long) {
         val l = trimOrig ?: return
         val orig = l.clip
         val a = assetOf(orig) ?: return
+        // The magnet: the edge under the finger is pulled onto a nearby edge (another clip's, the playhead where it is
+        // now, the start). The timeline never moves for a trim (except the edge auto-scroll), so these stay put while
+        // the finger looks for them. A V0 end moves the clips after it along, so it snaps against the other lanes only.
+        val deltaUs = run {
+            val v0Right = l.trackId == V0 && !trimLeft
+            val moving = if (trimLeft) orig.startUs + fingerUs else orig.endUs + fingerUs
+            val edge = nearEdge(moving, orig.id, exceptLane = if (v0Right) V0 else null)
+            guide(edge)
+            if (edge == null) fingerUs else edge - (if (trimLeft) orig.startUs else orig.endUs)
+        }
         val sp = orig.speed
         // The finger moves in timeline time; the source moves at the clip's speed.
         val srcDelta = (deltaUs * sp).toLong()
         if (l.trackId == V0) {
             // Rule 2: on V0 the clip keeps its place and the clips after it follow its new length.
             val longest = if (a.isImage) Long.MAX_VALUE / 4 else a.durationUs
-            val updated = if (trimLeft) {
+            if (trimLeft) {
+                // The left edge follows the finger and the timeline stays still, so what it lines up with stays where it
+                // is (the playhead, a cut on another lane). The clip is left where the edge was pulled, a gap before it,
+                // until the finger lifts: then V0 closes up again (see [trimEnd]).
                 val newIn = (orig.inUs + srcDelta).coerceIn(if (a.isImage) orig.outUs - longest else 0L, orig.outUs - MIN_CLIP_US)
-                // Shift the view with the edit, so the edge being pulled stays under the finger.
-                playheadUs = (trimOrigPlayhead - ((newIn - orig.inUs) / sp).toLong()).coerceAtLeast(0L)
                 if (!a.isImage) trimProxy?.let { scrub.show(it, newIn) }
-                orig.copy(inUs = newIn)
-            } else {
+                val moved = orig.copy(inUs = newIn, startUs = orig.startUs + ((newIn - orig.inUs) / sp).toLong())
+                tracks = tracks.map { t -> if (t.id != V0) t else t.copy(clips = t.clips.map { if (it.id == orig.id) moved else it }) }
+                return
+            }
+            val updated = run {
                 val newOut = (orig.outUs + srcDelta).coerceIn(orig.inUs + MIN_CLIP_US, longest)
                 if (!a.isImage) trimProxy?.let { scrub.show(it, newOut - (1_000_000f / a.fps).toLong()) }
                 orig.copy(outUs = newOut)
@@ -2266,12 +2550,15 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun trimEnd() {
+        guide(null)
         val l = trimOrig ?: return
         trimOrig = null
         trimSide = 0
         val before = trimBefore
         val now = locate(l.clip.id)?.clip
         if (before != null && now != l.clip) pushUndo(before)
+        // A left trim on V0 left a gap before the clip while the finger was down: V0 closes up again now.
+        if (l.trackId == V0 && trimLeft) tracks = tracks.map { t -> if (t.id != V0) t else t.copy(clips = pack(t.clips)) } // in their order on V0, which a trim never changes
         // Rule 7: a trim on V0 moves everything after the clip's old end by the change in length.
         if (l.trackId == V0 && now != null) tracks = ripple(tracks, l.clip.endUs, now.durationUs - l.clip.durationUs)
         apply(tracks)
@@ -2789,6 +3076,37 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     /** The clip whose Sound page is open, and the project as it was when it opened (for cancel and undo). */
     var soundClipId by mutableStateOf<Long?>(null)
         private set
+
+    /** The Sound page plays every sound (true) or only the clip being worked on (false, the default). */
+    var soundHearAll by mutableStateOf(false)
+        private set
+    fun chooseSoundHearAll(all: Boolean) {
+        if (all == soundHearAll) return
+        soundHearAll = all
+        syncLayers(false) // the gains change at once, playing or not
+    }
+    /** "Hear clip" is playing: the clip alone, until playback stops. */
+    var hearingClip = false
+        private set
+    /** The clip the Sound page is on, for hearing it alone. */
+    private val soundSolo: Clip? get() = soundClipId?.let(::locate)?.clip
+
+    /**
+     * Where the Sound page is: its tab, the effect open in the Effects tab, and Remove silence's settings. Kept here,
+     * not in the page, so turning the phone or resizing the window (which builds the page again in another layout)
+     * never loses them.
+     */
+    var soundTab by mutableStateOf("MIX")
+    var soundFxOpen by mutableStateOf<String?>(null)
+    var silenceDb by mutableFloatStateOf(-40f)
+    var silenceMinMs by mutableFloatStateOf(500f)
+    var silencePadMs by mutableFloatStateOf(120f)
+
+    /** The upright Sound page: the share of its height the controls take (the timeline gets the rest). */
+    var soundControlsFraction by mutableFloatStateOf(0.62f)
+
+    /** In the Sound page, the picture area shows the clip's waveform (true) instead of the picture. */
+    var soundWaveInPicture by mutableStateOf(false)
     private var soundBefore: List<Track>? = null
 
     fun openSound(): Boolean {
@@ -2851,6 +3169,8 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     /** Plays the clip once, from its start, so the sound settings can be heard in place. */
     fun previewSound() {
         val c = soundClipId?.let(::locate)?.clip ?: return
+        // "Hear clip" is always the clip alone, whatever the switch says; the transport plays as the switch says.
+        hearingClip = true
         seek(c.startUs)
         togglePlay()
         stopAtUs = c.endUs
@@ -4149,6 +4469,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     fun moveStart(clipId: Long): Boolean {
         val l = locate(clipId) ?: return false
         if (l.trackId in lockedTracks) return false
+        cutMarksHidden = true
         pause()
         moveOrig = l
         movingClipId = clipId

@@ -90,7 +90,14 @@ internal object Pro {
 }
 
 /** How far a finger moves before a control decides what the gesture is. */
-private const val SLOP = 8f
+private const val SLOP = 10f
+
+/**
+ * True where the palette's area is short (a phone on its side, a short split window): every control gets slimmer and
+ * groups put more side by side, so a palette needs far less scrolling. Set by the Color page from its measured height,
+ * so it applies to any screen by its size, never by device.
+ */
+internal val LocalDense = androidx.compose.runtime.compositionLocalOf { false }
 
 /** Light ticks every [step] while dragging, a firm click on reaching [neutral]. */
 private class Haptics(private val view: android.view.View, private val step: Float, private val neutral: Float) {
@@ -135,8 +142,9 @@ internal fun ProSliderRaw(
     val grow by animateFloatAsState(if (active) 1f else 0f, spring(0.7f, 600f), label = "thumb")
     val changed = abs(value - neutral) > (max - min) * 0.0005f
     var valueRight by remember { mutableStateOf(0f) }
+    val dense = LocalDense.current
     Column(
-        modifier.height(52.dp).graphicsLayer { alpha = if (enabled) 1f else 0.38f }
+        modifier.height(if (dense) 40.dp else 52.dp).graphicsLayer { alpha = if (enabled) 1f else 0.38f }
             .pointerInput(enabled, min, max) {
                 if (!enabled) return@pointerInput
                 var lastTap = 0L
@@ -152,7 +160,9 @@ internal fun ProSliderRaw(
                         if (!c.pressed) break
                         val d = c.positionChange()
                         tx += d.x; ty += d.y
-                        if (mode == 0 && abs(tx) + abs(ty) > SLOP * density) mode = if (abs(tx) >= abs(ty)) 1 else -1
+                        // Decided once, after a deliberate distance: clearly sideways is a change; anything else is the
+                        // page scrolling, and the slider lets go for good (it never chases a scroll).
+                        if (mode == 0 && abs(tx) + abs(ty) > SLOP * density) mode = if (abs(tx) > abs(ty) * 1.4f) 1 else -1
                         if (mode == -1) break
                         if (mode == 1) {
                             if (!active) { active = true; start(); ticks.start(free) }
@@ -172,24 +182,24 @@ internal fun ProSliderRaw(
                         else {
                             lastTap = t
                             // A single tap on the number types it.
-                            if (down.position.x > valueRight - 90 * density && down.position.y < 26 * density) type?.invoke()
+                            if (down.position.x > valueRight - 90 * density && down.position.y < (if (dense) 20 else 26) * density) type?.invoke()
                         }
                     }
                 }
             }
             .padding(horizontal = 4.dp),
     ) {
-        Row(Modifier.fillMaxWidth().height(24.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(label, color = if (changed) Pro.Text else Pro.Dim, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        Row(Modifier.fillMaxWidth().height(if (dense) 18.dp else 24.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(label, color = if (changed) Pro.Text else Pro.Dim, fontSize = if (dense) 11.sp else 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
             if (fine) Text("FINE", color = Color.Black, fontSize = 9.sp, fontWeight = FontWeight.Bold,
                 modifier = Modifier.padding(start = 4.dp).clip(RoundedCornerShape(4.dp)).background(Palette.Accent).padding(horizontal = 4.dp))
             Text(
                 format.format(value), color = if (active) Palette.Accent else if (changed) Palette.Accent.copy(alpha = 0.9f) else Pro.Text,
-                fontSize = 13.sp, fontFamily = Pro.Mono, maxLines = 1,
+                fontSize = if (dense) 12.sp else 13.sp, fontFamily = Pro.Mono, maxLines = 1,
                 modifier = Modifier.padding(start = 6.dp).onGloballyPositioned { valueRight = it.positionInParent().x + it.size.width },
             )
         }
-        Canvas(Modifier.fillMaxWidth().height(26.dp)) {
+        Canvas(Modifier.fillMaxWidth().height(if (dense) 22.dp else 26.dp)) {
             val y = size.height / 2
             val h = 4.dp.toPx()
             val t = ((value - min) / (max - min)).coerceIn(0f, 1f)
@@ -229,10 +239,12 @@ internal fun ProSlider(vm: EditorViewModel, p: Primary, modifier: Modifier = Mod
 /** Sliders two to a row (one on narrow screens), for a palette's group of values. */
 @Composable
 internal fun SliderGrid(vm: EditorViewModel, params: List<Primary>, columns: Int = 2, enabled: Boolean = true) {
+    val dense = LocalDense.current
     BoxWithConstraints(Modifier.fillMaxWidth()) {
-        val cols = if (maxWidth < 300.dp) 1 else columns
+        // Short panels: as many to a row as fit at a comfortable width (2 to 4), so the group takes fewer rows.
+        val cols = if (maxWidth < 300.dp) 1 else if (dense) (maxWidth / 140.dp).toInt().coerceIn(columns, 4) else columns
         Column {
-            for (row in params.chunked(cols)) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+            for (row in params.chunked(cols)) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(if (dense) 10.dp else 14.dp)) {
                 for (p in row) androidx.compose.runtime.key(p.label) { ProSlider(vm, p, Modifier.weight(1f), enabled) }
                 repeat(cols - row.size) { Spacer(Modifier.weight(1f)) }
             }
@@ -431,13 +443,15 @@ internal fun SectionCard(
 ) {
     var open by remember(title) { mutableStateOf(initiallyOpen) }
     val turn by animateFloatAsState(if (open) 0f else -90f, spring(0.8f, 500f), label = "fold")
+    val dense = LocalDense.current
     Column(
-        Modifier.fillMaxWidth().padding(bottom = 8.dp).clip(RoundedCornerShape(16.dp))
+        Modifier.fillMaxWidth().padding(bottom = if (dense) 6.dp else 8.dp).clip(RoundedCornerShape(if (dense) 12.dp else 16.dp))
             .background(Brush.verticalGradient(listOf(Color(0xFF1A1B21), Color(0xFF15161B))))
             .border(1.dp, if (changed) Palette.Accent.copy(alpha = 0.22f) else Color(0xFF1F2028), RoundedCornerShape(16.dp)),
     ) {
         Row(
-            Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { open = !open }.padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+            Modifier.fillMaxWidth().heightIn(min = if (dense) 34.dp else 48.dp).clickable { open = !open }
+                .padding(start = 12.dp, end = 4.dp, top = if (dense) 2.dp else 6.dp, bottom = if (dense) 2.dp else 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(Lucide.ChevronDown, null, tint = Pro.Dim, modifier = Modifier.size(16.dp).graphicsLayer { rotationZ = turn })
@@ -447,16 +461,16 @@ internal fun SectionCard(
                     Text(title, color = Pro.Text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     if (changed) { Spacer(Modifier.width(6.dp)); Box(Modifier.size(6.dp).clip(CircleShape).background(Palette.Accent)) }
                 }
-                if (note != null && open) Text(note, color = Pro.Dim, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                if (note != null && open && !dense) Text(note, color = Pro.Dim, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
             trailing?.invoke(this)
             if (onReset != null) Icon(
                 Lucide.RotateCcw, "Reset $title", tint = if (changed) Pro.Text else Pro.Faint,
-                modifier = Modifier.size(36.dp).clip(CircleShape).clickable(enabled = changed, onClick = onReset).padding(9.dp),
+                modifier = Modifier.size(if (dense) 32.dp else 36.dp).clip(CircleShape).clickable(enabled = changed, onClick = onReset).padding(if (dense) 8.dp else 9.dp),
             )
         }
         AnimatedVisibility(open, enter = expandVertically(spring(0.9f, 500f)) + fadeIn(), exit = shrinkVertically(spring(0.9f, 600f)) + fadeOut()) {
-            Column(Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, bottom = 8.dp)) { content() }
+            Column(Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, bottom = if (dense) 4.dp else 8.dp)) { content() }
         }
     }
 }
@@ -512,6 +526,17 @@ internal fun ProToggle(label: String, on: Boolean, modifier: Modifier = Modifier
  */
 @Composable
 internal fun PaletteHeader(title: String, note: String, on: Boolean?, changed: Boolean, onToggle: () -> Unit, onReset: () -> Unit, extra: (@Composable RowScope.() -> Unit)? = null) {
+    // Short panels: everything on one line, the description left out.
+    if (LocalDense.current) {
+        Row(Modifier.fillMaxWidth().padding(start = 2.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(title, color = Pro.Text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            extra?.invoke(this)
+            if (on != null) ProToggle(if (on) "On" else "Off", on, onClick = onToggle)
+            Icon(Lucide.RotateCcw, "Reset $title", tint = if (changed) Pro.Text else Pro.Faint,
+                modifier = Modifier.size(34.dp).clip(CircleShape).clickable(enabled = changed, onClick = onReset).padding(9.dp))
+        }
+        return
+    }
     Column(Modifier.fillMaxWidth().padding(start = 2.dp, bottom = 10.dp, top = 2.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(title, color = Pro.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))

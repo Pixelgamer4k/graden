@@ -90,8 +90,21 @@ data class EncoderInfo(
 
     fun supports(w: Int, h: Int, fps: Float): Boolean {
         val c = caps ?: return w in 16..maxWidth && h in 16..maxHeight && w % 2 == 0 && h % 2 == 0
+        // Where the maker lists the sizes and rates the encoder really sustains (performance points), those decide:
+        // the general size and rate ranges are each true alone but not together (4K is fine, 60 fps is fine, 4K at 60
+        // is not, on many mid-range chips).
+        performanceCovers(c, w, h, fps)?.let { return it }
         return runCatching { c.areSizeAndRateSupported(w, h, fps.toDouble()) }.getOrDefault(false) ||
             runCatching { c.isSizeSupported(w, h) }.getOrDefault(false) && fps <= maxFps + 0.5f
+    }
+
+    /** True / false where the encoder lists performance points (Android 10+), null where it lists none. */
+    private fun performanceCovers(c: MediaCodecInfo.VideoCapabilities, w: Int, h: Int, fps: Float): Boolean? {
+        if (android.os.Build.VERSION.SDK_INT < 29) return null
+        val points = runCatching { c.supportedPerformancePoints }.getOrNull()?.takeIf { it.isNotEmpty() } ?: return null
+        val want = MediaCodecInfo.VideoCapabilities.PerformancePoint(w, h, kotlin.math.ceil(fps - 0.01f).toInt().coerceAtLeast(1))
+        val turned = MediaCodecInfo.VideoCapabilities.PerformancePoint(h, w, kotlin.math.ceil(fps - 0.01f).toInt().coerceAtLeast(1))
+        return points.any { it.covers(want) || it.covers(turned) }
     }
 
     /** Short note of the limits, shown under the encoder's name. */
